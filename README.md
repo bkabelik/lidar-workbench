@@ -67,8 +67,8 @@ conda activate pointcept
 
 
 ```
-# You'll also need a trained model checkpoint (.pth) and config (.py).
-# Place them in models/ and configs/ respectively.
+You'll also need a trained model checkpoint (.pth) and config (.py).
+Place them in models/ and configs/ respectively.
 
 **Download here:** [Pointcept Model](https://drive.google.com/file/d/15MlZ6cwed0jFsd7WKOdkDjQIQTiCy5nJ/view?usp=sharing)
 
