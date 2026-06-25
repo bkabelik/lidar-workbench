@@ -93,11 +93,16 @@ class ViewDTM(QWidget):
         ground_class: int = 2,
     ) -> None:
         """
-        Load point data and generate a DTM from ground-classified points.
+        Load point data for 2D top-down display.
+
+        DTM generation is **not** performed here — it is a batch operation
+        done after classification.  This view shows a simple 2D point
+        scatter coloured by elevation for fast interactive browsing.
 
         Args:
             data: Dict with keys ``x, y, z, classification``.
-            ground_class: ASPRS code for ground (default 2).
+            ground_class: ASPRS code for ground (default 2).  Unused during
+                          interactive viewing; used only by batch DTM export.
         """
         xs = data["x"]
         ys = data["y"]
@@ -106,22 +111,24 @@ class ViewDTM(QWidget):
 
         self._points_x = xs
         self._points_y = ys
+        self._points_z = zs
         self._points_class = cls
 
-        # Generate DTM
-        try:
-            gx, gy, gz, bbox = generate_dtm(xs, ys, zs, cls, ground_class=ground_class)
-            self._dtm_grid_x = gx
-            self._dtm_grid_y = gy
-            self._dtm_grid_z = gz
-            self._dtm_bbox = bbox
-        except Exception as exc:
-            logger.warning("DTM generation failed: %s", exc)
-            self._dtm_grid_x = None
-            self._dtm_grid_y = None
-            self._dtm_grid_z = None
+        # Subsample for fast 2D scatter rendering
+        n = len(xs)
+        if n > 200_000:
+            step = max(1, n // 200_000)
+            self._points_x = xs[::step]
+            self._points_y = ys[::step]
+            self._points_z = zs[::step]
+            self._points_class = cls[::step]
 
-        self._render_dtm()
+        # Clear any cached DTM
+        self._dtm_grid_x = None
+        self._dtm_grid_y = None
+        self._dtm_grid_z = None
+
+        self._render_scatter()
         self._fit_view()
         self.update()
 
@@ -189,6 +196,53 @@ class ViewDTM(QWidget):
         self._scale = min(scale_x, scale_y)
 
     # ── rendering ──────────────────────────────────────────────────
+
+    def _render_scatter(self) -> None:
+        """Pre-render a fast 2D height-coloured point scatter as a QPixmap."""
+        if self._points_x is None or len(self._points_x) == 0:
+            self._dtm_pixmap = None
+            return
+
+        w, h = self.width(), self.height()
+        if w < 2 or h < 2:
+            w, h = 400, 300
+
+        xs = self._points_x
+        ys = self._points_y
+        zs = self._points_z
+
+        # Normalise coordinates to pixel space
+        x_min, x_max = xs.min(), xs.max()
+        y_min, y_max = ys.min(), ys.max()
+        x_pad = (x_max - x_min) * 0.02 or 1.0
+        y_pad = (y_max - y_min) * 0.02 or 1.0
+        px = ((xs - x_min + x_pad) / (x_max - x_min + 2 * x_pad) * (w - 1)).astype(np.int32)
+        py = ((y_max - ys + y_pad) / (y_max - y_min + 2 * y_pad) * (h - 1)).astype(np.int32)
+        # Clip
+        px = np.clip(px, 0, w - 1)
+        py = np.clip(py, 0, h - 1)
+
+        # Height colour map
+        z_min, z_max = float(zs.min()), float(zs.max())
+        if z_max <= z_min:
+            z_norm = np.full_like(zs, 0.5)
+        else:
+            z_norm = (zs - z_min) / (z_max - z_min)
+
+        # RGB array
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+        r = np.clip((z_norm - 0.5) * 4.0, 0, 1) + np.clip((z_norm - 0.75) * 4.0, 0, 1)
+        g = np.clip(z_norm * 4.0, 0, 1) * (z_norm <= 0.5) + np.clip((1 - z_norm) * 4.0, 0, 1) * (z_norm > 0.5)
+        b = np.clip((0.25 - z_norm) * 4.0, 0, 1) + np.clip((0.5 - z_norm) * 4.0, 0, 1) * (z_norm > 0.25)
+        b = np.clip(b, 0, 1)
+        cr = (r * 255).astype(np.uint8)
+        cg = (g * 255).astype(np.uint8)
+        cb = (b * 255).astype(np.uint8)
+
+        img[py, px] = np.column_stack((cr, cg, cb))
+
+        qimg = QImage(img.data, w, h, w * 3, QImage.Format_RGB888)
+        self._dtm_pixmap = QPixmap.fromImage(qimg.copy())
 
     def _render_dtm(self) -> None:
         """Pre-render the DTM raster as a QPixmap with hillshade relief."""

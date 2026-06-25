@@ -455,68 +455,99 @@ class MainWindow(QMainWindow):
         dialog.filter_applied.connect(self._on_filter_applied)
         dialog.exec()
 
-    def _on_filter_applied(self, tile_ids: list, params: dict) -> None:
-        """Apply the chosen filter to the selected tiles."""
-        self.set_status(f"Applying {params.get('type', 'filter')} to {len(tile_ids)} tile(s)…", timeout=0)
+    def _on_filter_applied(self, tile_ids: list, pipeline: list) -> None:
+        """Apply a filter pipeline to the selected tiles in parallel."""
+        from ..noise_filter import FilterWorker
+        from ..gui.settings_dialog import load_general_settings
 
-        # Apply filter to each tile
-        for tile_id in tile_ids:
-            data = self._tm.load_tile_points_full(tile_id)
-            if data is None:
-                continue
+        # Load tile data (must happen on main thread for laspy thread-safety)
+        self.set_status(f"Loading {len(tile_ids)} tile(s)…", timeout=0)
+        tile_data = []
+        for tid in tile_ids:
+            data = self._tm.load_tile_points_full(tid)
+            if data is not None:
+                tile_data.append((tid, data))
 
-            if params["type"] == "sor":
-                from ..noise_filter import statistical_outlier_removal
-                keep, _ = statistical_outlier_removal(
-                    data["x"], data["y"], data["z"],
-                    nb_neighbors=params.get("nb_neighbors", 20),
-                    std_ratio=params.get("std_ratio", 2.0),
-                )
-            elif params["type"] == "ror":
-                from ..noise_filter import radius_outlier_removal
-                keep, _ = radius_outlier_removal(
-                    data["x"], data["y"], data["z"],
-                    radius=params.get("radius", 1.0),
-                    min_points=params.get("min_points", 5),
-                )
-            else:
-                from ..noise_filter import dbscan_outlier_removal
-                mode = "above" if params["type"] == "dbscan_above" else "below"
-                keep, _ = dbscan_outlier_removal(
-                    data["x"], data["y"], data["z"],
-                    eps=params.get("eps", 2.0),
-                    min_samples=params.get("min_samples", 10),
-                    min_cluster_size=params.get("min_cluster_size", 50),
-                    mode=mode,
-                )
+        if not tile_data:
+            self.set_status("No tiles could be loaded", timeout=3000)
+            return
 
-            # Write filtered data back
-            from ..noise_filter import apply_filter_to_tile
-            filtered = apply_filter_to_tile(
-                data["x"], data["y"], data["z"],
-                data["classification"], data["intensity"], data["return_number"],
-                keep,
-            )
-            # Re-write tile via tile_manager internal helper
-            tiles_dir = self._pm.tiles_dir
-            if tiles_dir is None:
-                continue
-            tile_info = self._db.get_tile(tile_id)
-            if tile_info is None:
-                continue
-            from ..tile_manager import _write_las_file
-            _write_las_file(
-                tiles_dir / tile_info["filename"],
-                *filtered[:3],
-                classes=filtered[3],
-                intensities=filtered[4],
-                return_numbers=filtered[5],
-            )
-            self._tm.update_tile_status(tile_id, TileStatus.FILTERED)
-            self._tile_list_widget.update_tile_status(tile_id, TileStatus.FILTERED)
+        settings = load_general_settings()
+        workers = settings.get("filter_workers", 4)
 
+        # Progress dialog
+        from PySide6.QtWidgets import QProgressDialog
+        self._filter_progress = QProgressDialog(
+            f"Filtering {len(tile_data)} tile(s) with {workers} workers…",
+            "Cancel", 0, len(tile_data), self,
+        )
+        self._filter_progress.setWindowModality(Qt.WindowModal)
+        self._filter_progress.setMinimumDuration(500)
+        self._filter_progress.canceled.connect(self._on_filter_canceled)
+
+        self._filter_worker = FilterWorker(tile_data, pipeline, workers, self)
+        self._filter_worker.progress.connect(self._on_filter_progress)
+        self._filter_worker.tile_done.connect(self._on_filter_tile_done)
+        self._filter_worker.finished_all.connect(self._on_filter_finished)
+        self._filter_worker.error_occurred.connect(self._on_filter_error)
+        self._filter_worker.start()
+
+    def _on_filter_canceled(self):
+        if hasattr(self, '_filter_worker') and self._filter_worker.isRunning():
+            self._filter_worker.terminate()
+            self._filter_worker.wait(2000)
+
+    def _on_filter_progress(self, msg: str, pct: float):
+        if hasattr(self, '_filter_progress'):
+            self._filter_progress.setLabelText(msg)
+            self._filter_progress.setValue(int(pct))
+
+    def _on_filter_tile_done(self, tile_id: str):
+        """Write filtered tile data back to disk as each tile finishes."""
+        if not hasattr(self, '_filter_worker'):
+            return
+        # Find the keep mask for this tile
+        for tid, keep in self._filter_worker._results:
+            if tid == tile_id:
+                break
+        else:
+            return
+
+        data = self._tm.load_tile_points_full(tile_id)
+        if data is None:
+            return
+        from ..noise_filter import apply_filter_to_tile
+        filtered = apply_filter_to_tile(
+            data["x"], data["y"], data["z"],
+            data["classification"], data["intensity"], data["return_number"],
+            keep,
+        )
+        tiles_dir = self._pm.tiles_dir
+        if tiles_dir is None:
+            return
+        tile_info = self._db.get_tile(tile_id)
+        if tile_info is None:
+            return
+        from ..tile_manager import _write_las_file
+        _write_las_file(
+            tiles_dir / tile_info["filename"],
+            *filtered[:3],
+            classes=filtered[3], intensities=filtered[4],
+            return_numbers=filtered[5],
+        )
+        self._tm.update_tile_status(tile_id, TileStatus.FILTERED)
+        self._tile_list_widget.update_tile_status(tile_id, TileStatus.FILTERED)
+
+    def _on_filter_finished(self, tile_ids: list, keep_masks: list):
         self._refresh_tile_list()
-        self.set_status(f"Filter applied to {len(tile_ids)} tile(s)", timeout=5000)
+        n = len(tile_ids)
+        self.set_status(f"Filter applied to {n} tile(s)", timeout=5000)
+        if hasattr(self, '_filter_progress'):
+            self._filter_progress.close()
+
+    def _on_filter_error(self, msg: str):
+        logger.error("Filter error: %s", msg)
+        self.set_status(f"Filter error: {msg}", timeout=5000)
 
     def _on_classify(self) -> None:
         """Open the Pointcept classification dialog."""

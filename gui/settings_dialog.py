@@ -28,7 +28,30 @@ from PySide6.QtWidgets import (
 
 logger = logging.getLogger("lidar_workbench.gui.settings_dialog")
 
-_SETTINGS_FILE = ".shortcuts.json"
+_SHORTCUTS_FILE = ".shortcuts.json"
+_SHORTCUTS_FILE = ".settings.json"
+
+
+def load_general_settings() -> dict:
+    """Load general settings, falling back to defaults."""
+    from ..config import DEFAULT_FILTER_WORKERS
+    defaults = {"filter_workers": DEFAULT_FILTER_WORKERS}
+    try:
+        with open(_SHORTCUTS_FILE, "r") as f:
+            saved = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        saved = {}
+    defaults.update({k: v for k, v in saved.items() if k in defaults})
+    return defaults
+
+
+def save_general_settings(settings: dict) -> None:
+    """Persist general settings to disk."""
+    try:
+        with open(_SHORTCUTS_FILE, "w") as f:
+            json.dump(settings, f, indent=2)
+    except Exception as exc:
+        logger.warning("Could not save settings: %s", exc)
 
 # Default shortcuts
 DEFAULTS: Dict[str, str] = {
@@ -85,7 +108,7 @@ ACTION_LABELS: Dict[str, str] = {
 def load_shortcuts() -> Dict[str, str]:
     """Load saved shortcuts, falling back to defaults."""
     try:
-        with open(_SETTINGS_FILE, "r") as f:
+        with open(_SHORTCUTS_FILE, "r") as f:
             saved = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         saved = {}
@@ -97,7 +120,7 @@ def load_shortcuts() -> Dict[str, str]:
 def save_shortcuts(shortcuts: Dict[str, str]) -> None:
     """Persist shortcuts to disk."""
     try:
-        with open(_SETTINGS_FILE, "w") as f:
+        with open(_SHORTCUTS_FILE, "w") as f:
             json.dump(shortcuts, f, indent=2)
     except Exception as exc:
         logger.warning("Could not save shortcuts: %s", exc)
@@ -116,8 +139,9 @@ class SettingsDialog(QDialog):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._shortcuts = load_shortcuts()
-        self.setWindowTitle("Settings — Keyboard Shortcuts")
-        self.setMinimumSize(500, 400)
+        self._settings = load_general_settings()
+        self.setWindowTitle("Settings")
+        self.setMinimumSize(500, 450)
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -141,6 +165,19 @@ class SettingsDialog(QDialog):
             self._table.setItem(row, 1, QTableWidgetItem(ks))
 
         layout.addWidget(self._table)
+
+        # ── General settings ───────────────────────────────────────
+        layout.addWidget(QLabel("<b>General</b>"))
+        gen_layout = QHBoxLayout()
+        gen_layout.addWidget(QLabel("Filter parallel workers:"))
+        from PySide6.QtWidgets import QSpinBox
+        self._filter_workers_spin = QSpinBox()
+        self._filter_workers_spin.setRange(1, 16)
+        self._filter_workers_spin.setValue(self._settings.get("filter_workers", 4))
+        self._filter_workers_spin.setToolTip("Number of tiles to filter in parallel")
+        gen_layout.addWidget(self._filter_workers_spin)
+        gen_layout.addStretch()
+        layout.addLayout(gen_layout)
 
         # Buttons
         btn_box = QDialogButtonBox()
@@ -172,6 +209,8 @@ class SettingsDialog(QDialog):
 
     def _on_accept(self) -> None:
         save_shortcuts(self._shortcuts)
+        self._settings["filter_workers"] = self._filter_workers_spin.value()
+        save_general_settings(self._settings)
         self.shortcuts_changed.emit(self._shortcuts)
         self.accept()
 

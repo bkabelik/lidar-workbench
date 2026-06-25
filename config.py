@@ -27,7 +27,7 @@ DEFAULT_CONFIG_PATH: Final[str] = "./configs/dales/ptv3_dales.py"
 DEFAULT_TILE_SIZE_M: Final[float] = 200.0       # meters
 DEFAULT_TILE_OVERLAP_M: Final[float] = 10.0     # meters
 TARGET_POINTS_PER_TILE: Final[int] = 1_500_000  # ~1.5 million
-MAX_POINTS_PER_VIEW: Final[int] = 10_000_000    # LOD trigger
+MAX_POINTS_PER_VIEW: Final[int] = 500_000     # software-renderer budget
 
 # ── Preview defaults ──────────────────────────────────────────────────
 PREVIEW_LOD_BBOX: Final[str] = "bbox"
@@ -48,6 +48,7 @@ DEFAULT_SOR_NB_NEIGHBORS: Final[int] = 20
 DEFAULT_SOR_STD_RATIO: Final[float] = 2.0
 DEFAULT_ROR_RADIUS: Final[float] = 1.0
 DEFAULT_ROR_MIN_POINTS: Final[int] = 5
+DEFAULT_FILTER_WORKERS: Final[int] = 4     # parallel filter threads
 
 # ── Profile defaults ──────────────────────────────────────────────────
 DEFAULT_PROFILE_WIDTH_M: Final[float] = 5.0     # meters

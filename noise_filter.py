@@ -342,3 +342,90 @@ def _brute_force_radius_count(
         dists_sq = (diff * diff).sum(axis=1)
         counts[i] = (dists_sq <= radius * radius).sum()
     return counts
+
+
+# ── parallel filter worker ──────────────────────────────────────────
+
+try:
+    from PySide6.QtCore import QThread, Signal
+    _HAS_QT = True
+except ImportError:
+    _HAS_QT = False
+
+
+if _HAS_QT:
+
+    class FilterWorker(QThread):
+        """Background worker that applies a filter pipeline to tiles in
+        parallel using a thread pool, reporting progress."""
+
+        progress = Signal(str, float)         # message, percentage
+        tile_done = Signal(str)               # tile_id that finished
+        finished_all = Signal(list, list)     # tile_ids, keep_masks
+        error_occurred = Signal(str)
+
+        def __init__(self, tile_data: list, pipeline: list,
+                     workers: int = 4, parent=None):
+            super().__init__(parent)
+            self._tile_data = tile_data  # list of (tile_id, data_dict)
+            self._pipeline = pipeline
+            self._workers = workers
+            self._results: list = []
+
+        def run(self):
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            total = len(self._tile_data)
+            done = 0
+            try:
+                with ThreadPoolExecutor(max_workers=self._workers) as pool:
+                    futures = {
+                        pool.submit(_apply_pipeline, data, self._pipeline): tid
+                        for tid, data in self._tile_data
+                    }
+                    for fut in as_completed(futures):
+                        tid = futures[fut]
+                        try:
+                            keep = fut.result()
+                            self._results.append((tid, keep))
+                            done += 1
+                            self.progress.emit(
+                                f"Filtered {done}/{total} tile(s)…",
+                                done / total * 100.0,
+                            )
+                            self.tile_done.emit(tid)
+                        except Exception as exc:
+                            self.error_occurred.emit(f"{tid}: {exc}")
+            except Exception as exc:
+                self.error_occurred.emit(str(exc))
+            self.finished_all.emit(
+                [r[0] for r in self._results],
+                [r[1] for r in self._results],
+            )
+
+
+def _apply_pipeline(data: dict, pipeline: list) -> np.ndarray:
+    """Apply a filter pipeline to a single tile's data, return keep mask."""
+    n = len(data["x"])
+    keep = np.ones(n, dtype=bool)
+    for step in pipeline:
+        if step["type"] == "sor":
+            k, _ = statistical_outlier_removal(
+                data["x"][keep], data["y"][keep], data["z"][keep],
+                nb_neighbors=step["nb_neighbors"],
+                std_ratio=step["std_ratio"],
+            )
+        elif step["type"] == "ror":
+            k, _ = radius_outlier_removal(
+                data["x"][keep], data["y"][keep], data["z"][keep],
+                radius=step["radius"], min_points=step["min_points"],
+            )
+        else:
+            mode = "above" if step["type"] == "dbscan_above" else "below"
+            k, _ = dbscan_outlier_removal(
+                data["x"][keep], data["y"][keep], data["z"][keep],
+                eps=step["eps"], min_samples=step["min_samples"],
+                min_cluster_size=step["min_cluster_size"], mode=mode,
+            )
+        keep_indices = np.where(keep)[0]
+        keep[keep_indices[~k]] = False
+    return keep

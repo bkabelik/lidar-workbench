@@ -14,8 +14,10 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QHBoxLayout,
     QHeaderView,
     QMenu,
+    QPushButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -112,6 +114,18 @@ class TileListWidget(QWidget):
         header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
 
         layout.addWidget(self._tree)
+
+        # Navigation buttons
+        nav = QHBoxLayout()
+        self._prev_btn = QPushButton("◀ Prev")
+        self._prev_btn.setToolTip("Previous tile (Ctrl+Shift+[)")
+        self._prev_btn.clicked.connect(self.select_previous_tile)
+        nav.addWidget(self._prev_btn)
+        self._next_btn = QPushButton("Next ▶")
+        self._next_btn.setToolTip("Next tile (Ctrl+Shift+])")
+        self._next_btn.clicked.connect(self.select_next_tile)
+        nav.addWidget(self._next_btn)
+        layout.addLayout(nav)
 
     # ── public API ─────────────────────────────────────────────────
 
