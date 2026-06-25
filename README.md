@@ -9,6 +9,7 @@ Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.c
 ## Features
 
 ### Point Cloud Processing
+- **LAS/LAZ Preview** — standalone file inspector with bounding box, subsampled, and full-resolution LODs before import
 - **Drag-and-drop import** of `.las`/`.laz` flight strips with automatic spatial tiling
 - **Interactive noise filtering** — SOR, ROR, and DBSCAN with real-time 3D preview
 - **Pointcept integration** — deep-learning classification via Point Transformer V3
@@ -87,15 +88,20 @@ python -m lidar_workbench.main /path/to/project
 ### Typical Workflow
 
 1. **Create or open a project** — *File → New Project* (Ctrl+N) or *File → Open Project* (Ctrl+O)
-2. **Import LAS/LAZ data** — *File → Import LAS/LAZ* (Ctrl+I) or drag-and-drop a folder onto the window
-3. **Apply noise filter** — Select tiles in the tile list → *Tools → Noise Filter* → choose SOR/ROR/DBSCAN → *Apply*
-4. **Classify with Pointcept** (optional) — Select filtered tiles → *Tools → Classify (Pointcept)* → configure → *Start*
-5. **Manual editing** — Double-click a classified tile to open the multi-view:
+2. **Preview LAS/LAZ data** — *File → Preview LAS/LAZ* (Ctrl+Shift+P) to inspect files before import:
+   - See bounding boxes, 1M/10M subsampled, or full-resolution point clouds
+   - Orbit/zoom with mouse, colour by height/classification/intensity/return/file
+   - Check point density (bbox + grid-based effective density)
+   - Click **Import…** from the preview to proceed to the import wizard
+3. **Import LAS/LAZ data** — *File → Import LAS/LAZ* (Ctrl+I) or drag-and-drop a folder onto the window
+4. **Apply noise filter** — Select tiles in the tile list → *Tools → Noise Filter* → choose SOR/ROR/DBSCAN → *Apply*
+5. **Classify with Pointcept** (optional) — Select filtered tiles → *Tools → Classify (Pointcept)* → configure → *Start*
+6. **Manual editing** — Double-click a classified tile to open the multi-view:
    - Draw a profile line in the DTM view (right-click + drag)
    - Select misclassified points in the profile view (brush, line, rectangle)
    - Click a class button in the properties panel to reclassify
    - *Undo*/*Redo* as needed (Ctrl+Z / Ctrl+Y)
-6. **Export raster** — *Tools → Export Raster (DTM / DSM)*:
+7. **Export raster** — *Tools → Export Raster (DTM / DSM)*:
    - Choose **DTM** (ground-only TIN interpolation) or **DSM** (max-Z from selected classes)
    - Set resolution (e.g. 0.5 m) and output directory
    - Toggle hillshade, merged vs tiled output
@@ -129,6 +135,7 @@ lidar_workbench/
 ├── project_manager.py           # Project lifecycle (create/open/save)
 ├── tile_manager.py              # LAS import, spatial tiling, I/O
 ├── import_wizard.py             # Guided import dialog (QWizard)
+├── preview_dialog.py            # LAS/LAZ preview inspector (NEW)
 ├── noise_filter.py              # SOR / ROR / DBSCAN filter algorithms
 ├── pointcept_worker.py          # Background subprocess inference runner
 ├── dtm_generator.py             # In-memory DTM interpolation (griddata)
@@ -145,6 +152,7 @@ lidar_workbench/
 │   ├── filter_dialog.py         # Noise filter parameter dialog
 │   ├── classification_dialog.py # Pointcept configuration dialog
 │   ├── export_dialog.py         # DTM/DSM export configuration dialog (NEW)
+│   ├── preview_dialog.py        # LAS/LAZ preview with density analysis (NEW)
 │   ├── properties_panel.py      # Point properties + quick-classify
 │   └── settings_dialog.py       # Keyboard shortcut editor
 └── Pointcept/                   # Bundled deep-learning library

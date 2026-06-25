@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import traceback
+from collections import defaultdict
 from pathlib import Path
 from typing import List, Optional
 
@@ -44,6 +45,7 @@ from .classification_dialog import ClassificationDialog
 from .export_dialog import ExportDialog
 from .filter_dialog import FilterDialog
 from .multi_view_widget import MultiViewWidget
+from .preview_dialog import PreviewDialog
 from .properties_panel import PropertiesPanel
 from .settings_dialog import SettingsDialog, load_shortcuts
 from .tile_list_widget import TileListWidget
@@ -92,6 +94,9 @@ class MainWindow(QMainWindow):
         self._profile_start: Optional[tuple] = None
         self._profile_end: Optional[tuple] = None
         self._profile_width: float = DEFAULT_PROFILE_WIDTH_M
+
+        # Keep preview dialog alive (prevent GC of Python wrapper)
+        self._preview_dlg: Optional[PreviewDialog] = None
 
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.setMinimumSize(1200, 700)
@@ -146,6 +151,12 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
+        preview_action = QAction("Preview &LAS/LAZ…", self)
+        preview_action.setShortcut(QKeySequence("Ctrl+Shift+P"))
+        preview_action.setObjectName("preview_las")
+        preview_action.triggered.connect(self._on_preview)
+        file_menu.addAction(preview_action)
+
         import_action = QAction("&Import LAS/LAZ…", self)
         import_action.setShortcut(QKeySequence("Ctrl+I"))
         import_action.setObjectName("import_las")
@@ -198,6 +209,10 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Main Toolbar")
         toolbar.setMovable(False)
         self.addToolBar(Qt.TopToolBarArea, toolbar)
+
+        preview_btn = toolbar.addAction("Preview")
+        preview_btn.setToolTip("Preview LAS/LAZ files before import (Ctrl+Shift+P)")
+        preview_btn.triggered.connect(self._on_preview)
 
         import_btn = toolbar.addAction("Import")
         import_btn.setToolTip("Import LAS/LAZ files (Ctrl+I)")
@@ -387,6 +402,44 @@ class MainWindow(QMainWindow):
             tile_ids = wizard.imported_tile_ids
             self._refresh_tile_list()
             self.set_status(f"Imported {len(tile_ids)} tile(s)", timeout=5000)
+
+    def _on_preview(self) -> None:
+        """Open the standalone LAS/LAZ preview dialog."""
+        if self._preview_dlg is not None:
+            self._preview_dlg.close()
+            self._preview_dlg = None
+        self._preview_dlg = PreviewDialog(parent=self)
+        self._preview_dlg.import_requested.connect(self._on_preview_import)
+        self._preview_dlg.destroyed.connect(lambda: setattr(self, '_preview_dlg', None))
+        self._preview_dlg.show()  # non-modal — user can keep interacting with main window
+
+    def _on_preview_import(self, file_paths: list) -> None:
+        """Handle import request from the preview dialog.
+
+        Groups files by parent directory and launches the ImportWizard
+        for each unique directory.
+        """
+        if not self._pm.is_open:
+            QMessageBox.information(
+                self, "No Project Open",
+                "Please create or open a project before importing data."
+            )
+            return
+
+        # Group files by parent directory
+        dirs: dict[str, list[Path]] = defaultdict(list)
+        for p in file_paths:
+            dirs[str(p.parent)].append(p)
+
+        # For now, import each unique directory via the wizard
+        for directory in dirs:
+            wizard = ImportWizard(self._tm, parent=self, preselected_dir=directory)
+            if wizard.exec() == ImportWizard.Accepted:
+                self._refresh_tile_list()
+                self.set_status(
+                    f"Imported {len(wizard.imported_tile_ids)} tile(s) from "
+                    f"{Path(directory).name}", timeout=5000
+                )
 
     def _on_filter(self) -> None:
         """Open the noise filter dialog for selected tiles."""

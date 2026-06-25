@@ -29,6 +29,20 @@ DEFAULT_TILE_OVERLAP_M: Final[float] = 10.0     # meters
 TARGET_POINTS_PER_TILE: Final[int] = 1_500_000  # ~1.5 million
 MAX_POINTS_PER_VIEW: Final[int] = 10_000_000    # LOD trigger
 
+# ── Preview defaults ──────────────────────────────────────────────────
+PREVIEW_LOD_BBOX: Final[str] = "bbox"
+PREVIEW_LOD_SUBSAMPLED_1M: Final[str] = "sub_1m"
+PREVIEW_LOD_SUBSAMPLED_10M: Final[str] = "sub_10m"
+PREVIEW_LOD_FULL: Final[str] = "full"
+PREVIEW_LOD_OPTIONS: Final[tuple] = (
+    (PREVIEW_LOD_BBOX, "Bounding Box Only"),
+    (PREVIEW_LOD_SUBSAMPLED_1M, "Subsampled (~1M points)"),
+    (PREVIEW_LOD_SUBSAMPLED_10M, "Subsampled (~10M points)"),
+    (PREVIEW_LOD_FULL, "Full Resolution"),
+)
+PREVIEW_CHUNK_SIZE: Final[int] = 1_000_000        # points per read chunk
+PREVIEW_FULL_WARN_THRESHOLD: Final[int] = 50_000_000  # warn above this
+
 # ── Filter defaults ───────────────────────────────────────────────────
 DEFAULT_SOR_NB_NEIGHBORS: Final[int] = 20
 DEFAULT_SOR_STD_RATIO: Final[float] = 2.0
