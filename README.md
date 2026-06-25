@@ -257,4 +257,14 @@ Keyboard shortcuts can be customised via *Tools → Settings*.
 
 ## License
 
-*To be determined.*
+This workbench integrates and builds upon several incredible open-source projects:
+
+- [Pointcept](https://github.com/Pointcept/Pointcept) (MIT License)
+- [Open3D](https://www.open3d.org) (MIT License)
+- [laspy](https://github.com/laspy/laspy) (BSD 2-Clause)
+- [PySide6](https://wiki.qt.io/Qt_for_Python) (LGPLv3)
+- [NumPy](https://numpy.org) (BSD 3-Clause)
+- [SciPy](https://scipy.org) (BSD 3-Clause)
+
+The custom workbench code in this repository is licensed under the **MIT License**.
+See the [`LICENSE`](LICENSE) file for details.
