@@ -114,6 +114,12 @@ class ViewDTM(QWidget):
         self._points_z = zs
         self._points_class = cls
 
+        # Keep originals for later DTM generation
+        self._points_x_orig = xs
+        self._points_y_orig = ys
+        self._points_z_orig = zs
+        self._points_class_orig = cls
+
         # Subsample for fast 2D scatter rendering
         n = len(xs)
         if n > 200_000:
@@ -131,6 +137,27 @@ class ViewDTM(QWidget):
         self._render_scatter()
         self._fit_view()
         self.update()
+
+    def generate_dtm(self, ground_class: int = 2) -> None:
+        """Generate a DTM from the currently loaded ground-classified points."""
+        if self._points_x_orig is None:
+            return
+        try:
+            xs = self._points_x_orig
+            ys = self._points_y_orig
+            zs = getattr(self, '_points_z_orig', np.zeros_like(xs))
+            cls = getattr(self, '_points_class_orig', np.zeros(len(xs), dtype=np.uint8))
+            gx, gy, gz, bbox = generate_dtm(xs, ys, zs, cls, ground_class=ground_class)
+            self._dtm_grid_x = gx
+            self._dtm_grid_y = gy
+            self._dtm_grid_z = gz
+            self._dtm_bbox = bbox
+            self._render_dtm()
+            self._fit_view()
+            self.update()
+            logger.info("DTM generated: %dx%d grid", gz.shape[0], gz.shape[1])
+        except Exception as exc:
+            logger.warning("DTM generation failed: %s", exc)
 
     def clear(self) -> None:
         """Clear all data."""
@@ -178,6 +205,14 @@ class ViewDTM(QWidget):
         wx = (px - self.width() / 2) / self._scale + self._offset_x
         wy = (py - self.height() / 2) / self._scale + self._offset_y
         return wx, wy
+
+    def _show_context_menu(self, pos):
+        """Right-click context menu."""
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        dtm_action = menu.addAction("Generate DTM from Ground Points")
+        dtm_action.triggered.connect(lambda: self.generate_dtm())
+        menu.exec(self.mapToGlobal(pos.toPoint()))
 
     def _fit_view(self) -> None:
         """Fit the DTM bbox to the widget."""
@@ -414,6 +449,8 @@ class ViewDTM(QWidget):
             self._profile_start = (wx, wy)
             self._profile_end = (wx, wy)
             self.update()
+        elif event.button() == Qt.RightButton:
+            self._show_context_menu(event.position())
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         wx, wy = self._widget_to_world(event.position().x(), event.position().y())

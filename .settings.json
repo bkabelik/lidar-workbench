@@ -1,3 +1,4 @@
 {
-  "filter_workers": 8
+  "filter_workers": 8,
+  "classify_workers": 3
 }

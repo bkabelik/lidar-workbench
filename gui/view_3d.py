@@ -126,6 +126,17 @@ class View3D(QWidget):
 
         if HAS_OPEN3D:
             self._init_renderer()
+        self.destroyed.connect(self._cleanup_renderer)
+
+    def _cleanup_renderer(self):
+        """Release OpenGL resources (called on destroyed signal)."""
+        if self._renderer is not None:
+            try:
+                self._scene = None
+                del self._renderer
+                self._renderer = None
+            except Exception:
+                pass
 
     # ── public API ─────────────────────────────────────────────────
 
@@ -209,17 +220,6 @@ class View3D(QWidget):
         self._highlight_geom = "_highlight"
         self._scene.add_geometry(self._highlight_geom, pcd, mat)
         self._render()
-
-    def closeEvent(self, event):
-        """Release OpenGL resources before Qt destroys the OpenGL context."""
-        if self._renderer is not None:
-            try:
-                self._scene = None
-                del self._renderer
-                self._renderer = None
-            except Exception:
-                pass
-        super().closeEvent(event)
 
     def clear(self):
         self._point_data = None

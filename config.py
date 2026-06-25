@@ -49,6 +49,7 @@ DEFAULT_SOR_STD_RATIO: Final[float] = 2.0
 DEFAULT_ROR_RADIUS: Final[float] = 1.0
 DEFAULT_ROR_MIN_POINTS: Final[int] = 5
 DEFAULT_FILTER_WORKERS: Final[int] = 4     # parallel filter threads
+DEFAULT_CLASSIFY_WORKERS: Final[int] = 1  # parallel classify processes (GPU-heavy)
 
 # ── Profile defaults ──────────────────────────────────────────────────
 DEFAULT_PROFILE_WIDTH_M: Final[float] = 5.0     # meters

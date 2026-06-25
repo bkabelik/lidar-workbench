@@ -1,6 +1,6 @@
 {
   "pointcept_path": "/home/fractal01/kabelik_lidar_gui_reasonix/lidar_workbench/Pointcept",
-  "model_path": "/home/fractal01/PointceptALS/exp/dales/ptv3_run_04__no_hag_average_bak/model/model_best.pth",
+  "model_path": "/home/fractal01/kabelik_lidar_gui_reasonix/lidar_workbench/models/model_best.pth",
   "config_path": "/home/fractal01/kabelik_lidar_gui_reasonix/lidar_workbench/Pointcept/configs/dales/ptv3_dales.py",
   "python_exe": "",
   "voxel_size": 0.15,

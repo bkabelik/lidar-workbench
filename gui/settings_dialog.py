@@ -34,8 +34,9 @@ _SHORTCUTS_FILE = ".settings.json"
 
 def load_general_settings() -> dict:
     """Load general settings, falling back to defaults."""
-    from ..config import DEFAULT_FILTER_WORKERS
-    defaults = {"filter_workers": DEFAULT_FILTER_WORKERS}
+    from ..config import DEFAULT_FILTER_WORKERS, DEFAULT_CLASSIFY_WORKERS
+    defaults = {"filter_workers": DEFAULT_FILTER_WORKERS,
+                "classify_workers": DEFAULT_CLASSIFY_WORKERS}
     try:
         with open(_SHORTCUTS_FILE, "r") as f:
             saved = json.load(f)
@@ -179,6 +180,16 @@ class SettingsDialog(QDialog):
         gen_layout.addStretch()
         layout.addLayout(gen_layout)
 
+        gen2_layout = QHBoxLayout()
+        gen2_layout.addWidget(QLabel("Classify parallel workers:"))
+        self._classify_workers_spin = QSpinBox()
+        self._classify_workers_spin.setRange(1, 8)
+        self._classify_workers_spin.setValue(self._settings.get("classify_workers", 1))
+        self._classify_workers_spin.setToolTip("Number of tiles to classify in parallel (GPU memory limited)")
+        gen2_layout.addWidget(self._classify_workers_spin)
+        gen2_layout.addStretch()
+        layout.addLayout(gen2_layout)
+
         # Buttons
         btn_box = QDialogButtonBox()
         reset_btn = QPushButton("Restore Defaults")
@@ -210,6 +221,7 @@ class SettingsDialog(QDialog):
     def _on_accept(self) -> None:
         save_shortcuts(self._shortcuts)
         self._settings["filter_workers"] = self._filter_workers_spin.value()
+        self._settings["classify_workers"] = self._classify_workers_spin.value()
         save_general_settings(self._settings)
         self.shortcuts_changed.emit(self._shortcuts)
         self.accept()

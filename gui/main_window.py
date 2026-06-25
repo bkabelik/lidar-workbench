@@ -664,6 +664,12 @@ class MainWindow(QMainWindow):
         # Load into multi-view
         self._multi_view.load_tile(tile_id, data)
         self._properties_panel.set_undo_info(*self._editor.undo_stack_info)
+
+        # Auto-generate DTM if tile is classified
+        tile_info = self._db.get_tile(tile_id)
+        if tile_info and tile_info.get("status") in (TileStatus.CLASSIFIED, TileStatus.EDITED):
+            self._multi_view._view_dtm.generate_dtm()
+
         self.set_status(f"Opened: {tile_id} ({data['x'].size:,} points)", timeout=5000)
 
     # ── slot: profile line ────────────────────────────────────
@@ -716,11 +722,17 @@ class MainWindow(QMainWindow):
             self._dtm_ref_elevations = dtm_z
             self._multi_view._view_profile.set_dtm_reference(dtm_d, dtm_z)
 
-        self.set_status(
-            f"Profile: {len(profile.distances)} pts / {profile.distances[-1]:.1f} m "
-            f"(width={self._profile_width:.1f} m, scroll to adjust, click to confirm)",
-            timeout=8000,
-        )
+        if len(profile.distances) > 0:
+            self.set_status(
+                f"Profile: {len(profile.distances)} pts / {profile.distances[-1]:.1f} m "
+                f"(width={self._profile_width:.1f} m, scroll to adjust, click to confirm)",
+                timeout=8000,
+            )
+        else:
+            self.set_status(
+                f"Profile: 0 points in corridor (width={self._profile_width:.1f} m)",
+                timeout=5000,
+            )
 
     def _on_profile_selection(self, mask: np.ndarray) -> None:
         """Called when the user makes a selection in the profile view."""
@@ -780,6 +792,7 @@ class MainWindow(QMainWindow):
                 self._tile_list_widget.update_tile_status(
                     self._editor.tile_id, TileStatus.EDITED
                 )
+                self._regenerate_dtm()
 
             self.set_status(
                 f"Reclassified points to class {new_class}",
@@ -799,6 +812,7 @@ class MainWindow(QMainWindow):
                 self._tile_list_widget.update_tile_status(
                     self._editor.tile_id, TileStatus.EDITED
                 )
+                self._regenerate_dtm()
             self.set_status(f"Undo: {desc}", timeout=3000)
 
     def _on_redo(self) -> None:
@@ -812,7 +826,16 @@ class MainWindow(QMainWindow):
                 self._tile_list_widget.update_tile_status(
                     self._editor.tile_id, TileStatus.EDITED
                 )
+                self._regenerate_dtm()
             self.set_status(f"Redo: {desc}", timeout=3000)
+
+    def _regenerate_dtm(self) -> None:
+        """Regenerate DTM from the current editor tile data after an edit."""
+        if self._editor.tile_id:
+            data = self._tm.load_tile_points_full(self._editor.tile_id)
+            if data:
+                self._multi_view._view_dtm.load_points(data)
+                self._multi_view._view_dtm.generate_dtm()
 
     def _on_tiles_filter(self, tile_ids: List[str]) -> None:
         self._on_filter()

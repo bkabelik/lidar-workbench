@@ -264,6 +264,10 @@ class ClassificationDialog(QDialog):
 
         smoothing = "yes" if self._smoothing_check.isChecked() else "no"
 
+        from .settings_dialog import load_general_settings
+        settings = load_general_settings()
+        workers = settings.get("classify_workers", 1)
+
         self._worker = PointceptWorker(
             self._tm,
             self._db,
@@ -279,6 +283,7 @@ class ClassificationDialog(QDialog):
         self._worker.tile_done.connect(self._on_tile_done)
         self._worker.tile_error.connect(self._on_tile_error)
         self._worker.all_done.connect(self._on_all_done)
+        self._worker._workers = workers
         self._worker.start()
 
     def _on_cancel(self) -> None:

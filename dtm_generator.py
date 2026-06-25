@@ -55,7 +55,14 @@ def generate_dtm(
     gy = ys[ground_mask]
     gz = zs[ground_mask]
 
-    logger.info("DTM: %d ground points for interpolation", len(gx))
+    # Subsample for speed — 50K points is plenty for a 1 m DTM
+    MAX_GROUND_PTS = 50_000
+    n_ground = len(gx)
+    if n_ground > MAX_GROUND_PTS:
+        idx = np.random.choice(n_ground, MAX_GROUND_PTS, replace=False)
+        gx, gy, gz = gx[idx], gy[idx], gz[idx]
+
+    logger.info("DTM: %d ground points for interpolation (from %d)", len(gx), n_ground)
 
     # Define grid extent
     x_min, x_max = gx.min(), gx.max()

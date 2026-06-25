@@ -103,6 +103,7 @@ class PointceptWorker(QThread):
         self._voxel_size = voxel_size
         self._smoothing = smoothing
         self._cancelled = False
+        self._workers = 1  # set by caller via configure or direct set
 
     def cancel(self) -> None:
         """Request cancellation.  The worker stops after the current tile."""
@@ -115,6 +116,7 @@ class PointceptWorker(QThread):
         """Execute the classification pipeline (runs in the worker thread)."""
         total = len(self._tile_ids)
         completed: List[str] = []
+        completed_lock = None
 
         # Validate prerequisites
         if not self._model_path.is_file():
@@ -131,34 +133,43 @@ class PointceptWorker(QThread):
         # Compute 97th percentile intensity across all selected tiles
         intensity_scale = self._compute_intensity_scale(tiles_dir)
 
-        for i, tile_id in enumerate(self._tile_ids):
+        from threading import Lock
+        completed_lock = Lock()
+
+        def classify_one(tile_id: str) -> None:
             if self._cancelled:
-                logger.info("Worker cancelled after %d/%d tiles", i, total)
-                break
-
-            pct_base = i / total * 100.0
-            self.progress.emit(
-                tile_id,
-                f"Classifying {tile_id} ({i + 1}/{total})…",
-                pct_base,
-            )
-
+                return
             try:
                 self._classify_tile(tile_id, tiles_dir, intensity_scale)
                 with self._db.connect() as conn:
                     self._db.update_status(conn, tile_id, TileStatus.CLASSIFIED)
                 self.tile_done.emit(tile_id)
-                completed.append(tile_id)
+                with completed_lock:
+                    completed.append(tile_id)
+                    n_done = len(completed)
                 self.progress.emit(
                     tile_id,
-                    f"Done: {tile_id}",
-                    (i + 1) / total * 100.0,
+                    f"Done: {tile_id} ({n_done}/{total})",
+                    n_done / total * 100.0,
                 )
             except Exception as exc:
                 logger.exception("Classification failed for %s", tile_id)
                 self.tile_error.emit(tile_id, str(exc))
                 with self._db.connect() as conn:
                     self._db.update_status(conn, tile_id, TileStatus.ERROR)
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        workers = min(self._workers, total)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(classify_one, tid): tid for tid in self._tile_ids}
+            for fut in as_completed(futures):
+                if self._cancelled:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+                try:
+                    fut.result()
+                except Exception:
+                    pass  # already handled in classify_one
 
         self.all_done.emit(completed)
 
