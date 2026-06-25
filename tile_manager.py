@@ -86,8 +86,10 @@ class TileManager:
         """
         Import all LAS/LAZ files from a directory into the project.
 
-        Automatically detects whether the files are individual tiles or
-        flight strips (based on spatial extent) and applies tiling as needed.
+        Streams each file once in chunks, bins points into the tile grid
+        using vectorised numpy, and writes tiles incrementally.  Each
+        input file is assigned a sequential flight-line number stored in
+        ``point_source_id``.
 
         Args:
             directory:          Path to a directory containing ``.las`` / ``.laz`` files.
@@ -120,7 +122,7 @@ class TileManager:
 
         logger.info("Found %d LAS/LAZ file(s) in %s", len(las_files), directory)
 
-        # Aggregate all points to determine global extent and point density
+        # ── Phase 1: read headers ──────────────────────────────────
         if progress_callback:
             progress_callback("Reading LAS headers…", 0.0)
 
@@ -132,10 +134,7 @@ class TileManager:
             try:
                 with laspy.open(las_path) as reader:
                     hdr = reader.header
-                    bbox: BBox = (
-                        hdr.x_min, hdr.y_min,
-                        hdr.x_max, hdr.y_max,
-                    )
+                    bbox: BBox = (hdr.x_min, hdr.y_min, hdr.x_max, hdr.y_max)
                     n_pts = hdr.point_count
                     all_bboxes.append(bbox)
                     total_points += n_pts
@@ -148,15 +147,14 @@ class TileManager:
             except Exception as exc:
                 logger.error("Failed to read header of %s: %s", las_path, exc)
                 continue
-
             if progress_callback:
-                progress_callback("Reading headers…", (i + 1) / len(las_files) * 10.0)
+                progress_callback("Reading headers…", (i + 1) / len(las_files) * 5.0)
 
         if not header_infos:
             logger.warning("No readable LAS/LAZ files found")
             return []
 
-        # Compute global bbox
+        # ── Phase 2: compute grid ───────────────────────────────────
         global_bbox: BBox = (
             min(b[0] for b in all_bboxes),
             min(b[1] for b in all_bboxes),
@@ -166,78 +164,132 @@ class TileManager:
         area_m2 = (global_bbox[2] - global_bbox[0]) * (global_bbox[3] - global_bbox[1])
         point_density = total_points / area_m2 if area_m2 > 0 else 0.0
 
-        logger.info(
-            "Global bbox: (%.2f, %.2f) – (%.2f, %.2f), %d points, density %.2f pts/m²",
-            *global_bbox, total_points, point_density,
-        )
-
-        # Determine tile size
         if tile_size_m is None:
             if point_density > 0:
-                # target: TARGET_POINTS_PER_TILE per tile
                 tile_area = TARGET_POINTS_PER_TILE / point_density
                 tile_size_m = np.sqrt(tile_area)
-                # Round to nearest 50 m
                 tile_size_m = max(50.0, round(tile_size_m / 50.0) * 50.0)
             else:
                 tile_size_m = DEFAULT_TILE_SIZE_M
-
         overlap_m = overlap_m if overlap_m is not None else DEFAULT_TILE_OVERLAP_M
 
-        logger.info("Tile size: %.0f m, overlap: %.0f m", tile_size_m, overlap_m)
-
-        # Generate tile grid
-        if progress_callback:
-            progress_callback("Generating tile grid…", 10.0)
-
         tile_bboxes = _compute_tile_grid(global_bbox, tile_size_m, overlap_m)
+        # Grid origin for tile-index math
+        grid_x0, grid_y0 = global_bbox[0], global_bbox[1]
+        stride = tile_size_m - overlap_m
+        if stride <= 0:
+            stride = tile_size_m
+        grid_cols = int(np.ceil((global_bbox[2] - grid_x0) / stride))
+
+        logger.info(
+            "Global bbox: (%.2f, %.2f) – (%.2f, %.2f), %d pts, density %.2f pts/m², "
+            "%d tile(s) @ %.0f m",
+            *global_bbox, total_points, point_density, len(tile_bboxes), tile_size_m,
+        )
 
         if progress_callback:
-            progress_callback(f"Importing {len(tile_bboxes)} tile(s)…", 15.0)
+            progress_callback(f"Importing {len(las_files)} file(s) → {len(tile_bboxes)} tile(s)…", 5.0)
 
-        # Load all points (streaming) and assign to tiles
-        imported_ids: List[str] = []
+        # ── Phase 3: single-pass streaming import ───────────────────
         tiles_dir = self._pm.tiles_dir
         assert tiles_dir is not None
 
-        with self._db.connect() as conn:
-            for tile_idx, tbbox in enumerate(tile_bboxes):
-                tile_id = f"tile_{tile_idx:04d}"
-                tile_filename = f"{tile_id}.las"
-                tile_path = tiles_dir / tile_filename
+        # Per-tile point accumulators  (lists of numpy arrays, flushed periodically)
+        tile_buffers: Dict[int, Dict[str, list]] = {}  # tile_idx → {x:[], y:[], z:[], cl:[], in:[], rn:[], src:[]}
 
-                # Collect points that fall into this tile bbox
-                xs, ys, zs, classes, intensities, return_nums = _collect_points_in_bbox(
-                    header_infos, tbbox, progress_callback=None
-                )
+        imported_ids: List[str] = []
+        total_processed = 0
+
+        for file_idx, info in enumerate(header_infos):
+            flight_line = file_idx + 1  # 1-based flight strip number
+            las_path = info["path"]
+            file_total = info["point_count"]
+            file_processed = 0
+
+            try:
+                with laspy.open(las_path) as reader:
+                    for chunk in reader.chunk_iterator(1_000_000):  # 1M pts per chunk
+                        n = len(chunk)
+                        x = np.array(chunk.x, dtype=np.float64)
+                        y = np.array(chunk.y, dtype=np.float64)
+
+                        # Vectorised tile-index computation
+                        col = ((x - grid_x0) / stride).astype(np.int64)
+                        row = ((y - grid_y0) / stride).astype(np.int64)
+                        # Clamp to valid range
+                        col = np.clip(col, 0, grid_cols - 1)
+                        max_rows = int(np.ceil((global_bbox[3] - grid_y0) / stride))
+                        row = np.clip(row, 0, max_rows - 1)
+                        tile_idx_arr = row * grid_cols + col
+
+                        # Bin points by tile
+                        z = np.array(chunk.z, dtype=np.float64)
+                        cl = (_safe_attr(chunk, "classification", np.uint8, 0))
+                        intens = (_safe_attr(chunk, "intensity", np.uint16, 0))
+                        rn = (_safe_attr(chunk, "return_number", np.uint8, 1))
+                        src = np.full(n, flight_line, dtype=np.uint16)
+
+                        for tidx in range(len(tile_bboxes)):
+                            mask = tile_idx_arr == tidx
+                            if not mask.any():
+                                continue
+                            if tidx not in tile_buffers:
+                                tile_buffers[tidx] = {"x":[], "y":[], "z":[],
+                                                       "cl":[], "in":[], "rn":[], "src":[]}
+                            buf = tile_buffers[tidx]
+                            buf["x"].append(x[mask])
+                            buf["y"].append(y[mask])
+                            buf["z"].append(z[mask])
+                            buf["cl"].append(cl[mask])
+                            buf["in"].append(intens[mask])
+                            buf["rn"].append(rn[mask])
+                            buf["src"].append(src[mask])
+
+                        file_processed += n
+                        total_processed += n
+                        if progress_callback:
+                            pct = 5.0 + (total_processed / total_points) * 90.0
+                            progress_callback(
+                                f"File {file_idx+1}/{len(header_infos)} — "
+                                f"{file_processed/file_total*100:.0f}%", pct
+                            )
+
+            except Exception as exc:
+                logger.error("Error reading %s: %s", las_path, exc)
+                continue
+
+        # ── Phase 4: write tile files ───────────────────────────────
+        if progress_callback:
+            progress_callback("Writing tile files…", 95.0)
+
+        with self._db.connect() as conn:
+            for tidx in sorted(tile_buffers.keys()):
+                buf = tile_buffers[tidx]
+                xs = np.concatenate(buf["x"])
+                ys = np.concatenate(buf["y"])
+                zs = np.concatenate(buf["z"])
+                cls = np.concatenate(buf["cl"])
+                intens = np.concatenate(buf["in"])
+                rns = np.concatenate(buf["rn"])
+                srcs = np.concatenate(buf["src"])
 
                 if len(xs) == 0:
-                    logger.debug("Tile %s has no points — skipping", tile_id)
                     continue
 
-                # Write tile LAS file
+                tile_id = f"tile_{tidx:04d}"
+                tile_path = tiles_dir / f"{tile_id}.las"
                 _write_las_file(
-                    tile_path,
-                    xs, ys, zs,
-                    classes=classes,
-                    intensities=intensities,
-                    return_numbers=return_nums,
+                    tile_path, xs, ys, zs,
+                    classes=cls, intensities=intens,
+                    return_numbers=rns, point_source_ids=srcs,
                 )
 
-                # Insert into database
                 self._db.insert_tile(
-                    conn,
-                    tile_id=tile_id,
-                    filename=tile_filename,
-                    bbox=tbbox,
-                    point_count=len(xs),
+                    conn, tile_id=tile_id, filename=f"{tile_id}.las",
+                    bbox=tile_bboxes[tidx], point_count=len(xs),
                     status=TileStatus.IMPORTED,
                 )
                 imported_ids.append(tile_id)
-
-                pct = 15.0 + (tile_idx + 1) / len(tile_bboxes) * 80.0
-                if progress_callback:
-                    progress_callback(f"Tile {tile_idx + 1}/{len(tile_bboxes)}", pct)
 
         if progress_callback:
             progress_callback("Import complete", 100.0)
@@ -429,6 +481,13 @@ class TileManager:
 # ── Internal helpers ──────────────────────────────────────────────────
 
 
+def _safe_attr(las_chunk, attr: str, dtype, default):
+    """Return ``las_chunk.<attr>`` as a numpy array, or *default* if missing."""
+    if hasattr(las_chunk, attr):
+        return np.array(getattr(las_chunk, attr), dtype=dtype)
+    return np.full(len(las_chunk), default, dtype=dtype)
+
+
 def _compute_tile_grid(
     global_bbox: BBox,
     tile_size: float,
@@ -464,82 +523,6 @@ def _compute_tile_grid(
     return tiles
 
 
-def _collect_points_in_bbox(
-    header_infos: List[Dict[str, Any]],
-    bbox: BBox,
-    progress_callback: Optional[callable] = None,
-) -> Tuple[
-    np.ndarray, np.ndarray, np.ndarray,
-    np.ndarray, np.ndarray, np.ndarray,
-]:
-    """
-    Stream through LAS files and collect points that fall within *bbox*.
-
-    Returns:
-        ``(xs, ys, zs, classes, intensities, return_numbers)`` as float/int arrays.
-    """
-    min_x, min_y, max_x, max_y = bbox
-    xs_all: List[np.ndarray] = []
-    ys_all: List[np.ndarray] = []
-    zs_all: List[np.ndarray] = []
-    cls_all: List[np.ndarray] = []
-    int_all: List[np.ndarray] = []
-    rn_all: List[np.ndarray] = []
-
-    for info in header_infos:
-        # Quick-reject: skip files that don't intersect bbox
-        fb = info["bbox"]
-        if fb[2] < min_x or fb[0] > max_x or fb[3] < min_y or fb[1] > max_y:
-            continue
-
-        try:
-            with laspy.open(info["path"]) as reader:
-                las_data = reader.read()
-                x = np.array(las_data.x, dtype=np.float64)
-                y = np.array(las_data.y, dtype=np.float64)
-
-                mask = (x >= min_x) & (x < max_x) & (y >= min_y) & (y < max_y)
-                if not mask.any():
-                    continue
-
-                xs_all.append(x[mask])
-                ys_all.append(y[mask])
-                zs_all.append(np.array(las_data.z, dtype=np.float64)[mask])
-
-                if hasattr(las_data, "classification"):
-                    cls_all.append(np.array(las_data.classification, dtype=np.uint8)[mask])
-                else:
-                    cls_all.append(np.zeros(mask.sum(), dtype=np.uint8))
-
-                if hasattr(las_data, "intensity"):
-                    int_all.append(np.array(las_data.intensity, dtype=np.uint16)[mask])
-                else:
-                    int_all.append(np.zeros(mask.sum(), dtype=np.uint16))
-
-                if hasattr(las_data, "return_number"):
-                    rn_all.append(np.array(las_data.return_number, dtype=np.uint8)[mask])
-                else:
-                    rn_all.append(np.ones(mask.sum(), dtype=np.uint8))
-        except Exception as exc:
-            logger.error("Error reading %s: %s", info["path"], exc)
-            continue
-
-    if not xs_all:
-        empty = np.array([], dtype=np.float64)
-        empty_u8 = np.array([], dtype=np.uint8)
-        empty_u16 = np.array([], dtype=np.uint16)
-        return empty, empty, empty, empty_u8, empty_u16, empty_u8
-
-    return (
-        np.concatenate(xs_all),
-        np.concatenate(ys_all),
-        np.concatenate(zs_all),
-        np.concatenate(cls_all),
-        np.concatenate(int_all),
-        np.concatenate(rn_all),
-    )
-
-
 def _write_las_file(
     path: Path,
     xs: np.ndarray,
@@ -548,12 +531,13 @@ def _write_las_file(
     classes: Optional[np.ndarray] = None,
     intensities: Optional[np.ndarray] = None,
     return_numbers: Optional[np.ndarray] = None,
+    point_source_ids: Optional[np.ndarray] = None,
 ) -> None:
     """
     Write a set of points to a LAS file via laspy.
 
     Creates LAS 1.4 point format 6 (includes classification, intensity,
-    return number).
+    return number, point source ID).
     """
     if not HAS_LASPY:
         raise RuntimeError("laspy required")
@@ -568,27 +552,25 @@ def _write_las_file(
     header.z_scale = 0.001
 
     las_data = laspy.LasData(header)
-
     las_data.x = xs
     las_data.y = ys
     las_data.z = zs
 
-    if classes is not None and len(classes) == n:
-        las_data.classification = classes
-    else:
-        las_data.classification = np.zeros(n, dtype=np.uint8)
-
-    if intensities is not None and len(intensities) == n:
-        las_data.intensity = intensities
-    else:
-        las_data.intensity = np.zeros(n, dtype=np.uint16)
-
-    if return_numbers is not None and len(return_numbers) == n:
-        las_data.return_number = return_numbers
-    else:
-        las_data.return_number = np.ones(n, dtype=np.uint8)
+    las_data.classification = (
+        classes if classes is not None and len(classes) == n
+        else np.zeros(n, dtype=np.uint8)
+    )
+    las_data.intensity = (
+        intensities if intensities is not None and len(intensities) == n
+        else np.zeros(n, dtype=np.uint16)
+    )
+    las_data.return_number = (
+        return_numbers if return_numbers is not None and len(return_numbers) == n
+        else np.ones(n, dtype=np.uint8)
+    )
+    if point_source_ids is not None and len(point_source_ids) == n:
+        las_data.point_source_id = point_source_ids
 
     path.parent.mkdir(parents=True, exist_ok=True)
     las_data.write(str(path))
-
     logger.debug("Wrote %d points to %s", n, path)
