@@ -10,6 +10,7 @@ Colour modes:
     - ``"height"`` — rainbow ramp by elevation
     - ``"intensity"`` — greyscale by LiDAR intensity
     - ``"return_number"`` — coloured by return number
+    - ``"flightline"`` — coloured by point_source_id / flight line
 """
 
 from __future__ import annotations
@@ -44,13 +45,19 @@ except ImportError:
 # ── _PreviewView (shared with preview_dialog — keep in sync) ───────
 
 class _PreviewView(QWidget):
-    """QWidget that paints a stored QPixmap, with mouse orbit callbacks."""
+    """QWidget that paints a stored QPixmap, with mouse orbit/pan callbacks."""
 
-    def __init__(self, parent=None, orbit_callback=None):
+    def __init__(self, parent=None, orbit_callback=None, pan_callback=None,
+                 click_callback=None, dblclick_callback=None):
         super().__init__(parent)
         self._pixmap = None
         self._orbit_cb = orbit_callback
+        self._pan_cb = pan_callback
+        self._click_cb = click_callback
+        self._dblclick_cb = dblclick_callback
         self._mouse_last = None
+        self._mouse_button = None
+        self._click_start = None  # for distinguishing click vs drag
         self.setMinimumSize(160, 120)
         self.setMouseTracking(True)
 
@@ -72,20 +79,38 @@ class _PreviewView(QWidget):
         p.end()
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            self._mouse_last = (event.position().x(), event.position().y())
+        self._mouse_last = (event.position().x(), event.position().y())
+        self._mouse_button = event.button()
+        self._click_start = self._mouse_last
 
     def mouseMoveEvent(self, event):
-        if self._mouse_last is None or self._orbit_cb is None:
+        if self._mouse_last is None:
             return
         x, y = event.position().x(), event.position().y()
-        dx, dy = x - self._mouse_last[0], y - self._mouse_last[1]
+        dx = x - self._mouse_last[0]
+        dy = y - self._mouse_last[1]
         self._mouse_last = (x, y)
-        self._orbit_cb("orbit", dx, dy)
+
+        if self._mouse_button == Qt.LeftButton and self._orbit_cb:
+            self._orbit_cb("orbit", dx, dy)
+        elif self._mouse_button == Qt.MiddleButton and self._pan_cb:
+            self._pan_cb("pan", dx, dy)
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
+        if event.button() == self._mouse_button:
+            # Distinguish click (small movement) from drag
+            if self._click_start is not None and self._click_cb is not None:
+                ex, ey = event.position().x(), event.position().y()
+                dist = ((ex - self._click_start[0])**2 + (ey - self._click_start[1])**2)**0.5
+                if dist < 4:  # < 4 pixels = click, not drag
+                    self._click_cb(ex, ey)
             self._mouse_last = None
+            self._mouse_button = None
+            self._click_start = None
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton and self._dblclick_cb is not None:
+            self._dblclick_cb(event.position().x(), event.position().y())
 
     def wheelEvent(self, event):
         if self._orbit_cb is None:
@@ -93,12 +118,42 @@ class _PreviewView(QWidget):
         self._orbit_cb("zoom", event.angleDelta().y() / 120.0, 0.0)
 
 
+# ── Flightline palette (20 distinct colours) ───────────────────────
+
+_FL_PALETTE = np.array([
+    [0.90, 0.10, 0.10],  # red
+    [0.10, 0.50, 0.90],  # blue
+    [0.10, 0.80, 0.10],  # green
+    [0.90, 0.60, 0.10],  # orange
+    [0.70, 0.10, 0.90],  # purple
+    [0.10, 0.80, 0.80],  # cyan
+    [0.90, 0.10, 0.70],  # magenta
+    [0.60, 0.60, 0.10],  # olive
+    [0.90, 0.50, 0.50],  # salmon
+    [0.20, 0.60, 0.20],  # forest
+    [0.20, 0.20, 0.80],  # navy
+    [0.80, 0.30, 0.10],  # rust
+    [0.10, 0.70, 0.70],  # teal
+    [0.70, 0.70, 0.10],  # gold
+    [0.60, 0.10, 0.60],  # plum
+    [0.10, 0.50, 0.50],  # dark cyan
+    [0.80, 0.80, 0.10],  # yellow
+    [0.50, 0.10, 0.50],  # indigo
+    [0.10, 0.40, 0.10],  # dark green
+    [0.50, 0.50, 0.50],  # grey
+], dtype=np.float64)
+
+
 # ── View3D ─────────────────────────────────────────────────────────
 
 class View3D(QWidget):
     """GPU-accelerated 3D view using Open3D OffscreenRenderer."""
 
-    COLOUR_MODES = ("class", "height", "intensity", "return_number")
+    COLOUR_MODES = ("class", "height", "intensity", "return_number", "flightline")
+
+    # emitted when user clicks a point in the 3D view
+    point_picked = Signal(int, float, float, float, int, int)
+    # (index, x, y, z, classification, intensity)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -119,9 +174,22 @@ class View3D(QWidget):
         # Highlight overlay geometry name → colour
         self._highlight_geom: Optional[str] = None
 
+        # Picked point marker
+        self._picked_pt: Optional[np.ndarray] = None  # (3,) xyz
+        self._picked_geom: Optional[str] = None
+
+        # Flightline visibility: None = all visible
+        self._hidden_flightlines: set = set()
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        self._view = _PreviewView(self, orbit_callback=self._on_orbit)
+        self._view = _PreviewView(
+            self,
+            orbit_callback=self._on_orbit,
+            pan_callback=self._on_pan,
+            click_callback=self._on_click,
+            dblclick_callback=self._on_dblclick,
+        )
         layout.addWidget(self._view, 1)
 
         if HAS_OPEN3D:
@@ -143,6 +211,7 @@ class View3D(QWidget):
     def load_point_cloud(
         self, xs, ys, zs,
         classifications=None, intensities=None, return_numbers=None,
+        point_source_ids=None,
     ):
         n = len(xs)
         if n == 0:
@@ -159,14 +228,18 @@ class View3D(QWidget):
                 intensities = intensities[idx]
             if return_numbers is not None:
                 return_numbers = return_numbers[idx]
+            if point_source_ids is not None:
+                point_source_ids = point_source_ids[idx]
 
         self._point_data = {
             "x": xs, "y": ys, "z": zs,
             "classification": classifications,
             "intensity": intensities,
             "return_number": return_numbers,
+            "point_source_id": point_source_ids,
         }
         self._has_geometry = True
+        self._hidden_flightlines.clear()
         self._fit_camera(xs, ys, zs)
         self._rebuild_scene()
 
@@ -180,10 +253,12 @@ class View3D(QWidget):
             xs, ys, zs, colors = xs[idx], ys[idx], zs[idx], colors[idx]
         self._point_data = {
             "x": xs, "y": ys, "z": zs,
-            "classification": None, "intensity": None, "return_number": None,
+            "classification": None, "intensity": None,
+            "return_number": None, "point_source_id": None,
         }
         self._colour_mode = "_custom"
         self._has_geometry = True
+        self._hidden_flightlines.clear()
         self._fit_camera(xs, ys, zs)
         self._build_and_render(xs, ys, zs, np.asarray(colors, dtype=np.float64))
 
@@ -221,11 +296,40 @@ class View3D(QWidget):
         self._scene.add_geometry(self._highlight_geom, pcd, mat)
         self._render()
 
+    def toggle_flightline(self, flightline: int, visible: bool) -> None:
+        """Show or hide a flightline in the 3D view."""
+        if not visible:
+            self._hidden_flightlines.add(flightline)
+        else:
+            self._hidden_flightlines.discard(flightline)
+        if self._point_data is not None:
+            self._rebuild_scene()
+
+    def set_all_flightlines_visible(self) -> None:
+        """Show all flightlines."""
+        self._hidden_flightlines.clear()
+        if self._point_data is not None:
+            self._rebuild_scene()
+
+    @property
+    def flightlines(self) -> list[int]:
+        """Return sorted list of flightline numbers in the current data."""
+        d = self._point_data
+        if d is None or d.get("point_source_id") is None:
+            return []
+        ids = np.unique(d["point_source_id"])
+        return sorted(int(x) for x in ids if x > 0)
+
     def clear(self):
         self._point_data = None
         self._has_geometry = False
+        self._hidden_flightlines.clear()
+        self._picked_pt = None
         if self._scene is not None:
+            if self._picked_geom is not None:
+                self._scene.remove_geometry(self._picked_geom)
             self._scene.clear_geometry()
+        self._picked_geom = None
         self._highlight_geom = None
         self._view.set_pixmap(QPixmap())
         self._view.update()
@@ -258,14 +362,40 @@ class View3D(QWidget):
         if self._point_data is None or self._scene is None:
             return
         d = self._point_data
-        colors = self._compute_colours()
-        self._build_and_render(d["x"], d["y"], d["z"], colors)
+
+        # Filter out hidden flightlines
+        if self._hidden_flightlines and d.get("point_source_id") is not None:
+            mask = np.ones(len(d["x"]), dtype=bool)
+            for fl in self._hidden_flightlines:
+                mask &= (d["point_source_id"] != fl)
+            if mask.sum() == 0:
+                self._scene.clear_geometry()
+                self._highlight_geom = None
+                self._render()
+                return
+            xs = d["x"][mask]
+            ys = d["y"][mask]
+            zs = d["z"][mask]
+            # recompute colors for subset
+            sub_data = {
+                "x": xs, "y": ys, "z": zs,
+                "classification": d["classification"][mask] if d["classification"] is not None else None,
+                "intensity": d["intensity"][mask] if d["intensity"] is not None else None,
+                "return_number": d["return_number"][mask] if d["return_number"] is not None else None,
+                "point_source_id": d["point_source_id"][mask] if d["point_source_id"] is not None else None,
+            }
+            colors = self._compute_colours(sub_data)
+            self._build_and_render(xs, ys, zs, colors)
+        else:
+            colors = self._compute_colours(d)
+            self._build_and_render(d["x"], d["y"], d["z"], colors)
 
     def _build_and_render(self, xs, ys, zs, colors):
         if self._scene is None:
             return
         self._scene.clear_geometry()
         self._highlight_geom = None
+        self._picked_geom = None
 
         pts = np.column_stack((xs, ys, zs))
         pcd = o3d.geometry.PointCloud()
@@ -275,10 +405,15 @@ class View3D(QWidget):
         mat.shader = "defaultUnlit"
         mat.point_size = 2.5
         self._scene.add_geometry("_points", pcd, mat)
+
+        # Re-add pick marker if one exists
+        self._show_pick_marker()
+
         self._render()
 
-    def _compute_colours(self):
-        d = self._point_data
+    def _compute_colours(self, d=None):
+        if d is None:
+            d = self._point_data
         n = len(d["x"])
         mode = self._colour_mode
 
@@ -319,6 +454,14 @@ class View3D(QWidget):
             if rn is not None:
                 for r, col in palette.items():
                     colors[rn == r] = col
+            else:
+                colors[:] = 0.5
+        elif mode == "flightline":
+            fl = d["point_source_id"]
+            if fl is not None:
+                unique_fl = np.unique(fl)
+                for i, fl_val in enumerate(unique_fl):
+                    colors[fl == fl_val] = _FL_PALETTE[i % len(_FL_PALETTE)]
             else:
                 colors[:] = 0.5
         else:
@@ -368,3 +511,149 @@ class View3D(QWidget):
             if new_dist > 0.01:
                 self._cam_eye = self._cam_center + direction / dist * new_dist
         self._render()
+
+    def _on_pan(self, action, dx, dy):
+        """Pan the camera center and eye by dx/dy in screen space."""
+        if self._renderer is None or action != "pan":
+            return
+        direction = self._cam_eye - self._cam_center
+        dist = float(np.linalg.norm(direction))
+        direction /= dist
+        up = self._cam_up / np.linalg.norm(self._cam_up)
+        right = np.cross(direction, up)
+        right /= np.linalg.norm(right) + 1e-12
+
+        pan_speed = dist * 0.002
+        shift = -dx * right * pan_speed + dy * up * pan_speed
+
+        self._cam_center = self._cam_center + shift
+        self._cam_eye = self._cam_eye + shift
+        self._render()
+
+    def _on_click(self, sx, sy):
+        """Handle a click in the 3D view — project all points to screen
+        space, find the nearest one to the click, emit point_picked,
+        and show a marker sphere."""
+        if self._point_data is None or self._renderer is None:
+            return
+        d = self._point_data
+        n = len(d["x"])
+        if n == 0:
+            return
+
+        vp_w = max(self._view.width(), 1)
+        vp_h = max(self._view.height(), 1)
+        pts = np.column_stack((d["x"], d["y"], d["z"]))
+
+        # Project all points to screen space
+        screen_pts = self._project_to_screen(pts, vp_w, vp_h)
+        if screen_pts is None:
+            return
+
+        # Distance in pixels from click to each projected point
+        sx_arr = screen_pts[:, 0]
+        sy_arr = screen_pts[:, 1]
+        in_front = screen_pts[:, 2]  # depth
+
+        pixel_dist = np.sqrt((sx_arr - sx)**2 + (sy_arr - sy)**2)
+        pixel_dist[~in_front] = np.inf
+
+        # Find nearest within tolerance (20 pixels)
+        nearest = int(np.argmin(pixel_dist))
+        if pixel_dist[nearest] > 20:
+            return  # too far from any point
+
+        px, py, pz = float(d["x"][nearest]), float(d["y"][nearest]), float(d["z"][nearest])
+        cls = int(d["classification"][nearest]) if d["classification"] is not None else 0
+        intens = int(d["intensity"][nearest]) if d["intensity"] is not None else 0
+
+        # Store picked point and show marker
+        self._picked_pt = np.array([px, py, pz])
+        self._show_pick_marker()
+        self._render()
+
+        self.point_picked.emit(nearest, px, py, pz, cls, intens)
+
+    def _on_dblclick(self, sx, sy):
+        """Double-click: re-center the orbit on the nearest point."""
+        if self._point_data is None or self._renderer is None:
+            return
+        d = self._point_data
+        n = len(d["x"])
+        if n == 0:
+            return
+
+        vp_w = max(self._view.width(), 1)
+        vp_h = max(self._view.height(), 1)
+        pts = np.column_stack((d["x"], d["y"], d["z"]))
+
+        screen_pts = self._project_to_screen(pts, vp_w, vp_h)
+        if screen_pts is None:
+            return
+
+        sx_arr = screen_pts[:, 0]
+        sy_arr = screen_pts[:, 1]
+        in_front = screen_pts[:, 2]
+
+        pixel_dist = np.sqrt((sx_arr - sx)**2 + (sy_arr - sy)**2)
+        pixel_dist[~in_front] = np.inf
+
+        nearest = int(np.argmin(pixel_dist))
+        if pixel_dist[nearest] > 30:
+            return  # generous tolerance for double-click
+
+        new_center = np.array([float(d["x"][nearest]), float(d["y"][nearest]), float(d["z"][nearest])])
+        offset = self._cam_eye - self._cam_center
+        self._cam_center = new_center
+        self._cam_eye = new_center + offset
+        self._render()
+
+    def _project_to_screen(self, pts, vp_w, vp_h):
+        """Project 3D points to screen coordinates.
+        Returns (N,3) array of (sx, sy, in_front)."""
+        direction = self._cam_eye - self._cam_center
+        view_dir = direction / np.linalg.norm(direction)
+        up = self._cam_up / np.linalg.norm(self._cam_up)
+        right = np.cross(view_dir, up)
+        right /= np.linalg.norm(right) + 1e-12
+        up = np.cross(right, view_dir)
+        up /= np.linalg.norm(up) + 1e-12
+
+        half_h = math.tan(math.radians(self._cam_fov / 2.0))
+        half_w = half_h * vp_w / vp_h
+
+        eye = self._cam_eye
+        to_pts = pts - eye
+        t = np.dot(to_pts, view_dir)  # depth along view direction
+        in_front = t > 0.01
+
+        # Perspective divide
+        px = np.divide(np.dot(to_pts, right), t, out=np.zeros_like(t), where=in_front)
+        py = np.divide(np.dot(to_pts, up), t, out=np.zeros_like(t), where=in_front)
+
+        # NDC to pixel
+        sx = (px / half_w * 0.5 + 0.5) * vp_w
+        sy = (0.5 - py / half_h * 0.5) * vp_h
+
+        return np.column_stack((sx, sy, in_front))
+
+    def _show_pick_marker(self):
+        """Add a small sphere at the picked point location."""
+        if self._scene is None:
+            return
+        # Remove old marker
+        if self._picked_geom is not None:
+            self._scene.remove_geometry(self._picked_geom)
+            self._picked_geom = None
+        if self._picked_pt is None:
+            return
+
+        import open3d as o3d
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.15)
+        sphere.translate(self._picked_pt)
+        sphere.paint_uniform_color([1.0, 0.2, 0.2])  # bright red
+        mat = o3d_render.MaterialRecord()
+        mat.shader = "defaultUnlit"
+        mat.base_color = [1.0, 0.2, 0.2, 1.0]
+        self._picked_geom = "_picked_marker"
+        self._scene.add_geometry(self._picked_geom, sphere, mat)

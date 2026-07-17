@@ -2,7 +2,7 @@
 LiDAR Workbench — Manual Editing Module.
 
 Implements profile extraction, point selection tools, class assignment,
-and undo/redo command stack — modelled after Terrasolid TerraScan's
+and undo/redo command stack.
 manual editing workflow.
 """
 

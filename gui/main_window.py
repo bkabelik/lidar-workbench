@@ -17,7 +17,7 @@ from typing import List, Optional
 import numpy as np
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence
+from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMenuBar,
     QMessageBox,
+    QPushButton,
     QSplitter,
     QStackedWidget,
     QStatusBar,
@@ -35,7 +36,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import APP_NAME, APP_VERSION, DEFAULT_PROFILE_WIDTH_M, TileStatus
+from ..config import (
+    APP_NAME, APP_VERSION, ASPRS_CLASS_COLORS, ASPRS_CLASS_NAMES,
+    DEFAULT_PROFILE_WIDTH_M, TileStatus,
+)
 from ..database import Database
 from ..import_wizard import ImportWizard
 from ..manual_edit import ManualEditor
@@ -90,6 +94,9 @@ class MainWindow(QMainWindow):
         self._dtm_ref_distances: Optional[np.ndarray] = None
         self._dtm_ref_elevations: Optional[np.ndarray] = None
 
+        # Class visibility filter (indexed by ASPRS class code, all visible by default)
+        self.class_visibility = np.ones(256, dtype=bool)
+
         # Cached profile line for width changes
         self._profile_start: Optional[tuple] = None
         self._profile_end: Optional[tuple] = None
@@ -116,6 +123,22 @@ class MainWindow(QMainWindow):
         self._register_shortcuts()
 
         logger.info("MainWindow initialised")
+
+    def closeEvent(self, event) -> None:
+        """Release Open3D resources before the window closes."""
+        try:
+            # Release the multi-view's Open3D resources
+            if hasattr(self, '_multi_view'):
+                self._multi_view.cleanup()
+        except Exception:
+            pass
+        try:
+            # Release the shared hidden renderer window
+            from ._renderer import cleanup_shared_renderer
+            cleanup_shared_renderer()
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     # ── menu bar ───────────────────────────────────────────────────
 
@@ -185,6 +208,18 @@ class MainWindow(QMainWindow):
 
         tools_menu.addSeparator()
 
+        ground_action = QAction("&Ground Classification…", self)
+        ground_action.setObjectName("ground_classify")
+        ground_action.triggered.connect(self._on_ground_classify)
+        tools_menu.addAction(ground_action)
+
+        bathy_action = QAction("&Bathymetry Processing…", self)
+        bathy_action.setObjectName("bathy_process")
+        bathy_action.triggered.connect(self._on_bathy_process)
+        tools_menu.addAction(bathy_action)
+
+        tools_menu.addSeparator()
+
         export_action = QAction("&Export Raster (DTM / DSM)…", self)
         export_action.setObjectName("export_raster")
         export_action.triggered.connect(self._on_export_raster)
@@ -228,7 +263,69 @@ class MainWindow(QMainWindow):
         classify_btn.setToolTip("Run Pointcept classification on selected tiles")
         classify_btn.triggered.connect(self._on_classify)
 
-    # ── central widget ─────────────────────────────────────────────
+        ground_btn = toolbar.addAction("Ground")
+        ground_btn.setToolTip("Ground classification (SMRF or TIN)")
+        ground_btn.triggered.connect(self._on_ground_classify)
+
+        bathy_btn = toolbar.addAction("Bathy")
+        bathy_btn.setToolTip("Bathymetry processing (refraction, river crop, benthic filter)")
+        bathy_btn.triggered.connect(self._on_bathy_process)
+
+        toolbar.addSeparator()
+
+        self._class_vis_btn = QPushButton("Classes ▾")
+        self._class_vis_btn.setToolTip("Toggle visibility of ASPRS classes in all views")
+        self._class_vis_btn.setFlat(True)
+        self._class_vis_btn.setStyleSheet(
+            "QPushButton { padding: 2px 8px; font-weight: bold; }"
+            "QPushButton::menu-indicator { image: none; }"
+        )
+        self._class_vis_menu = QMenu(self._class_vis_btn)
+        self._class_vis_btn.setMenu(self._class_vis_menu)
+        toolbar.addWidget(self._class_vis_btn)
+        self._build_class_visibility_menu()
+
+    def _build_class_visibility_menu(self) -> None:
+        """Build the popup menu with checkable ASPRS class items."""
+        menu = self._class_vis_menu
+        menu.clear()
+        menu.triggered.disconnect()
+        menu.triggered.connect(self._on_class_visibility_toggled)
+
+        all_action = menu.addAction("▸ Show All")
+        all_action.setData(-1)
+        none_action = menu.addAction("▸ Hide All")
+        none_action.setData(-2)
+        menu.addSeparator()
+
+        for code in sorted(ASPRS_CLASS_NAMES.keys()):
+            name = ASPRS_CLASS_NAMES[code]
+            r, g, b = ASPRS_CLASS_COLORS.get(code, (0.5, 0.5, 0.5))
+            pm = QPixmap(14, 14)
+            pm.fill(QColor(int(r * 255), int(g * 255), int(b * 255)))
+            action = menu.addAction(f"{code:2d}: {name}")
+            action.setCheckable(True)
+            action.setChecked(bool(self.class_visibility[code]))
+            action.setData(code)
+            action.setIcon(pm)
+
+    def _on_class_visibility_toggled(self, action: QAction) -> None:
+        code = action.data()
+        if code == -1:
+            self.class_visibility[:] = True
+        elif code == -2:
+            self.class_visibility[:] = False
+        else:
+            self.class_visibility[code] = action.isChecked()
+
+        # Rebuild menu to sync all check states
+        self._build_class_visibility_menu()
+
+        # Refresh views if a tile is open
+        if self._editor.tile_id is not None:
+            data = self._tm.load_tile_points_full(self._editor.tile_id)
+            if data is not None:
+                self._multi_load_for_edit(data)
 
     def _setup_central_widget(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
@@ -248,6 +345,10 @@ class MainWindow(QMainWindow):
         self._multi_view.profile_line_defined.connect(self._on_profile_line_defined)
         # Wire profile view selection → editor
         self._multi_view._view_profile.selection_changed.connect(self._on_profile_selection)
+        # Wire profile view hover → properties panel
+        self._multi_view._view_profile.point_hovered.connect(self._on_point_hovered)
+        # Wire 3D view point pick → properties panel
+        self._multi_view._view_3d.point_picked.connect(self._on_point_hovered)
         # Wire profile view width change → re-extract
         self._multi_view._view_profile.profile_width_changed.connect(self._on_profile_width_changed)
         splitter.addWidget(self._multi_view)
@@ -339,14 +440,25 @@ class MainWindow(QMainWindow):
         _make("prev_tile", self._tile_list_widget.select_previous_tile)
 
         # Quick-classify shortcuts (emit directly to properties signal handler)
+        _make("classify_created", lambda: self._properties_panel.classify_requested.emit(0))
+        _make("classify_unclass", lambda: self._properties_panel.classify_requested.emit(1))
         _make("classify_ground", lambda: self._properties_panel.classify_requested.emit(2))
         _make("classify_low_veg", lambda: self._properties_panel.classify_requested.emit(3))
         _make("classify_med_veg", lambda: self._properties_panel.classify_requested.emit(4))
         _make("classify_high_veg", lambda: self._properties_panel.classify_requested.emit(5))
         _make("classify_building", lambda: self._properties_panel.classify_requested.emit(6))
-        _make("classify_water", lambda: self._properties_panel.classify_requested.emit(9))
         _make("classify_noise", lambda: self._properties_panel.classify_requested.emit(7))
-        _make("classify_unclass", lambda: self._properties_panel.classify_requested.emit(1))
+        _make("classify_model_key", lambda: self._properties_panel.classify_requested.emit(8))
+        _make("classify_water", lambda: self._properties_panel.classify_requested.emit(9))
+        _make("classify_rail", lambda: self._properties_panel.classify_requested.emit(10))
+        _make("classify_road", lambda: self._properties_panel.classify_requested.emit(11))
+        _make("classify_overlap", lambda: self._properties_panel.classify_requested.emit(12))
+        _make("classify_wire_guard", lambda: self._properties_panel.classify_requested.emit(13))
+        _make("classify_wire_conductor", lambda: self._properties_panel.classify_requested.emit(14))
+        _make("classify_tower", lambda: self._properties_panel.classify_requested.emit(15))
+        _make("classify_wire_connector", lambda: self._properties_panel.classify_requested.emit(16))
+        _make("classify_bridge", lambda: self._properties_panel.classify_requested.emit(17))
+        _make("classify_high_noise", lambda: self._properties_panel.classify_requested.emit(18))
 
     def _on_new_project(self) -> None:
         directory = QFileDialog.getExistingDirectory(
@@ -516,12 +628,6 @@ class MainWindow(QMainWindow):
         data = self._tm.load_tile_points_full(tile_id)
         if data is None:
             return
-        from ..noise_filter import apply_filter_to_tile
-        filtered = apply_filter_to_tile(
-            data["x"], data["y"], data["z"],
-            data["classification"], data["intensity"], data["return_number"],
-            keep,
-        )
         tiles_dir = self._pm.tiles_dir
         if tiles_dir is None:
             return
@@ -529,11 +635,34 @@ class MainWindow(QMainWindow):
         if tile_info is None:
             return
         from ..tile_manager import _write_las_file
+        # Apply keep mask to all fields and write full LAS
+        def _mask(arr, default=None):
+            if arr is None:
+                return default
+            return arr[keep]
+
         _write_las_file(
             tiles_dir / tile_info["filename"],
-            *filtered[:3],
-            classes=filtered[3], intensities=filtered[4],
-            return_numbers=filtered[5],
+            data["x"][keep],
+            data["y"][keep],
+            data["z"][keep],
+            classes=_mask(data.get("classification")),
+            intensities=_mask(data.get("intensity")),
+            return_numbers=_mask(data.get("return_number")),
+            num_returns=_mask(data.get("num_returns")),
+            point_source_ids=_mask(data.get("point_source_id")),
+            gps_times=_mask(data.get("gps_time")),
+            scan_angle_ranks=_mask(data.get("scan_angle_rank")),
+            scan_direction_flags=_mask(data.get("scan_direction_flag")),
+            edge_of_flight_lines=_mask(data.get("edge_of_flight_line")),
+            user_data_array=_mask(data.get("user_data")),
+            reds=_mask(data.get("red")),
+            greens=_mask(data.get("green")),
+            blues=_mask(data.get("blue")),
+            key_points=_mask(data.get("key_point")),
+            synthetics=_mask(data.get("synthetic")),
+            withhelds=_mask(data.get("withheld")),
+            overlaps=_mask(data.get("overlap")),
         )
         self._tm.update_tile_status(tile_id, TileStatus.FILTERED)
         self._tile_list_widget.update_tile_status(tile_id, TileStatus.FILTERED)
@@ -562,6 +691,136 @@ class MainWindow(QMainWindow):
         dialog = ClassificationDialog(self._tm, self._db, selected, parent=self)
         dialog.finished.connect(lambda: self._refresh_tile_list())
         dialog.exec()
+
+    def _on_ground_classify(self) -> None:
+        """Open the ground classification dialog for the currently open tile."""
+        if self._editor.tile_id is None:
+            QMessageBox.information(self, "No Tile Open",
+                                    "Please open a tile first (double-click in tile list).")
+            return
+        data = self._tm.load_tile_points_full(self._editor.tile_id)
+        if data is None:
+            return
+
+        from .ground_classify_dialog import GroundClassifyDialog
+        dlg = GroundClassifyDialog(data, parent=self)
+        dlg.ground_applied.connect(lambda mask, sc: self._apply_ground_mask(mask, sc))
+        dlg.exec()
+
+    def _apply_ground_mask(self, mask: np.ndarray, source_class: int = -1) -> None:
+        """Apply ground classification mask to the current tile.
+
+        Args:
+            mask: Boolean array, True = ground.
+            source_class: Only reclassify points whose current class matches
+                          this value.  -1 means all points, -2 means
+                          classes 1 & 2 (unclassified + ground).
+        """
+        if self._editor.tile_id is None:
+            return
+        full_data = self._tm.load_tile_points_full(self._editor.tile_id)
+        if full_data is None:
+            return
+        n_total = len(full_data["x"])
+        if len(mask) != n_total:
+            self.set_status("Ground mask size mismatch", timeout=5000)
+            return
+
+        cls = full_data["classification"]
+        if source_class == -2:
+            # Classes 1 & 2 — allows re-running ground classification
+            in_source = (cls == 1) | (cls == 2)
+            cls[in_source & mask] = 2     # ground
+            cls[in_source & ~mask] = 1    # unclassified
+            n_affected = in_source.sum()
+        elif source_class >= 0:
+            # Only modify points matching the source class
+            in_source = (cls == source_class)
+            cls[in_source & mask] = 2     # ground
+            cls[in_source & ~mask] = 1    # unclassified
+            n_affected = in_source.sum()
+        else:
+            cls[mask] = 2     # ground
+            cls[~mask] = 1    # unclassified
+            n_affected = n_total
+
+        # ── Write updated classifications back to the LAS file ──────
+        tile_info = self._db.get_tile(self._editor.tile_id)
+        tiles_dir = self._pm.tiles_dir
+        if tile_info is not None and tiles_dir is not None:
+            from ..tile_manager import _read_las_header_template, _write_las_file
+            las_path = tiles_dir / tile_info["filename"]
+            # Preserve the original point format / VLRs / extra dims
+            try:
+                header_tmpl = _read_las_header_template(las_path)
+            except Exception:
+                header_tmpl = None
+            _write_las_file(
+                las_path,
+                full_data["x"], full_data["y"], full_data["z"],
+                classes=full_data["classification"],
+                intensities=full_data.get("intensity"),
+                return_numbers=full_data.get("return_number"),
+                num_returns=full_data.get("num_returns"),
+                point_source_ids=full_data.get("point_source_id"),
+                gps_times=full_data.get("gps_time"),
+                scan_angle_ranks=full_data.get("scan_angle_rank"),
+                scan_direction_flags=full_data.get("scan_direction_flag"),
+                edge_of_flight_lines=full_data.get("edge_of_flight_line"),
+                user_data_array=full_data.get("user_data"),
+                reds=full_data.get("red"),
+                greens=full_data.get("green"),
+                blues=full_data.get("blue"),
+                key_points=full_data.get("key_point"),
+                synthetics=full_data.get("synthetic"),
+                withhelds=full_data.get("withheld"),
+                overlaps=full_data.get("overlap"),
+                header_template=header_tmpl,
+            )
+            self._tm.update_tile_status(self._editor.tile_id, TileStatus.EDITED)
+
+        self._editor.open_tile(self._editor.tile_id)
+        self._multi_load_for_edit(full_data)
+        self._tile_list_widget.update_tile_status(self._editor.tile_id, TileStatus.EDITED)
+        self._regenerate_dtm()
+        n_ground = mask.sum()
+        self.set_status(
+            f"Ground: {n_ground:,} / {n_affected:,} points ({n_ground/max(n_affected,1)*100:.1f}%)",
+            timeout=8000,
+        )
+
+    def _on_bathy_process(self) -> None:
+        """Open the bathymetry processing dialog for the currently open tile."""
+        if self._editor.tile_id is None:
+            QMessageBox.information(self, "No Tile Open",
+                                    "Please open a tile first (double-click in tile list).")
+            return
+
+        tile_info = self._db.get_tile(self._editor.tile_id)
+        scanner = tile_info.get("scanner", '') if tile_info else ''
+        sensor_type = tile_info.get("sensor_type", '') if tile_info else ''
+
+        data = self._tm.load_tile_points_full(self._editor.tile_id)
+        if data is None:
+            return
+
+        from .bathy_dialog import BathyDialog
+        dlg = BathyDialog(data, scanner=scanner, sensor_type=sensor_type, parent=self)
+        dlg.bathy_applied.connect(lambda r: self._apply_bathy_result(r))
+        dlg.exec()
+
+    def _apply_bathy_result(self, result: dict) -> None:
+        """Apply bathymetry processing results to the current tile."""
+        if self._editor.tile_id is None:
+            return
+        self._editor.open_tile(self._editor.tile_id)
+        self._multi_load_for_edit(result)
+        self._tile_list_widget.update_tile_status(self._editor.tile_id, TileStatus.EDITED)
+        self._regenerate_dtm()
+        self.set_status(
+            f"Bathymetry done: {len(result['x']):,} points",
+            timeout=8000,
+        )
 
     def _on_export_raster(self, tile_ids: Optional[List[str]] = None) -> None:
         """Open the DTM / DSM export dialog."""
@@ -643,7 +902,21 @@ class MainWindow(QMainWindow):
         # Show tile info in properties panel
         tile_info = self._db.get_tile(tile_id)
         if tile_info:
+            all_scanners_raw = tile_info.get("all_scanners", "[]")
+            try:
+                all_scanners = json.loads(all_scanners_raw) if isinstance(all_scanners_raw, str) else all_scanners_raw
+            except Exception:
+                all_scanners = []
             self._properties_panel.set_selection_count(tile_info.get("point_count", 0))
+            self._properties_panel.set_tile_metadata(
+                scanner=tile_info.get("scanner", ''),
+                all_scanners=all_scanners,
+                sensor_type=tile_info.get("sensor_type", ''),
+                flight_line=tile_info.get("flight_line", 0),
+                point_count=tile_info.get("point_count", 0),
+            )
+            # Read LAS header for version
+            self._populate_las_header(tile_id)
 
     def _on_tile_open(self, tile_id: str) -> None:
         """Open a tile in the multi-view for inspection and editing."""
@@ -656,19 +929,39 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Load Error", f"Failed to load tile {tile_id}.")
             return
 
+        # Apply class visibility filter for views
+        view_data = self._apply_class_filter(data)
+
         # Open in editor
         if not self._editor.open_tile(tile_id):
             QMessageBox.warning(self, "Edit Error", f"Failed to open tile {tile_id} for editing.")
             return
 
         # Load into multi-view
-        self._multi_view.load_tile(tile_id, data)
+        self._multi_view.load_tile(tile_id, view_data)
+        self._properties_panel.set_tile_data(view_data)
         self._properties_panel.set_undo_info(*self._editor.undo_stack_info)
 
         # Auto-generate DTM if tile is classified
         tile_info = self._db.get_tile(tile_id)
         if tile_info and tile_info.get("status") in (TileStatus.CLASSIFIED, TileStatus.EDITED):
             self._multi_view._view_dtm.generate_dtm()
+
+        # Populate metadata panel
+        if tile_info:
+            all_scanners_raw = tile_info.get("all_scanners", "[]")
+            try:
+                all_scanners = json.loads(all_scanners_raw) if isinstance(all_scanners_raw, str) else all_scanners_raw
+            except Exception:
+                all_scanners = []
+            self._properties_panel.set_tile_metadata(
+                scanner=tile_info.get("scanner", ''),
+                all_scanners=all_scanners,
+                sensor_type=tile_info.get("sensor_type", ''),
+                flight_line=tile_info.get("flight_line", 0),
+                point_count=tile_info.get("point_count", 0),
+            )
+            self._populate_las_header(tile_id)
 
         self.set_status(f"Opened: {tile_id} ({data['x'].size:,} points)", timeout=5000)
 
@@ -705,6 +998,11 @@ class MainWindow(QMainWindow):
             profile.distances,
             profile.elevations,
             profile.classifications,
+            intensities=profile.intensities,
+            indices=profile.indices,
+            xs=profile.xs,
+            ys=profile.ys,
+            zs=profile.elevations,  # elevations ARE the Z values
         )
 
         # Extract DTM profile for reference line
@@ -741,6 +1039,16 @@ class MainWindow(QMainWindow):
         count = self._editor.selected_count
         self._properties_panel.set_selection_count(count)
 
+    def _on_point_hovered(self, idx: int, x: float, y: float, z: float,
+                          classification: int, intensity: int) -> None:
+        """Update the properties panel when hovering over a profile point."""
+        self._properties_panel.set_point_info(
+            x=x, y=y, z=z,
+            classification=classification,
+            intensity=intensity,
+            point_index=idx,
+        )
+
     def _on_profile_width_changed(self, new_width: float) -> None:
         """Called when the user scrolls to change the profile corridor width."""
         if self._editor.tile_id is None or self._profile_start is None:
@@ -758,6 +1066,11 @@ class MainWindow(QMainWindow):
             return
         self._multi_view._view_profile.set_profile_data(
             profile.distances, profile.elevations, profile.classifications,
+            intensities=profile.intensities,
+            indices=profile.indices,
+            xs=profile.xs,
+            ys=profile.ys,
+            zs=profile.elevations,
         )
         # Restore DTM reference line
         if self._dtm_ref_distances is not None:
@@ -881,32 +1194,64 @@ class MainWindow(QMainWindow):
 
     # ── helpers ────────────────────────────────────────────────────
 
+    def _apply_class_filter(self, point_data: dict) -> dict:
+        """Return a filtered copy of *point_data* with only visible classes."""
+        cls = point_data.get("classification")
+        if cls is None or self.class_visibility.all():
+            return point_data
+        visible = self.class_visibility[cls]
+        if visible.all():
+            return point_data
+        filtered = {"x": point_data["x"][visible],
+                    "y": point_data["y"][visible],
+                    "z": point_data["z"][visible]}
+        for key in ("classification", "intensity", "return_number",
+                    "num_returns", "point_source_id", "scan_direction_flag",
+                    "edge_of_flight_line", "scan_angle_rank", "user_data",
+                    "gps_time", "red", "green", "blue",
+                    "key_point", "synthetic", "withheld", "overlap",
+                    "sensor_type"):
+            if key in point_data:
+                filtered[key] = point_data[key][visible]
+        return filtered
+
     def _multi_load_for_edit(self, point_data: dict) -> None:
         """
         Refresh 3D + DTM views after an edit, preserving the profile view
         if a profile is already loaded in the editor.
         """
+        # Keep tile data in sync for the info button
+        self._properties_panel.set_tile_data(point_data)
+
+        # Apply class visibility filter
+        filtered = self._apply_class_filter(point_data)
+
         # Update 3D
         self._multi_view._view_3d.load_point_cloud(
-            point_data["x"], point_data["y"], point_data["z"],
-            point_data.get("classification"),
-            point_data.get("intensity"),
-            point_data.get("return_number"),
+            filtered["x"], filtered["y"], filtered["z"],
+            filtered.get("classification"),
+            filtered.get("intensity"),
+            filtered.get("return_number"),
+            filtered.get("point_source_id"),
         )
         # Update DTM
-        self._multi_view._view_dtm.load_points(point_data)
+        self._multi_view._view_dtm.load_points(filtered)
 
         # Refresh profile view if a profile exists in the editor
         profile = self._editor.profile
         if profile is not None and len(profile.distances) > 0:
-            # Get updated classifications for the profile points
             new_cls = point_data["classification"][profile.indices]
             self._multi_view._view_profile.set_profile_data(
                 profile.distances,
                 profile.elevations,
                 new_cls,
+                intensities=profile.intensities,
+                indices=profile.indices,
+                xs=profile.xs,
+                ys=profile.ys,
+                zs=profile.elevations,
             )
-            # Restore DTM reference line
+            self._multi_view._view_profile.set_class_visibility(self.class_visibility)
             if self._dtm_ref_distances is not None:
                 self._multi_view._view_profile.set_dtm_reference(
                     self._dtm_ref_distances, self._dtm_ref_elevations
@@ -948,6 +1293,43 @@ class MainWindow(QMainWindow):
             self.set_status(f"Loaded {len(tiles)} tile(s)", timeout=3000)
         else:
             self._tile_list_widget.set_tiles([])
+
+    def _populate_las_header(self, tile_id: str) -> None:
+        """Read the LAS file header for version/CRS info and update metadata panel."""
+        tile_info = self._db.get_tile(tile_id)
+        if tile_info is None:
+            return
+        tiles_dir = self._pm.tiles_dir
+        if tiles_dir is None:
+            return
+        las_path = tiles_dir / tile_info["filename"]
+        if not las_path.is_file():
+            return
+        try:
+            import laspy
+            with laspy.open(las_path) as reader:
+                hdr = reader.header
+                las_ver = f"{hdr.version.major}.{hdr.version.minor}"
+                # Try to extract CRS from VLRs (WKT or GeoTIFF)
+                crs_str = ""
+                try:
+                    for vlr in getattr(hdr, 'vlrs', []):
+                        rec_id = getattr(vlr, 'record_id', None)
+                        if rec_id == 2112:  # WKT OGC CS
+                            crs_str = str(vlr.record_data.decode('utf-8', errors='replace'))[:80]
+                            break
+                except Exception:
+                    pass
+                self._properties_panel.set_tile_metadata(
+                    scanner=tile_info.get("scanner", ''),
+                    sensor_type=tile_info.get("sensor_type", ''),
+                    flight_line=tile_info.get("flight_line", 0),
+                    las_version=las_ver,
+                    point_count=tile_info.get("point_count", 0),
+                    crs=crs_str,
+                )
+        except Exception:
+            pass
 
     # ── recent projects ─────────────────────────────────────────
 

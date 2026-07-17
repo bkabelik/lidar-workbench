@@ -27,6 +27,7 @@ DEFAULT_CONFIG_PATH: Final[str] = "./configs/dales/ptv3_dales.py"
 DEFAULT_TILE_SIZE_M: Final[float] = 200.0       # meters
 DEFAULT_TILE_OVERLAP_M: Final[float] = 10.0     # meters
 TARGET_POINTS_PER_TILE: Final[int] = 1_500_000  # ~1.5 million
+DEFAULT_MIN_POINTS_PER_TILE: Final[int] = 0   # skip tiles below this count
 MAX_POINTS_PER_VIEW: Final[int] = 500_000     # software-renderer budget
 
 # ── Preview defaults ──────────────────────────────────────────────────
@@ -50,6 +51,16 @@ DEFAULT_ROR_RADIUS: Final[float] = 1.0
 DEFAULT_ROR_MIN_POINTS: Final[int] = 5
 DEFAULT_FILTER_WORKERS: Final[int] = 4     # parallel filter threads
 DEFAULT_CLASSIFY_WORKERS: Final[int] = 1  # parallel classify processes (GPU-heavy)
+
+# ── TerraSolid-style filter defaults ──────────────────────────────────
+DEFAULT_ISOLATED_SEARCH_RADIUS: Final[float] = 3.0
+DEFAULT_ISOLATED_MIN_DISTANCE: Final[float] = 0.5
+DEFAULT_LOW_POINTS_SEARCH_RADIUS: Final[float] = 2.0
+DEFAULT_LOW_POINTS_BELOW: Final[float] = 1.0
+DEFAULT_LOW_POINTS_ABOVE: Final[float] = 10.0
+DEFAULT_SURFACE_NOISE_GRID: Final[float] = 0.5
+DEFAULT_SURFACE_NOISE_TOLERANCE: Final[float] = 0.05
+DEFAULT_SURFACE_NOISE_PROXIMITY: Final[float] = 0.25
 
 # ── Profile defaults ──────────────────────────────────────────────────
 DEFAULT_PROFILE_WIDTH_M: Final[float] = 5.0     # meters

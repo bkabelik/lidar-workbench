@@ -22,6 +22,7 @@ import numpy as np
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -91,9 +92,16 @@ class MultiViewWidget(QWidget):
         self._colour_combo.addItem("By Height", "height")
         self._colour_combo.addItem("By Intensity", "intensity")
         self._colour_combo.addItem("By Return Number", "return_number")
+        self._colour_combo.addItem("By Flightline", "flightline")
         self._colour_combo.currentIndexChanged.connect(self._on_colour_mode_changed)
         toolbar.addWidget(QLabel("Colour:"))
         toolbar.addWidget(self._colour_combo)
+
+        # Flightline toggle checkboxes (populated on load)
+        self._fl_toggle_layout = QHBoxLayout()
+        self._fl_toggle_layout.setContentsMargins(0, 0, 0, 0)
+        self._fl_toggle_layout.setSpacing(4)
+        toolbar.addLayout(self._fl_toggle_layout)
         toolbar.addStretch()
         main_layout.addLayout(toolbar)
 
@@ -141,6 +149,7 @@ class MultiViewWidget(QWidget):
             point_data.get("classification"),
             point_data.get("intensity"),
             point_data.get("return_number"),
+            point_data.get("point_source_id"),
         )
 
         # DTM top-down
@@ -148,6 +157,9 @@ class MultiViewWidget(QWidget):
 
         # Clear profile view (populated when a profile line is drawn)
         self._view_profile.clear()
+
+        # Rebuild flightline toggle checkboxes
+        self._rebuild_flightline_toggles()
 
         self.tile_loaded.emit(tile_id)
 
@@ -158,6 +170,47 @@ class MultiViewWidget(QWidget):
         self._view_3d.clear()
         self._view_dtm.clear()
         self._view_profile.clear()
+
+    def cleanup(self) -> None:
+        """Release Open3D resources held by the views before Qt shutdown."""
+        # Force cleanup of the 3D view's renderer
+        if hasattr(self, '_view_3d'):
+            self._view_3d._cleanup_renderer()
+
+    def _rebuild_flightline_toggles(self) -> None:
+        """Create/update flightline visibility checkboxes in the toolbar."""
+        # Remove old toggles
+        while self._fl_toggle_layout.count():
+            item = self._fl_toggle_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        fls = self._view_3d.flightlines
+        if len(fls) <= 1:
+            return  # only one or zero flightlines — no need for toggles
+
+        # Add "All" checkbox
+        all_cb = QCheckBox("FL:All")
+        all_cb.setChecked(True)
+        all_cb.setToolTip("Show/hide all flightlines")
+        all_cb.toggled.connect(self._on_fl_all_toggled)
+        self._fl_toggle_layout.addWidget(all_cb)
+
+        # Add per-flightline checkboxes
+        for fl in fls:
+            cb = QCheckBox(str(fl))
+            cb.setChecked(True)
+            cb.setToolTip(f"Toggle flightline {fl}")
+            cb.toggled.connect(lambda checked, f=fl: self._view_3d.toggle_flightline(f, checked))
+            self._fl_toggle_layout.addWidget(cb)
+
+    def _on_fl_all_toggled(self, checked: bool) -> None:
+        """Show or hide all flightlines."""
+        if checked:
+            self._view_3d.set_all_flightlines_visible()
+        else:
+            for fl in self._view_3d.flightlines:
+                self._view_3d.toggle_flightline(fl, False)
 
     # ── slots ──────────────────────────────────────────────────────
 
@@ -170,13 +223,3 @@ class MultiViewWidget(QWidget):
         """Propagate colour mode to the 3D overview view."""
         mode = self._colour_combo.currentData()
         self._view_3d.set_colour_mode(mode)
-        # Reload with new colour mode if data is loaded
-        if self._point_data is not None:
-            self._view_3d.load_point_cloud(
-                self._point_data["x"],
-                self._point_data["y"],
-                self._point_data["z"],
-                self._point_data.get("classification"),
-                self._point_data.get("intensity"),
-                self._point_data.get("return_number"),
-            )

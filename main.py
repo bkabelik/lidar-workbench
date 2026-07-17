@@ -112,6 +112,14 @@ def main() -> int:
     # Run
     exit_code = app.exec()
 
+    # ── Cleanup (order matters: Open3D before Qt finalisation) ──
+    try:
+        import open3d.visualization.gui as o3d_gui
+        o3d_gui.Application.instance.quit()
+        logger.debug("Open3D Application quit")
+    except Exception:
+        pass
+
     # Cleanup
     if pm.is_open:
         pm.close()

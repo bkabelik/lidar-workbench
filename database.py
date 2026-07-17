@@ -9,6 +9,7 @@ internally via the context manager.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -16,6 +17,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from .config import TileStatus
+
+logger = logging.getLogger("lidar_workbench.database")
 
 # ── SQL schema ─────────────────────────────────────────────────────────
 SCHEMA_SQL: str = """
@@ -27,6 +30,11 @@ CREATE TABLE IF NOT EXISTS tiles (
     bbox_max_x      REAL,
     bbox_max_y      REAL,
     point_count     INTEGER,
+    flight_line     INTEGER DEFAULT 0,
+    scanner         TEXT    DEFAULT '',
+    all_scanners    TEXT    DEFAULT '[]',  -- JSON list of all scanner names in this tile
+    sensor_type     TEXT    DEFAULT '' CHECK(sensor_type IN ('', 'topo', 'bathy')),
+    flightline_sensor_types TEXT DEFAULT '{}',  -- JSON: {"1": "topo", "2": "bathy"}
     status          TEXT    NOT NULL DEFAULT 'IMPORTED'
                     CHECK(status IN ('IMPORTED','FILTERED','CLASSIFIED','EDITED','ERROR')),
     filter_params   TEXT,   -- JSON
@@ -113,6 +121,22 @@ class Database:
         """Create tables and indexes if they do not exist."""
         with self.connect() as conn:
             conn.executescript(SCHEMA_SQL)
+            self._migrate(conn)
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add new columns that may be missing from older databases."""
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(tiles)")}
+        migrations = [
+            ("flight_line", "ALTER TABLE tiles ADD COLUMN flight_line INTEGER DEFAULT 0"),
+            ("scanner",     "ALTER TABLE tiles ADD COLUMN scanner TEXT DEFAULT ''"),
+            ("sensor_type", "ALTER TABLE tiles ADD COLUMN sensor_type TEXT DEFAULT ''"),
+            ("flightline_sensor_types", "ALTER TABLE tiles ADD COLUMN flightline_sensor_types TEXT DEFAULT '{}'"),
+            ("all_scanners", "ALTER TABLE tiles ADD COLUMN all_scanners TEXT DEFAULT '[]'"),
+        ]
+        for col, sql in migrations:
+            if col not in existing:
+                conn.execute(sql)
+                logger.debug("Migrated tiles table: added column %s", col)
 
     # ── tile CRUD ──────────────────────────────────────────────────
 
@@ -123,6 +147,11 @@ class Database:
         filename: str,
         bbox: Optional[tuple[float, float, float, float]] = None,
         point_count: int = 0,
+        flight_line: int = 0,
+        scanner: str = '',
+        all_scanners: Optional[List[str]] = None,
+        sensor_type: str = '',
+        flightline_sensor_types: Optional[Dict[int, str]] = None,
         status: str = TileStatus.IMPORTED,
         filter_params: Optional[Dict[str, Any]] = None,
         classification_model: Optional[str] = None,
@@ -136,6 +165,11 @@ class Database:
             filename:         LAS/LAZ file name (relative to project tiles dir).
             bbox:             ``(min_x, min_y, max_x, max_y)`` in CRS units.
             point_count:      Number of points in the tile.
+            flight_line:      Flight line number (0 = unknown).
+            scanner:          Dominant scanner/sensor name (e.g. 'vq820g').
+            all_scanners:     List of all unique scanner names found in this tile.
+            sensor_type:      'topo', 'bathy', or ''.
+            flightline_sensor_types: Optional dict mapping flight_line -> sensor_type.
             status:           One of :class:`TileStatus`.
             filter_params:    Optional dict serialised to JSON.
             classification_model: Model name/path used for classification.
@@ -148,6 +182,11 @@ class Database:
             bbox[2] if bbox else None,
             bbox[3] if bbox else None,
             point_count,
+            flight_line,
+            scanner,
+            json.dumps(all_scanners) if all_scanners else '[]',
+            sensor_type,
+            json.dumps(flightline_sensor_types) if flightline_sensor_types else '{}',
             status,
             json.dumps(filter_params) if filter_params else None,
             classification_model,
@@ -156,8 +195,10 @@ class Database:
             conn.execute(
                 """INSERT OR REPLACE INTO tiles
                    (id, filename, bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y,
-                    point_count, status, filter_params, classification_model, last_modified)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                    point_count, flight_line, scanner, all_scanners, sensor_type,
+                    flightline_sensor_types,
+                    status, filter_params, classification_model, last_modified)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
                 vals,
             )
 

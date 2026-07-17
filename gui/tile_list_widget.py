@@ -7,6 +7,7 @@ coloured status indicators, point counts, and context-menu actions.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -165,6 +166,24 @@ class TileListWidget(QWidget):
             item.setText(1, tile["id"])
             item.setText(2, f"{tile.get('point_count', 0):,}")
             item.setText(3, tile.get("last_modified", ""))
+
+            # Build tooltip with scanner info
+            tooltip_parts = [f"Tile: {tile['id']}"]
+            dom_scanner = tile.get("scanner", "")
+            all_raw = tile.get("all_scanners", "[]")
+            try:
+                all_list = json.loads(all_raw) if isinstance(all_raw, str) else all_raw
+            except Exception:
+                all_list = []
+            if all_list:
+                tooltip_parts.append(f"Sensors: {', '.join(all_list)}")
+            elif dom_scanner:
+                tooltip_parts.append(f"Scanner: {dom_scanner}")
+            fl = tile.get("flight_line", 0)
+            if fl:
+                tooltip_parts.append(f"Flight Line: {fl}")
+            item.setToolTip(1, "\n".join(tooltip_parts))
+
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(1, Qt.Checked)
 

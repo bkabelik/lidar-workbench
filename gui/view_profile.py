@@ -55,6 +55,7 @@ class ViewProfile(QWidget):
     selection_changed = Signal(np.ndarray)
     selection_mode_changed = Signal(str)
     profile_width_changed = Signal(float)
+    point_hovered = Signal(int, float, float, float, int, int)  # idx, x, y, z, class, intensity
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -65,6 +66,11 @@ class ViewProfile(QWidget):
         self._distances: Optional[np.ndarray] = None
         self._elevations: Optional[np.ndarray] = None
         self._classifications: Optional[np.ndarray] = None
+        self._intensities: Optional[np.ndarray] = None
+        self._profile_indices: Optional[np.ndarray] = None  # indices into the parent tile
+        self._xs: Optional[np.ndarray] = None  # original X coords
+        self._ys: Optional[np.ndarray] = None  # original Y coords
+        self._zs: Optional[np.ndarray] = None  # original Z coords
         self._dtm_distances: Optional[np.ndarray] = None
         self._dtm_elevations: Optional[np.ndarray] = None
 
@@ -94,6 +100,11 @@ class ViewProfile(QWidget):
         distances: np.ndarray,
         elevations: np.ndarray,
         classifications: np.ndarray,
+        intensities: Optional[np.ndarray] = None,
+        indices: Optional[np.ndarray] = None,
+        xs: Optional[np.ndarray] = None,
+        ys: Optional[np.ndarray] = None,
+        zs: Optional[np.ndarray] = None,
     ) -> None:
         """
         Load profile point data.  After loading, the view enters
@@ -104,12 +115,21 @@ class ViewProfile(QWidget):
             distances:       Distance along profile (meters).
             elevations:      Point elevations.
             classifications: ASPRS class codes.
+            intensities:     LiDAR intensity values.
+            indices:         Point indices into the parent tile array.
+            xs, ys, zs:      Original 3D coordinates.
         """
         self._distances = distances
         self._elevations = elevations
         self._classifications = classifications
+        self._intensities = intensities
+        self._profile_indices = indices
+        self._xs = xs
+        self._ys = ys
+        self._zs = zs
         self._current_mask = None
         self._width_adjusting = True  # enter width-adjust mode
+        self._class_visibility: Optional[np.ndarray] = None
         self._fit_view()
         self.update()
 
@@ -151,6 +171,11 @@ class ViewProfile(QWidget):
     def set_selection_mask(self, mask: np.ndarray) -> None:
         """Apply an externally-computed selection mask."""
         self._current_mask = mask
+        self.update()
+
+    def set_class_visibility(self, visibility: np.ndarray) -> None:
+        """Set which ASPRS classes are visible (bool array indexed by class code)."""
+        self._class_visibility = visibility
         self.update()
 
     def clear(self) -> None:
@@ -225,8 +250,13 @@ class ViewProfile(QWidget):
 
             for i in range(0, n, step):
                 pt = self._world_to_widget(self._distances[i], self._elevations[i])
-                cls = self._classifications[i] if self._classifications is not None else 0
-                r, g, b = get_class_color(int(cls))
+                cls = int(self._classifications[i]) if self._classifications is not None else 0
+
+                # Skip hidden classes
+                if self._class_visibility is not None and not self._class_visibility[cls]:
+                    continue
+
+                r, g, b = get_class_color(cls)
 
                 if self._current_mask is not None and self._current_mask[i]:
                     # Highlight selected points
@@ -304,6 +334,9 @@ class ViewProfile(QWidget):
         elif self._select_mode == SELECT_BRUSH and event.buttons() & Qt.LeftButton:
             # Continuous brush painting
             self._compute_brush_selection(wx, wy, additive=True)
+        else:
+            # Emit hover info for nearest point
+            self._emit_hover(wx, wy)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if not self._selecting:
@@ -396,6 +429,29 @@ class ViewProfile(QWidget):
 
         self.selection_changed.emit(self._current_mask.copy())
         self.update()
+
+    def _emit_hover(self, d: float, z: float) -> None:
+        """Find the nearest profile point and emit point_hovered signal."""
+        if self._distances is None or len(self._distances) == 0:
+            return
+
+        d_dist = self._distances - d
+        e_dist = self._elevations - z
+        dists = np.sqrt(d_dist * d_dist + e_dist * e_dist)
+        nearest = int(np.argmin(dists))
+
+        # Only emit if within reasonable distance in world coords
+        if dists[nearest] > self._brush_radius * 3:
+            return
+
+        idx = int(self._profile_indices[nearest]) if self._profile_indices is not None else int(nearest)
+        px = float(self._xs[nearest]) if self._xs is not None else 0.0
+        py = float(self._ys[nearest]) if self._ys is not None else 0.0
+        pz = float(self._elevations[nearest])
+        cls = int(self._classifications[nearest]) if self._classifications is not None else 0
+        intens = int(self._intensities[nearest]) if self._intensities is not None else 0
+
+        self.point_hovered.emit(idx, px, py, pz, cls, intens)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

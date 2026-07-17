@@ -269,6 +269,189 @@ def calculate_cluster_linearity(points):
         return (e1 - e2) / e1
     except:
         return 0
+# ── TerraSolid-inspired noise filters ──────────────────────────────────
+
+def isolated_point_filter(points, search_radius=3.0, min_distance=0.5):
+    """
+    Flag points whose nearest neighbour is farther than *min_distance*
+    within *search_radius*.  These are isolated "fliers" — aerial noise,
+    sensor artifacts, birds.
+
+    TerraSolid equivalent:  FnScanClassifyIsolated("1",7,3,"Any",0.50,0)
+
+    Args:
+        points: (N, 3) float64 array of xyz coordinates.
+        search_radius: Search radius in CRS units (metres).
+        min_distance: Minimum required distance to the closest neighbour.
+
+    Returns:
+        ``keep_mask`` — boolean array, True for inliers.
+    """
+    n = len(points)
+    if n < 2:
+        return np.ones(n, dtype=bool)
+
+    tree = cKDTree(points)
+    # Query 2 nearest neighbours (index 0 is the point itself)
+    dists, _ = tree.query(points, k=min(2, n))
+    if dists.ndim == 1:
+        nn_dist = dists  # only one point
+    else:
+        nn_dist = dists[:, 1]
+
+    keep_mask = nn_dist <= min_distance
+    print(f"  Isolated filter (r={search_radius}m, min_dist={min_distance}m): "
+          f"{(~keep_mask).sum():,} outliers / {n:,} points")
+    return keep_mask
+
+
+def low_point_filter(points, search_radius=2.0, below_threshold=1.0,
+                     above_threshold=10.0):
+    """
+    Flag points that are significantly below or above their local
+    neighbourhood — classic multipath (underground) and extreme aerial
+    outlier removal.
+
+    For each point the lowest and highest Z among neighbours within
+    *search_radius* is found.  If the point Z is more than
+    *below_threshold* **below** the lowest neighbour, or more than
+    *above_threshold* **above** the highest neighbour, it is noise.
+
+    TerraSolid equivalent:  FnScanClassifyLow("1",7,2,1.00,10.00,0)
+
+    Args:
+        points: (N, 3) float64 xyz array.
+        search_radius: Neighbourhood radius in CRS units (metres).
+        below_threshold: Max allowed Z below the local minimum.
+        above_threshold: Max allowed Z above the local maximum.
+
+    Returns:
+        ``keep_mask`` — boolean array, True for inliers.
+    """
+    n = len(points)
+    if n == 0:
+        return np.ones(n, dtype=bool)
+
+    tree = cKDTree(points)
+    indices_list = tree.query_ball_point(points, r=search_radius)
+
+    z = points[:, 2]
+    keep_mask = np.ones(n, dtype=bool)
+
+    for i in range(n):
+        neighbours = indices_list[i]
+        if len(neighbours) < 2:
+            continue  # not enough context — keep the point
+        nbr_z = z[neighbours]
+        if z[i] < nbr_z.min() - below_threshold or \
+           z[i] > nbr_z.max() + above_threshold:
+            keep_mask[i] = False
+
+    print(f"  Low-point filter (r={search_radius}m, "
+          f"below={below_threshold}m, above={above_threshold}m): "
+          f"{(~keep_mask).sum():,} outliers / {n:,} points")
+    return keep_mask
+
+
+def surface_noise_filter(points, grid_size=0.5, surface_tolerance=0.05,
+                         proximity_threshold=0.25):
+    """
+    Build a smooth minimum-Z surface grid, then flag points that sit
+    in a narrow band **above** the surface — near-ground noise that is
+    too high to be ground yet too low to be real features.
+
+    Algorithm
+    ---------
+    1.  Grid the points at *grid_size* and keep the minimum Z per cell.
+    2.  Hole-fill and median-smooth the grid.
+    3.  Bilinear-interpolate a surface height for every point.
+    4.  Points whose height-above-surface falls in
+        ``(surface_tolerance, proximity_threshold]`` are flagged.
+
+    TerraSolid equivalent:
+      FnScanClassifySurface  +  FnScanSmoothenXyz  +  FnScanClassifyCloseby
+
+    Args:
+        points: (N, 3) float64 xyz array.
+        grid_size: Cell size for the surface raster (metres).
+        surface_tolerance: Max height to be considered "on" the surface.
+        proximity_threshold: Upper bound of the noise band above surface.
+
+    Returns:
+        ``keep_mask`` — boolean array, True for inliers.
+    """
+    n = len(points)
+    if n < 100:
+        return np.ones(n, dtype=bool)
+
+    import scipy.ndimage as ndimage
+
+    min_x, max_x = points[:, 0].min(), points[:, 0].max()
+    min_y, max_y = points[:, 1].min(), points[:, 1].max()
+
+    nx = int(np.ceil((max_x - min_x) / grid_size)) + 1
+    ny = int(np.ceil((max_y - min_y) / grid_size)) + 1
+
+    # --- minimum Z per cell ---
+    grid = np.full((nx, ny), np.inf, dtype=np.float32)
+    gx = np.clip(((points[:, 0] - min_x) / grid_size).astype(np.int32), 0, nx - 1)
+    gy = np.clip(((points[:, 1] - min_y) / grid_size).astype(np.int32), 0, ny - 1)
+
+    # vectorised bin-minimum
+    flat_idx = gx * ny + gy
+    sort_idx = np.argsort(flat_idx)
+    sorted_flat = flat_idx[sort_idx]
+    sorted_z = points[sort_idx, 2]
+    unique_bins, first_idx = np.unique(sorted_flat, return_index=True)
+    last_idx = np.append(first_idx[1:], len(sort_idx))
+    for j, bin_id in enumerate(unique_bins):
+        bin_z = sorted_z[first_idx[j]:last_idx[j]]
+        xi, yi = divmod(bin_id, ny)
+        grid[xi, yi] = bin_z.min()
+    grid[grid == np.inf] = np.nan
+
+    # --- hole-fill & smooth ---
+    # Re-use the simple_fill defined above for the DTM
+    grid = simple_fill(grid)
+    grid = ndimage.median_filter(grid, size=3)
+
+    # --- bilinear surface height for every point ---
+    fx = (points[:, 0] - min_x) / grid_size
+    fy = (points[:, 1] - min_y) / grid_size
+    x0 = np.clip(np.floor(fx).astype(np.int32), 0, nx - 1)
+    y0 = np.clip(np.floor(fy).astype(np.int32), 0, ny - 1)
+    x1 = np.clip(x0 + 1, 0, nx - 1)
+    y1 = np.clip(y0 + 1, 0, ny - 1)
+
+    wx = fx - x0
+    wy = fy - y0
+
+    fill_val = float(np.nanmedian(grid))
+    if np.isnan(fill_val):
+        fill_val = float(np.median(points[:, 2]))
+
+    def _safe(arr):
+        out = arr.copy()
+        out[np.isnan(out)] = fill_val
+        return out
+
+    z_surface = (_safe(grid[x0, y0]) * (1 - wx) * (1 - wy) +
+                 _safe(grid[x1, y0]) * wx * (1 - wy) +
+                 _safe(grid[x0, y1]) * (1 - wx) * wy +
+                 _safe(grid[x1, y1]) * wx * wy)
+
+    h_above = points[:, 2] - z_surface
+    is_noise = (h_above > surface_tolerance) & (h_above <= proximity_threshold)
+
+    keep_mask = ~is_noise
+    print(f"  Surface-noise filter (grid={grid_size}m, "
+          f"band=({surface_tolerance}, {proximity_threshold}]m): "
+          f"{(~keep_mask).sum():,} outliers / {n:,} points")
+    return keep_mask
+
+
+# ── Interactive GUI application ──────────────────────────────────────
+
 class NoiseFilterApp:
     def __init__(self, points, intensities=None, initial_params=None, initial_active=None, 
                  return_num=None, total_returns=None):
@@ -305,7 +488,16 @@ class NoiseFilterApp:
             "dbscan": True,
             "intensity_min": 0.0,
             "dtm_grid_size": 2.0,
-            "max_gui_points": 25000000
+            "max_gui_points": 25000000,
+            # ── TerraSolid-style filters ──────────────────────
+            "isolated_radius": 3.0,
+            "isolated_min_dist": 0.5,
+            "lowpts_radius": 2.0,
+            "lowpts_below": 1.0,
+            "lowpts_above": 10.0,
+            "surf_grid": 0.5,
+            "surf_tolerance": 0.05,
+            "surf_proximity": 0.25,
         }
         
         # Override with initial params if provided
@@ -317,7 +509,11 @@ class NoiseFilterApp:
             "ror": False, # OFF by default for instant launch
             "dbscan": False,
             "floor": False, # OFF by default for instant launch
-            "intensity": False
+            "intensity": False,
+            # ── TerraSolid-style filters ──────────────────────
+            "isolated": False,
+            "low_points": False,
+            "surface_noise": False,
         }
         
         if initial_active:
@@ -416,6 +612,26 @@ class NoiseFilterApp:
             ("Min Cluster Size", "dbscan_min_points", 2, 500, 10),
             ("Base Altitude (m)", "dbscan_base_alt", 0.0, 50.0, 5.0),
             ("Linearity Protect", "dbscan_linearity", 0.0, 1.0, 0.85)
+        ]))
+
+        # Section: Isolated Points (TerraSolid-style)
+        self.panel.add_child(self._create_filter_section("Isolated Points (fliers)", "isolated", [
+            ("Search radius (m)", "isolated_radius", 0.5, 10.0, 3.0),
+            ("Min neighbour dist (m)", "isolated_min_dist", 0.1, 5.0, 0.5)
+        ]))
+
+        # Section: Low Points (TerraSolid-style)
+        self.panel.add_child(self._create_filter_section("Low Points (multipath)", "low_points", [
+            ("Search radius (m)", "lowpts_radius", 0.5, 10.0, 2.0),
+            ("Max below (m)", "lowpts_below", 0.1, 20.0, 1.0),
+            ("Max above (m)", "lowpts_above", 1.0, 100.0, 10.0)
+        ]))
+
+        # Section: Surface Noise (TerraSolid-style)
+        self.panel.add_child(self._create_filter_section("Surface Proximity Noise", "surface_noise", [
+            ("Grid size (m)", "surf_grid", 0.1, 5.0, 0.5),
+            ("Surface tolerance (m)", "surf_tolerance", 0.01, 0.5, 0.05),
+            ("Noise band upper (m)", "surf_proximity", 0.05, 2.0, 0.25)
         ]))
 
         # Section: Sampling (Info only)
@@ -638,6 +854,35 @@ class NoiseFilterApp:
             m = np.zeros(len(self.points), dtype=bool); m[ind] = True
             self.mask &= m
 
+        if self.active_filters["isolated"]:
+            m = isolated_point_filter(
+                self.points_local[self.mask],
+                search_radius=self.params["isolated_radius"],
+                min_distance=self.params["isolated_min_dist"],
+            )
+            keep_idx = np.where(self.mask)[0]
+            self.mask[keep_idx[~m]] = False
+
+        if self.active_filters["low_points"]:
+            m = low_point_filter(
+                self.points_local[self.mask],
+                search_radius=self.params["lowpts_radius"],
+                below_threshold=self.params["lowpts_below"],
+                above_threshold=self.params["lowpts_above"],
+            )
+            keep_idx = np.where(self.mask)[0]
+            self.mask[keep_idx[~m]] = False
+
+        if self.active_filters["surface_noise"]:
+            m = surface_noise_filter(
+                self.points_local[self.mask],
+                grid_size=self.params["surf_grid"],
+                surface_tolerance=self.params["surf_tolerance"],
+                proximity_threshold=self.params["surf_proximity"],
+            )
+            keep_idx = np.where(self.mask)[0]
+            self.mask[keep_idx[~m]] = False
+
         # --- PASS 2: Ground-Dependent Filters (Only runs if Ground Model was manually built) ---
         if self.heights is not None:
             if self.active_filters["floor"]:
@@ -737,6 +982,35 @@ def apply_headless_filter(points, intensities, params, active_filters, return_nu
                                                 std_ratio=params["sor_std_ratio"])
         m = np.zeros(len(points), dtype=bool); m[ind] = True
         combined_mask &= m
+
+    if active_filters.get("isolated", False):
+        m = isolated_point_filter(
+            points[combined_mask],
+            search_radius=params.get("isolated_radius", 3.0),
+            min_distance=params.get("isolated_min_dist", 0.5),
+        )
+        keep_idx = np.where(combined_mask)[0]
+        combined_mask[keep_idx[~m]] = False
+
+    if active_filters.get("low_points", False):
+        m = low_point_filter(
+            points[combined_mask],
+            search_radius=params.get("lowpts_radius", 2.0),
+            below_threshold=params.get("lowpts_below", 1.0),
+            above_threshold=params.get("lowpts_above", 10.0),
+        )
+        keep_idx = np.where(combined_mask)[0]
+        combined_mask[keep_idx[~m]] = False
+
+    if active_filters.get("surface_noise", False):
+        m = surface_noise_filter(
+            points[combined_mask],
+            grid_size=params.get("surf_grid", 0.5),
+            surface_tolerance=params.get("surf_tolerance", 0.05),
+            proximity_threshold=params.get("surf_proximity", 0.25),
+        )
+        keep_idx = np.where(combined_mask)[0]
+        combined_mask[keep_idx[~m]] = False
     
     # 2. Refined DTM Build from partially cleaned data (ROR/SOR/Intensity only)
     valid_idx = np.where(combined_mask)[0]

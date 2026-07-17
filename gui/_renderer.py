@@ -22,6 +22,19 @@ _HIDDEN_WINDOW: Optional[object] = None
 """Hidden Open3D Window that owns the Renderer."""
 
 
+def cleanup_shared_renderer() -> None:
+    """Close the hidden Open3D window and release the shared renderer."""
+    global _renderer, _HIDDEN_WINDOW
+    if _HIDDEN_WINDOW is not None:
+        try:
+            _HIDDEN_WINDOW.close()
+        except Exception:
+            pass
+        _HIDDEN_WINDOW = None
+    _renderer = None
+    logger.debug("Shared renderer cleaned up")
+
+
 def get_shared_renderer():
     """
     Return a :class:`open3d.visualization.rendering.Renderer` that can

@@ -20,10 +20,12 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QVBoxLayout,
     QWizard,
     QWizardPage,
@@ -55,6 +57,10 @@ class _ImportWorker(QThread):
         directory: str,
         tile_size_m: Optional[float],
         overlap_m: float,
+        target_points_per_tile: Optional[int] = None,
+        min_points_per_tile: Optional[int] = None,
+        sensor_type: str = '',
+        scanner_override: str = '',
         parent: Optional[QThread] = None,
     ) -> None:
         super().__init__(parent)
@@ -62,6 +68,10 @@ class _ImportWorker(QThread):
         self._dir = directory
         self._tile_size = tile_size_m
         self._overlap = overlap_m
+        self._target_points = target_points_per_tile
+        self._min_points = min_points_per_tile
+        self._sensor_type = sensor_type
+        self._scanner_override = scanner_override
 
     def run(self) -> None:
         """Execute the import (runs in the worker thread)."""
@@ -70,6 +80,10 @@ class _ImportWorker(QThread):
                 self._dir,
                 tile_size_m=self._tile_size,
                 overlap_m=self._overlap,
+                target_points_per_tile=self._target_points,
+                min_points_per_tile=self._min_points,
+                sensor_type=self._sensor_type,
+                scanner_override=self._scanner_override,
                 progress_callback=lambda msg, pct: self.progress.emit(msg, pct),
             )
             self.finished_import.emit(tile_ids)
@@ -219,11 +233,46 @@ class _TilingParamsPage(QWizardPage):
 
         layout.addWidget(size_group)
 
+        # Auto-detect target group
+        auto_group = QGroupBox("Auto-Detect Target")
+        auto_form = QFormLayout(auto_group)
+
+        self._target_points_spin = QDoubleSpinBox()
+        self._target_points_spin.setRange(0.1, 50.0)
+        self._target_points_spin.setValue(1.5)
+        self._target_points_spin.setDecimals(1)
+        self._target_points_spin.setSingleStep(0.5)
+        self._target_points_spin.setSuffix(" M pts")
+        self._target_points_spin.setToolTip(
+            "Target point count per tile when auto-detect is enabled"
+        )
+        auto_form.addRow("Target Points per Tile:", self._target_points_spin)
+
+        layout.addWidget(auto_group)
+
+        # Min points filter group
+        filter_group = QGroupBox("Tile Filtering")
+        filter_form = QFormLayout(filter_group)
+
+        self._min_points_spin = QDoubleSpinBox()
+        self._min_points_spin.setRange(0.0, 1000.0)
+        self._min_points_spin.setValue(0.0)
+        self._min_points_spin.setDecimals(0)
+        self._min_points_spin.setSingleStep(100.0)
+        self._min_points_spin.setSuffix(" K pts")
+        self._min_points_spin.setToolTip(
+            "Skip tiles with fewer than this many points (0 = keep all)"
+        )
+        filter_form.addRow("Minimum Points per Tile:", self._min_points_spin)
+
+        layout.addWidget(filter_group)
+
         # Info label
         self._info_label = QLabel(
             "Auto-detect computes tile size from point density to target "
             "~1.5 million points per tile.  Manual override is useful for "
-            "very sparse or very dense datasets."
+            "very sparse or very dense datasets.\n\n"
+            "Set a minimum point threshold to discard near-empty fringe tiles."
         )
         self._info_label.setWordWrap(True)
         layout.addWidget(self._info_label)
@@ -232,6 +281,7 @@ class _TilingParamsPage(QWizardPage):
 
     def _on_auto_toggled(self, checked: bool) -> None:
         self._tile_size_spin.setEnabled(not checked)
+        self._target_points_spin.setEnabled(checked)
 
     @property
     def tile_size_m(self) -> Optional[float]:
@@ -244,8 +294,96 @@ class _TilingParamsPage(QWizardPage):
     def overlap_m(self) -> float:
         return self._overlap_spin.value()
 
+    @property
+    def target_points_per_tile(self) -> Optional[int]:
+        """Target point count for auto-detect, or None to use default."""
+        return int(self._target_points_spin.value() * 1_000_000)
 
-# ── Page 3: progress ───────────────────────────────────────────────────
+    @property
+    def min_points_per_tile(self) -> Optional[int]:
+        """Minimum points per tile; tiles below this are skipped."""
+        return int(self._min_points_spin.value() * 1_000)
+
+
+# ── Page 3: sensor / scanner settings ──────────────────────────────────
+
+
+class _SensorParamsPage(QWizardPage):
+    """Third wizard page — configure sensor type and scanner name."""
+
+    def __init__(self, parent: Optional[QWizard] = None) -> None:
+        super().__init__(parent)
+        self.setTitle("Sensor & Scanner Settings")
+        self.setSubTitle(
+            "Select the sensor type (topography / bathymetry) and "
+            "optionally override the scanner name."
+        )
+
+        layout = QVBoxLayout(self)
+
+        # Sensor type
+        type_group = QGroupBox("Sensor Type")
+        type_layout = QVBoxLayout(type_group)
+
+        self._auto_radio = QRadioButton("Auto-detect from filename (recommended)")
+        self._auto_radio.setChecked(True)
+        self._topo_radio = QRadioButton("Topography (topo)")
+        self._bathy_radio = QRadioButton("Bathymetry (bathy)")
+        self._none_radio = QRadioButton("Unspecified")
+
+        type_layout.addWidget(self._auto_radio)
+        type_layout.addWidget(self._topo_radio)
+        type_layout.addWidget(self._bathy_radio)
+        type_layout.addWidget(self._none_radio)
+        layout.addWidget(type_group)
+
+        # Scanner override
+        scanner_group = QGroupBox("Scanner Name Override")
+        scanner_layout = QFormLayout(scanner_group)
+
+        self._scanner_edit = QLineEdit()
+        self._scanner_edit.setPlaceholderText(
+            "e.g. vq820g, vq580, als70 — leave empty for auto-detect"
+        )
+        scanner_layout.addRow("Scanner:", self._scanner_edit)
+        layout.addWidget(scanner_group)
+
+        # Info
+        self._info_label = QLabel(
+            "The scanner name is auto-detected from the filename "
+            "(e.g. 'vq820g' from '1 - vq820g - ...').  "
+            "Set an override here only when the filename does not "
+            "encode the sensor or you need a custom label.\n\n"
+            "<b>Auto-detect:</b> recognizes bathymetric scanners by the "
+            "RIEGL -G suffix (VQ-820-G, VQ-870-G, VQ-880-G, VQ-840-G) "
+            "and other known systems (Chiroptera, Hawkeye).  All other "
+            "recognized scanners are treated as topographic.  Topo and "
+            "bathy files can be imported together in a single run.\n\n"
+            "Sensor type helps separate topography and bathymetry "
+            "LiDAR for later analysis (e.g. automatic bathymetry "
+            "cutting to river boundaries)."
+        )
+        self._info_label.setWordWrap(True)
+        layout.addWidget(self._info_label)
+
+        layout.addStretch()
+
+    @property
+    def sensor_type(self) -> str:
+        if self._auto_radio.isChecked():
+            return ''  # auto-detect per file from scanner name
+        elif self._topo_radio.isChecked():
+            return 'topo'
+        elif self._bathy_radio.isChecked():
+            return 'bathy'
+        return ''
+
+    @property
+    def scanner_override(self) -> str:
+        return self._scanner_edit.text().strip()
+
+
+# ── Page 4: progress ───────────────────────────────────────────────────
 
 
 class _ProgressPage(QWizardPage):
@@ -295,6 +433,7 @@ class _ProgressPage(QWizardPage):
         pages = wizard.pageIds()
         file_page: _ImportFilePage = wizard.page(pages[0])  # type: ignore[assignment]
         params_page: _TilingParamsPage = wizard.page(pages[1])  # type: ignore[assignment]
+        sensor_page: _SensorParamsPage = wizard.page(pages[2])  # type: ignore[assignment]
 
         directory = file_page.selected_directory
         if directory is None:
@@ -309,8 +448,18 @@ class _ProgressPage(QWizardPage):
 
         tile_size = params_page.tile_size_m
         overlap = params_page.overlap_m
+        target_points = params_page.target_points_per_tile
+        min_points = params_page.min_points_per_tile
+        sensor_type = sensor_page.sensor_type
+        scanner_override = sensor_page.scanner_override
 
-        self._worker = _ImportWorker(tile_manager, directory, tile_size, overlap)
+        self._worker = _ImportWorker(
+            tile_manager, directory, tile_size, overlap,
+            target_points_per_tile=target_points,
+            min_points_per_tile=min_points,
+            sensor_type=sensor_type,
+            scanner_override=scanner_override,
+        )
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_import.connect(self._on_finished)
         self._worker.error_occurred.connect(self._on_error)
@@ -367,17 +516,19 @@ class ImportWizard(QWizard):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import LiDAR Data")
-        self.setMinimumSize(520, 420)
+        self.setMinimumSize(560, 600)
 
         # Store tile_manager as a property so pages can access it
         self.setProperty("tile_manager", tile_manager)
 
         self._file_page = _ImportFilePage(self)
         self._params_page = _TilingParamsPage(self)
+        self._sensor_page = _SensorParamsPage(self)
         self._progress_page = _ProgressPage(self)
 
         self.addPage(self._file_page)
         self.addPage(self._params_page)
+        self.addPage(self._sensor_page)
         self.addPage(self._progress_page)
 
         # If a directory is pre-selected, fill the file page and jump ahead

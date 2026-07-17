@@ -28,7 +28,6 @@ from PySide6.QtWidgets import (
 
 logger = logging.getLogger("lidar_workbench.gui.settings_dialog")
 
-_SHORTCUTS_FILE = ".shortcuts.json"
 _SHORTCUTS_FILE = ".settings.json"
 
 
@@ -70,14 +69,25 @@ DEFAULTS: Dict[str, str] = {
     "sel_rectangle": "R",
     "next_tile": "Tab",
     "prev_tile": "Shift+Tab",
+    "classify_created": "Ctrl+0",
+    "classify_unclass": "Ctrl+1",
     "classify_ground": "Ctrl+2",
     "classify_low_veg": "Ctrl+3",
     "classify_med_veg": "Ctrl+4",
     "classify_high_veg": "Ctrl+5",
     "classify_building": "Ctrl+6",
-    "classify_water": "Ctrl+9",
     "classify_noise": "Ctrl+7",
-    "classify_unclass": "Ctrl+1",
+    "classify_model_key": "Ctrl+8",
+    "classify_water": "Ctrl+9",
+    "classify_rail": "Ctrl+Shift+0",
+    "classify_road": "Ctrl+Shift+1",
+    "classify_overlap": "Ctrl+Shift+2",
+    "classify_wire_guard": "Ctrl+Shift+3",
+    "classify_wire_conductor": "Ctrl+Shift+4",
+    "classify_tower": "Ctrl+Shift+5",
+    "classify_wire_connector": "Ctrl+Shift+6",
+    "classify_bridge": "Ctrl+Shift+7",
+    "classify_high_noise": "Ctrl+Shift+8",
 }
 
 ACTION_LABELS: Dict[str, str] = {
@@ -95,14 +105,25 @@ ACTION_LABELS: Dict[str, str] = {
     "sel_rectangle": "Select: Rectangle",
     "next_tile": "Next Tile",
     "prev_tile": "Previous Tile",
+    "classify_created": "Quick Classify: Created (0)",
+    "classify_unclass": "Quick Classify: Unclassified (1)",
     "classify_ground": "Quick Classify: Ground (2)",
     "classify_low_veg": "Quick Classify: Low Veg (3)",
     "classify_med_veg": "Quick Classify: Med Veg (4)",
     "classify_high_veg": "Quick Classify: High Veg (5)",
     "classify_building": "Quick Classify: Building (6)",
-    "classify_water": "Quick Classify: Water (9)",
     "classify_noise": "Quick Classify: Low Pt Noise (7)",
-    "classify_unclass": "Quick Classify: Unclassified (1)",
+    "classify_model_key": "Quick Classify: Model Key (8)",
+    "classify_water": "Quick Classify: Water (9)",
+    "classify_rail": "Quick Classify: Rail (10)",
+    "classify_road": "Quick Classify: Road Surface (11)",
+    "classify_overlap": "Quick Classify: Overlap (12)",
+    "classify_wire_guard": "Quick Classify: Wire Guard (13)",
+    "classify_wire_conductor": "Quick Classify: Wire Conductor (14)",
+    "classify_tower": "Quick Classify: Tower (15)",
+    "classify_wire_connector": "Quick Classify: Wire Connector (16)",
+    "classify_bridge": "Quick Classify: Bridge Deck (17)",
+    "classify_high_noise": "Quick Classify: High Noise (18)",
 }
 
 

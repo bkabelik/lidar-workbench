@@ -39,12 +39,25 @@ from ..config import (
     DEFAULT_ROR_RADIUS,
     DEFAULT_SOR_NB_NEIGHBORS,
     DEFAULT_SOR_STD_RATIO,
+    DEFAULT_ISOLATED_SEARCH_RADIUS,
+    DEFAULT_ISOLATED_MIN_DISTANCE,
+    DEFAULT_LOW_POINTS_SEARCH_RADIUS,
+    DEFAULT_LOW_POINTS_BELOW,
+    DEFAULT_LOW_POINTS_ABOVE,
+    DEFAULT_SURFACE_NOISE_GRID,
+    DEFAULT_SURFACE_NOISE_TOLERANCE,
+    DEFAULT_SURFACE_NOISE_PROXIMITY,
     get_class_color,
 )
 from ..noise_filter import (
     dbscan_outlier_removal,
     radius_outlier_removal,
     statistical_outlier_removal,
+    isolated_point_removal,
+    low_point_removal,
+    surface_noise_removal,
+    multipath_reflection_removal,
+    bilateral_filter,
 )
 from ..tile_manager import TileManager
 from .view_3d import View3D
@@ -56,6 +69,11 @@ FILTER_TYPES = [
     ("ROR (Radius Outlier Removal)", "ror"),
     ("DBSCAN — Above (aerial noise)", "dbscan_above"),
     ("DBSCAN — Below (sub-surface noise)", "dbscan_below"),
+    ("Isolated Points (TerraSolid)", "isolated"),
+    ("Low Points — Multipath (TerraSolid)", "low_points"),
+    ("Surface Proximity Noise (TerraSolid)", "surface_noise"),
+    ("Multipath Reflection Removal", "multipath"),
+    ("Bilateral Filter (Edge-Preserving)", "bilateral"),
 ]
 
 
@@ -158,6 +176,108 @@ class FilterDialog(QDialog):
         self._dbscan_group.setVisible(False)
         left.addWidget(self._dbscan_group)
 
+        # --- Isolated Points params ---
+        self._isolated_group = QGroupBox("Isolated Points Parameters")
+        iso_f = QFormLayout(self._isolated_group)
+        self._isolated_radius_spin = QDoubleSpinBox()
+        self._isolated_radius_spin.setRange(0.5, 20.0)
+        self._isolated_radius_spin.setDecimals(2)
+        self._isolated_radius_spin.setValue(DEFAULT_ISOLATED_SEARCH_RADIUS)
+        self._isolated_radius_spin.setSuffix(" m")
+        iso_f.addRow("Search Radius:", self._isolated_radius_spin)
+        self._isolated_min_dist_spin = QDoubleSpinBox()
+        self._isolated_min_dist_spin.setRange(0.05, 10.0)
+        self._isolated_min_dist_spin.setDecimals(2)
+        self._isolated_min_dist_spin.setValue(DEFAULT_ISOLATED_MIN_DISTANCE)
+        self._isolated_min_dist_spin.setSuffix(" m")
+        iso_f.addRow("Min Neighbour Dist:", self._isolated_min_dist_spin)
+        self._isolated_group.setVisible(False)
+        left.addWidget(self._isolated_group)
+
+        # --- Low Points params ---
+        self._lowpts_group = QGroupBox("Low Points Parameters")
+        lpf = QFormLayout(self._lowpts_group)
+        self._lowpts_radius_spin = QDoubleSpinBox()
+        self._lowpts_radius_spin.setRange(0.5, 20.0)
+        self._lowpts_radius_spin.setDecimals(2)
+        self._lowpts_radius_spin.setValue(DEFAULT_LOW_POINTS_SEARCH_RADIUS)
+        self._lowpts_radius_spin.setSuffix(" m")
+        lpf.addRow("Search Radius:", self._lowpts_radius_spin)
+        self._lowpts_below_spin = QDoubleSpinBox()
+        self._lowpts_below_spin.setRange(0.1, 50.0)
+        self._lowpts_below_spin.setDecimals(2)
+        self._lowpts_below_spin.setValue(DEFAULT_LOW_POINTS_BELOW)
+        self._lowpts_below_spin.setSuffix(" m")
+        lpf.addRow("Max Below Neighbours:", self._lowpts_below_spin)
+        self._lowpts_above_spin = QDoubleSpinBox()
+        self._lowpts_above_spin.setRange(1.0, 200.0)
+        self._lowpts_above_spin.setDecimals(1)
+        self._lowpts_above_spin.setValue(DEFAULT_LOW_POINTS_ABOVE)
+        self._lowpts_above_spin.setSuffix(" m")
+        lpf.addRow("Max Above Neighbours:", self._lowpts_above_spin)
+        self._lowpts_group.setVisible(False)
+        left.addWidget(self._lowpts_group)
+
+        # --- Surface Noise params ---
+        self._surf_group = QGroupBox("Surface Noise Parameters")
+        sf = QFormLayout(self._surf_group)
+        self._surf_grid_spin = QDoubleSpinBox()
+        self._surf_grid_spin.setRange(0.1, 10.0)
+        self._surf_grid_spin.setDecimals(2)
+        self._surf_grid_spin.setValue(DEFAULT_SURFACE_NOISE_GRID)
+        self._surf_grid_spin.setSuffix(" m")
+        sf.addRow("Grid Size:", self._surf_grid_spin)
+        self._surf_tol_spin = QDoubleSpinBox()
+        self._surf_tol_spin.setRange(0.01, 1.0)
+        self._surf_tol_spin.setDecimals(3)
+        self._surf_tol_spin.setValue(DEFAULT_SURFACE_NOISE_TOLERANCE)
+        self._surf_tol_spin.setSuffix(" m")
+        sf.addRow("Surface Tolerance:", self._surf_tol_spin)
+        self._surf_prox_spin = QDoubleSpinBox()
+        self._surf_prox_spin.setRange(0.05, 5.0)
+        self._surf_prox_spin.setDecimals(2)
+        self._surf_prox_spin.setValue(DEFAULT_SURFACE_NOISE_PROXIMITY)
+        self._surf_prox_spin.setSuffix(" m")
+        sf.addRow("Noise Band Upper:", self._surf_prox_spin)
+        self._surf_group.setVisible(False)
+        left.addWidget(self._surf_group)
+
+        # --- Multipath params ---
+        self._multipath_group = QGroupBox("Multipath Parameters")
+        mpf = QFormLayout(self._multipath_group)
+        self._mp_depth_spin = QDoubleSpinBox()
+        self._mp_depth_spin.setRange(0.1, 5.0)
+        self._mp_depth_spin.setDecimals(2)
+        self._mp_depth_spin.setValue(0.5)
+        self._mp_depth_spin.setSuffix(" m")
+        mpf.addRow("Depth Threshold:", self._mp_depth_spin)
+        self._multipath_group.setVisible(False)
+        left.addWidget(self._multipath_group)
+
+        # --- Bilateral params ---
+        self._bilateral_group = QGroupBox("Bilateral Filter Parameters")
+        bf = QFormLayout(self._bilateral_group)
+        self._bilat_spatial_spin = QDoubleSpinBox()
+        self._bilat_spatial_spin.setRange(0.01, 10.0)
+        self._bilat_spatial_spin.setDecimals(2)
+        self._bilat_spatial_spin.setValue(0.5)
+        self._bilat_spatial_spin.setSuffix(" m")
+        bf.addRow("Spatial Sigma:", self._bilat_spatial_spin)
+        self._bilat_range_spin = QDoubleSpinBox()
+        self._bilat_range_spin.setRange(0.01, 5.0)
+        self._bilat_range_spin.setDecimals(2)
+        self._bilat_range_spin.setValue(0.1)
+        self._bilat_range_spin.setSuffix(" m")
+        bf.addRow("Range Sigma:", self._bilat_range_spin)
+        self._bilat_knn_spin = QSpinBox()
+        self._bilat_knn_spin.setRange(5, 200)
+        self._bilat_knn_spin.setValue(20)
+        bf.addRow("K Neighbors:", self._bilat_knn_spin)
+        self._bilateral_group.setVisible(False)
+        left.addWidget(self._bilateral_group)
+
+        # --- Bilateral params ---
+
         # --- Add to pipeline button ---
         add_btn = QPushButton("➕ Add to Pipeline & Preview")
         add_btn.clicked.connect(self._on_add_to_pipeline)
@@ -241,6 +361,11 @@ class FilterDialog(QDialog):
         self._sor_group.setVisible(ft == "sor")
         self._ror_group.setVisible(ft == "ror")
         self._dbscan_group.setVisible(ft in ("dbscan_above", "dbscan_below"))
+        self._isolated_group.setVisible(ft == "isolated")
+        self._lowpts_group.setVisible(ft == "low_points")
+        self._surf_group.setVisible(ft == "surface_noise")
+        self._multipath_group.setVisible(ft == "multipath")
+        self._bilateral_group.setVisible(ft == "bilateral")
 
     def _on_sor_slider_changed(self, value):
         self._sor_std_spin.blockSignals(True)
@@ -276,6 +401,16 @@ class FilterDialog(QDialog):
                 label += f"  (k={step['nb_neighbors']}, σ={step['std_ratio']})"
             elif step["type"] == "ror":
                 label += f"  (r={step['radius']}, min={step['min_points']})"
+            elif step["type"] == "isolated":
+                label += f"  (r={step['search_radius']}, d={step['min_distance']})"
+            elif step["type"] == "low_points":
+                label += f"  (r={step['search_radius']}, ↓{step['below_threshold']} ↑{step['above_threshold']})"
+            elif step["type"] == "surface_noise":
+                label += f"  (grid={step['grid_size']}, band=({step['surface_tolerance']},{step['proximity_threshold']}])"
+            elif step["type"] == "multipath":
+                label += f"  (depth_thresh={step['depth_threshold']})"
+            elif step["type"] == "bilateral":
+                label += f"  (σs={step['spatial_sigma']}, σr={step['range_sigma']}, k={step['knn']})"
             else:
                 label += f"  (ε={step['eps']}, min_s={step['min_samples']}, min_c={step['min_cluster_size']})"
             self._pipeline_list.addItem(QListWidgetItem(label))
@@ -290,6 +425,30 @@ class FilterDialog(QDialog):
             return {"type": "ror",
                     "radius": self._ror_radius_spin.value(),
                     "min_points": self._ror_min_spin.value()}
+        elif ft == "isolated":
+            return {"type": "isolated",
+                    "search_radius": self._isolated_radius_spin.value(),
+                    "min_distance": self._isolated_min_dist_spin.value()}
+        elif ft == "low_points":
+            return {"type": "low_points",
+                    "search_radius": self._lowpts_radius_spin.value(),
+                    "below_threshold": self._lowpts_below_spin.value(),
+                    "above_threshold": self._lowpts_above_spin.value()}
+        elif ft == "surface_noise":
+            return {"type": "surface_noise",
+                    "grid_size": self._surf_grid_spin.value(),
+                    "surface_tolerance": self._surf_tol_spin.value(),
+                    "proximity_threshold": self._surf_prox_spin.value()}
+        elif ft == "multipath":
+            return {"type": "multipath",
+                    "depth_threshold": self._mp_depth_spin.value()}
+        elif ft == "bilateral":
+            return {"type": "bilateral",
+                    "spatial_sigma": self._bilat_spatial_spin.value(),
+                    "range_sigma": self._bilat_range_spin.value(),
+                    "knn": self._bilat_knn_spin.value()}
+        elif ft == "":
+            return {"type": "sor", "nb_neighbors": 20, "std_ratio": 2.0}
         else:
             return {"type": ft,
                     "eps": self._dbscan_eps_spin.value(),
@@ -357,6 +516,26 @@ class FilterDialog(QDialog):
                         pts["x"][keep], pts["y"][keep], pts["z"][keep],
                         radius=step["radius"],
                         min_points=step["min_points"],
+                    )
+                elif step["type"] == "isolated":
+                    k, _ = isolated_point_removal(
+                        pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                        search_radius=step["search_radius"],
+                        min_distance=step["min_distance"],
+                    )
+                elif step["type"] == "low_points":
+                    k, _ = low_point_removal(
+                        pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                        search_radius=step["search_radius"],
+                        below_threshold=step["below_threshold"],
+                        above_threshold=step["above_threshold"],
+                    )
+                elif step["type"] == "surface_noise":
+                    k, _ = surface_noise_removal(
+                        pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                        grid_size=step["grid_size"],
+                        surface_tolerance=step["surface_tolerance"],
+                        proximity_threshold=step["proximity_threshold"],
                     )
                 else:
                     mode = "above" if step["type"] == "dbscan_above" else "below"

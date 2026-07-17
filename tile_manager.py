@@ -7,8 +7,10 @@ and lazy data loading for the view system.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional, Tuple
@@ -29,6 +31,7 @@ except ImportError:
     HAS_SCIPY = False
 
 from .config import (
+    DEFAULT_MIN_POINTS_PER_TILE,
     DEFAULT_TILE_OVERLAP_M,
     DEFAULT_TILE_SIZE_M,
     TARGET_POINTS_PER_TILE,
@@ -41,6 +44,36 @@ logger = logging.getLogger("lidar_workbench.tile_manager")
 
 # Type aliases
 PointCloud = Tuple[np.ndarray, np.ndarray, np.ndarray]  # (x, y, z)
+
+# ── Structured dtype for per-file tile chunk flushing ──────────────
+# All 21 point attributes in a single numpy structured array so we can
+# raw-binary append to disk without per-attribute file explosion.
+_TILE_CHUNK_DTYPE = np.dtype([
+    ("x", "f8"), ("y", "f8"), ("z", "f8"),
+    ("classification", "u1"), ("intensity", "u2"),
+    ("return_number", "u1"), ("number_of_returns", "u1"),
+    ("point_source_id", "u2"), ("gps_time", "f8"),
+    ("scan_angle_rank", "i1"), ("scan_angle", "f8"),
+    ("scan_direction_flag", "u1"), ("edge_of_flight_line", "u1"),
+    ("user_data", "u1"),
+    ("red", "u2"), ("green", "u2"), ("blue", "u2"),
+    ("key_point", "u1"), ("synthetic", "u1"),
+    ("withheld", "u1"), ("overlap", "u1"),
+])
+
+# Mapping from buffer keys to structured-array field names
+_TILE_BUF_TO_CHUNK: Dict[str, str] = {
+    "x": "x", "y": "y", "z": "z",
+    "cl": "classification", "in": "intensity",
+    "rn": "return_number", "nr": "number_of_returns",
+    "src": "point_source_id", "gt": "gps_time",
+    "sar": "scan_angle_rank", "sa": "scan_angle",
+    "sdf": "scan_direction_flag", "efl": "edge_of_flight_line",
+    "ud": "user_data",
+    "red": "red", "grn": "green", "blu": "blue",
+    "kp": "key_point", "syn": "synthetic",
+    "wh": "withheld", "ov": "overlap",
+}
 BBox = Tuple[float, float, float, float]  # (min_x, min_y, max_x, max_y)
 
 
@@ -81,6 +114,10 @@ class TileManager:
         directory: str | Path,
         tile_size_m: Optional[float] = None,
         overlap_m: Optional[float] = None,
+        target_points_per_tile: Optional[int] = None,
+        min_points_per_tile: Optional[int] = None,
+        sensor_type: str = '',
+        scanner_override: str = '',
         progress_callback: Optional[callable] = None,
     ) -> List[str]:
         """
@@ -92,12 +129,21 @@ class TileManager:
         ``point_source_id``.
 
         Args:
-            directory:          Path to a directory containing ``.las`` / ``.laz`` files.
-            tile_size_m:        Tile edge length in meters.  When ``None``, computed
-                                automatically from point density to hit ~1.5 M points/tile.
-            overlap_m:          Overlap between adjacent tiles in meters.
-            progress_callback:  Optional ``callable(step: str, pct: float)`` for progress
-                                reporting.
+            directory:              Path to a directory containing ``.las`` / ``.laz`` files.
+            tile_size_m:            Tile edge length in meters.  When ``None``, computed
+                                    automatically from point density to hit the target
+                                    points per tile.
+            overlap_m:              Overlap between adjacent tiles in meters.
+            target_points_per_tile: Target point count for auto-detect tile sizing
+                                    (default ``TARGET_POINTS_PER_TILE``, ~1.5 M).
+            min_points_per_tile:    Skip tiles with fewer than this many points
+                                    (default ``DEFAULT_MIN_POINTS_PER_TILE``, 0).
+            sensor_type:            ``'topo'`` for topography, ``'bathy'`` for bathymetry,
+                                    or ``''`` to leave unset.
+            scanner_override:       Manual scanner name override (ignores filename detection
+                                    and LAS header).  Use when filenames don't encode the sensor.
+            progress_callback:      Optional ``callable(step: str, pct: float)`` for progress
+                                    reporting.
 
         Returns:
             List of tile IDs that were imported.
@@ -129,21 +175,84 @@ class TileManager:
         all_bboxes: List[BBox] = []
         total_points = 0
         header_infos: List[Dict[str, Any]] = []
+        flight_line_counter = 0  # auto-increment when file has no flight line
+        header_template: Optional[dict] = None  # captured from first file
+        # Union extra dimensions across all files (different scanners may differ)
+        _union_extra_dims: Dict[str, str] = {}  # name → type
+        _template_format_id: Optional[int] = None
 
         for i, las_path in enumerate(las_files):
             try:
+                # Snapshot header template from the first readable file,
+                # then union extra dimensions from every file.
+                try:
+                    file_tmpl = _read_las_header_template(las_path)
+                    fmt_id = file_tmpl["point_format_id"]
+                    # Warn if point formats differ across files
+                    if _template_format_id is not None and fmt_id != _template_format_id:
+                        logger.warning(
+                            "Point format mismatch: %s is format %d, previous files were format %d. "
+                            "Output will use format %d, some attributes may be missing.",
+                            las_path.name, fmt_id, _template_format_id, _template_format_id,
+                        )
+                    # Capture first file's template as base
+                    if header_template is None:
+                        header_template = file_tmpl
+                        _template_format_id = fmt_id
+                        logger.info(
+                            "Header template from %s: format %d, %d VLR(s), %d extra dim(s)",
+                            las_path.name, fmt_id,
+                            len(header_template["vlrs"]),
+                            len(header_template["extra_dimensions"]),
+                        )
+                    # Union extra dimensions from all files
+                    for ed in file_tmpl["extra_dimensions"]:
+                        _union_extra_dims[ed.name] = ed.type
+                except Exception as exc:
+                    if header_template is None:
+                        logger.warning("Could not read header template from %s: %s", las_path, exc)
+
                 with laspy.open(las_path) as reader:
                     hdr = reader.header
                     bbox: BBox = (hdr.x_min, hdr.y_min, hdr.x_max, hdr.y_max)
                     n_pts = hdr.point_count
                     all_bboxes.append(bbox)
                     total_points += n_pts
-                    header_infos.append({
-                        "path": las_path,
-                        "bbox": bbox,
-                        "point_count": n_pts,
-                        "version": f"{hdr.version.major}.{hdr.version.minor}",
-                    })
+
+                # Extended metadata
+                meta = _read_las_header_meta(las_path)
+
+                # Flight-line number: use file_source_id if available, else auto-increment
+                file_fl = meta["file_source_id"]
+                if file_fl and file_fl > 0:
+                    flight_line = int(file_fl)
+                else:
+                    flight_line_counter += 1
+                    flight_line = flight_line_counter
+
+                # Scanner detection: explicit override > filename > header system_id
+                scanner = scanner_override.strip().lower() if scanner_override else ''
+                if not scanner:
+                    scanner = _detect_scanner_from_filename(las_path)
+                if not scanner:
+                    sid = meta["system_id"].strip()
+                    if sid and sid.lower() not in ('', 'default', 'none'):
+                        scanner = sid.lower()
+
+                # Sensor type: explicit > auto-detect from scanner > ''
+                file_sensor_type = sensor_type
+                if not file_sensor_type and scanner:
+                    file_sensor_type = _detect_sensor_type(scanner)
+
+                header_infos.append({
+                    "path": las_path,
+                    "bbox": bbox,
+                    "point_count": n_pts,
+                    "version": meta["version"],
+                    "flight_line": flight_line,
+                    "scanner": scanner,
+                    "sensor_type": file_sensor_type,
+                })
             except Exception as exc:
                 logger.error("Failed to read header of %s: %s", las_path, exc)
                 continue
@@ -153,6 +262,21 @@ class TileManager:
         if not header_infos:
             logger.warning("No readable LAS/LAZ files found")
             return []
+
+        # Fallback template if we couldn't read any header
+        if header_template is None:
+            header_template = {
+                "version": "1.4",
+                "point_format_id": 6,
+                "extra_dimensions": [],
+                "vlrs": [],
+                "x_scale": 0.001,
+                "y_scale": 0.001,
+                "z_scale": 0.001,
+            }
+        else:
+            # Replace file-specific list with the union across all files
+            header_template["extra_dimensions"] = list(_union_extra_dims.items())  # [(name, type), ...]
 
         # ── Phase 2: compute grid ───────────────────────────────────
         global_bbox: BBox = (
@@ -164,9 +288,15 @@ class TileManager:
         area_m2 = (global_bbox[2] - global_bbox[0]) * (global_bbox[3] - global_bbox[1])
         point_density = total_points / area_m2 if area_m2 > 0 else 0.0
 
+        # Apply defaults for new optional params
+        if target_points_per_tile is None:
+            target_points_per_tile = TARGET_POINTS_PER_TILE
+        if min_points_per_tile is None:
+            min_points_per_tile = DEFAULT_MIN_POINTS_PER_TILE
+
         if tile_size_m is None:
             if point_density > 0:
-                tile_area = TARGET_POINTS_PER_TILE / point_density
+                tile_area = target_points_per_tile / point_density
                 tile_size_m = np.sqrt(tile_area)
                 tile_size_m = max(50.0, round(tile_size_m / 50.0) * 50.0)
             else:
@@ -190,52 +320,87 @@ class TileManager:
         if progress_callback:
             progress_callback(f"Importing {len(las_files)} file(s) → {len(tile_bboxes)} tile(s)…", 5.0)
 
-        # ── Phase 3: single-pass streaming import ───────────────────
+        # ── Phase 3: stream files, flush per file to disk ─────────
         tiles_dir = self._pm.tiles_dir
         assert tiles_dir is not None
 
-        # Per-tile point accumulators  (lists of numpy arrays, flushed periodically)
-        tile_buffers: Dict[int, Dict[str, list]] = {}  # tile_idx → {x:[], y:[], z:[], cl:[], in:[], rn:[], src:[]}
+        chunk_dir = tiles_dir / ".tmp_import"
+        chunk_dir.mkdir(parents=True, exist_ok=True)
+        # Clean leftovers from a previous crashed import
+        for stale in chunk_dir.glob("*.bin"):
+            stale.unlink()
+
+        # In-memory buffers for the CURRENT file only (flushed after each file)
+        tile_buffers: Dict[int, Dict[str, list]] = {}
+        # Cumulative metadata trackers (tiny — just counter dicts)
+        tile_scanner_map: Dict[int, Dict[str, int]] = {}
+        tile_sensor_type_map: Dict[int, Dict[str, int]] = {}
+        tile_fl_sensor_types: Dict[int, Dict[int, str]] = {}
+        tile_total_points: Dict[int, int] = {}  # running total across flushed chunks
 
         imported_ids: List[str] = []
         total_processed = 0
 
         for file_idx, info in enumerate(header_infos):
-            flight_line = file_idx + 1  # 1-based flight strip number
+            flight_line = info["flight_line"]
             las_path = info["path"]
             file_total = info["point_count"]
             file_processed = 0
 
+            # Fresh buffers for this file
+            tile_buffers.clear()
+
             try:
                 with laspy.open(las_path) as reader:
-                    for chunk in reader.chunk_iterator(1_000_000):  # 1M pts per chunk
+                    for chunk in reader.chunk_iterator(1_000_000):
                         n = len(chunk)
                         x = np.array(chunk.x, dtype=np.float64)
                         y = np.array(chunk.y, dtype=np.float64)
 
-                        # Vectorised tile-index computation
                         col = ((x - grid_x0) / stride).astype(np.int64)
                         row = ((y - grid_y0) / stride).astype(np.int64)
-                        # Clamp to valid range
                         col = np.clip(col, 0, grid_cols - 1)
                         max_rows = int(np.ceil((global_bbox[3] - grid_y0) / stride))
                         row = np.clip(row, 0, max_rows - 1)
                         tile_idx_arr = row * grid_cols + col
 
-                        # Bin points by tile
                         z = np.array(chunk.z, dtype=np.float64)
                         cl = (_safe_attr(chunk, "classification", np.uint8, 0))
                         intens = (_safe_attr(chunk, "intensity", np.uint16, 0))
                         rn = (_safe_attr(chunk, "return_number", np.uint8, 1))
+                        nr = (_safe_attr(chunk, "number_of_returns", np.uint8, 1))
                         src = np.full(n, flight_line, dtype=np.uint16)
+                        gt  = (_safe_attr(chunk, "gps_time", np.float64, 0.0))
+                        sar = (_safe_attr(chunk, "scan_angle_rank", np.int8, 0))
+                        sa_deg = (_safe_attr(chunk, "scan_angle", np.float64, 0.0))
+                        sdf = (_safe_attr(chunk, "scan_direction_flag", np.uint8, 0))
+                        efl = (_safe_attr(chunk, "edge_of_flight_line", np.uint8, 0))
+                        ud  = (_safe_attr(chunk, "user_data", np.uint8, 0))
+                        red = (_safe_attr(chunk, "red", np.uint16, 0))
+                        grn = (_safe_attr(chunk, "green", np.uint16, 0))
+                        blu = (_safe_attr(chunk, "blue", np.uint16, 0))
+                        kp  = (_safe_attr(chunk, "key_point", np.uint8, 0))
+                        syn = (_safe_attr(chunk, "synthetic", np.uint8, 0))
+                        wh  = (_safe_attr(chunk, "withheld", np.uint8, 0))
+                        ov  = (_safe_attr(chunk, "overlap", np.uint8, 0))
 
-                        for tidx in range(len(tile_bboxes)):
+                        # Only iterate tiles that actually received points
+                        occupied = np.unique(tile_idx_arr)
+                        for tidx in occupied:
+                            tidx = int(tidx)
                             mask = tile_idx_arr == tidx
-                            if not mask.any():
-                                continue
                             if tidx not in tile_buffers:
-                                tile_buffers[tidx] = {"x":[], "y":[], "z":[],
-                                                       "cl":[], "in":[], "rn":[], "src":[]}
+                                tile_buffers[tidx] = {
+                                    "x":[], "y":[], "z":[],
+                                    "cl":[], "in":[], "rn":[], "nr":[], "src":[],
+                                    "gt":[], "sar":[], "sa":[], "sdf":[], "efl":[], "ud":[],
+                                    "red":[], "grn":[], "blu":[],
+                                    "kp":[], "syn":[], "wh":[], "ov":[],
+                                }
+                                if tidx not in tile_scanner_map:
+                                    tile_scanner_map[tidx] = {}
+                                if tidx not in tile_sensor_type_map:
+                                    tile_sensor_type_map[tidx] = {}
                             buf = tile_buffers[tidx]
                             buf["x"].append(x[mask])
                             buf["y"].append(y[mask])
@@ -243,53 +408,168 @@ class TileManager:
                             buf["cl"].append(cl[mask])
                             buf["in"].append(intens[mask])
                             buf["rn"].append(rn[mask])
+                            buf["nr"].append(nr[mask])
                             buf["src"].append(src[mask])
+                            buf["gt"].append(gt[mask])
+                            buf["sar"].append(sar[mask])
+                            buf["sa"].append(sa_deg[mask])
+                            buf["sdf"].append(sdf[mask])
+                            buf["efl"].append(efl[mask])
+                            buf["ud"].append(ud[mask])
+                            buf["red"].append(red[mask])
+                            buf["grn"].append(grn[mask])
+                            buf["blu"].append(blu[mask])
+                            buf["kp"].append(kp[mask])
+                            buf["syn"].append(syn[mask])
+                            buf["wh"].append(wh[mask])
+                            buf["ov"].append(ov[mask])
+                            sc_name = info.get("scanner", '')
+                            tile_scanner_map[tidx][sc_name] = (
+                                tile_scanner_map[tidx].get(sc_name, 0) + mask.sum()
+                            )
+                            st = info.get("sensor_type", '')
+                            tile_sensor_type_map[tidx][st] = (
+                                tile_sensor_type_map[tidx].get(st, 0) + mask.sum()
+                            )
+                            if tidx not in tile_fl_sensor_types:
+                                tile_fl_sensor_types[tidx] = {}
+                            tile_fl_sensor_types[tidx][flight_line] = st if st else ''
 
                         file_processed += n
                         total_processed += n
                         if progress_callback:
-                            pct = 5.0 + (total_processed / total_points) * 90.0
+                            pct = 5.0 + (total_processed / total_points) * 85.0
                             progress_callback(
                                 f"File {file_idx+1}/{len(header_infos)} — "
                                 f"{file_processed/file_total*100:.0f}%", pct
                             )
 
+                # Flush this file's buffers to disk, then free RAM
+                if tile_buffers:
+                    flushed = _flush_tile_buffers(tile_buffers, chunk_dir, file_idx)
+                    for tidx, n_pts in flushed.items():
+                        tile_total_points[tidx] = tile_total_points.get(tidx, 0) + n_pts
+                    tile_buffers.clear()
+
             except Exception as exc:
                 logger.error("Error reading %s: %s", las_path, exc)
+                tile_buffers.clear()
                 continue
 
-        # ── Phase 4: write tile files ───────────────────────────────
+        # ── Phase 4: merge chunks and write final tiles ────────────
         if progress_callback:
-            progress_callback("Writing tile files…", 95.0)
+            progress_callback("Merging tile chunks…", 90.0)
 
         with self._db.connect() as conn:
-            for tidx in sorted(tile_buffers.keys()):
-                buf = tile_buffers[tidx]
-                xs = np.concatenate(buf["x"])
-                ys = np.concatenate(buf["y"])
-                zs = np.concatenate(buf["z"])
-                cls = np.concatenate(buf["cl"])
-                intens = np.concatenate(buf["in"])
-                rns = np.concatenate(buf["rn"])
-                srcs = np.concatenate(buf["src"])
-
-                if len(xs) == 0:
+            tile_idxs = sorted(tile_total_points.keys())
+            for i, tidx in enumerate(tile_idxs):
+                # Gather all chunks for this tile
+                pattern = f"tile_{tidx:04d}_*.bin"
+                chunk_paths = sorted(chunk_dir.glob(pattern))
+                if not chunk_paths:
                     continue
+
+                if len(chunk_paths) == 1:
+                    # Single chunk — read directly
+                    data = np.fromfile(str(chunk_paths[0]), dtype=_TILE_CHUNK_DTYPE)
+                else:
+                    # Byte-level concatenate all chunks into one temp file,
+                    # then read once.  Avoids loading N arrays + np.concatenate.
+                    merged_path = chunk_dir / f"tile_{tidx:04d}_merged.bin"
+                    with open(merged_path, "wb") as out:
+                        for cp in chunk_paths:
+                            with open(cp, "rb") as inp:
+                                while True:
+                                    buf = inp.read(16 * 1024 * 1024)  # 16 MiB
+                                    if not buf:
+                                        break
+                                    out.write(buf)
+                    data = np.fromfile(str(merged_path), dtype=_TILE_CHUNK_DTYPE)
+                    merged_path.unlink()  # clean up the merge temp
+
+                n_pts = len(data)
+                if n_pts < min_points_per_tile:
+                    for p in chunk_paths:
+                        p.unlink()
+                    continue
+
+                xs = data["x"]; ys = data["y"]; zs = data["z"]
+                cls = data["classification"]; intens = data["intensity"]
+                rns = data["return_number"]; nrs = data["number_of_returns"]
+                srcs = data["point_source_id"]; gts = data["gps_time"]
+                sars = data["scan_angle_rank"]; sa_degs = data["scan_angle"]
+                sdfs = data["scan_direction_flag"]; efls = data["edge_of_flight_line"]
+                uds = data["user_data"]
+                reds = data["red"]; grns = data["green"]; blus = data["blue"]
+                kps = data["key_point"]; syns = data["synthetic"]
+                whs = data["withheld"]; ovs = data["overlap"]
+                del data  # free the structured array
 
                 tile_id = f"tile_{tidx:04d}"
                 tile_path = tiles_dir / f"{tile_id}.las"
                 _write_las_file(
                     tile_path, xs, ys, zs,
                     classes=cls, intensities=intens,
-                    return_numbers=rns, point_source_ids=srcs,
+                    return_numbers=rns, num_returns=nrs,
+                    point_source_ids=srcs,
+                    gps_times=gts, scan_angle_ranks=sars,
+                    scan_angles=sa_degs,
+                    scan_direction_flags=sdfs, edge_of_flight_lines=efls,
+                    user_data_array=uds,
+                    reds=reds, greens=grns, blues=blus,
+                    key_points=kps, synthetics=syns,
+                    withhelds=whs, overlaps=ovs,
+                    header_template=header_template,
                 )
+
+                # Determine dominant scanner for this tile
+                sc_map = tile_scanner_map.get(tidx, {})
+                dominant_scanner = ''
+                all_scanner_names: List[str] = []
+                if sc_map:
+                    sorted_scanners = sorted(sc_map.items(), key=lambda kv: kv[1], reverse=True)
+                    dominant_scanner = sorted_scanners[0][0] if sorted_scanners[0][0] else ''
+                    all_scanner_names = [s for s, _ in sorted_scanners if s]
+
+                # Representative flight_line (mode of point_source_id)
+                if len(srcs) > 0:
+                    src_int = srcs.astype(np.int64)
+                    flight_line_val = int(np.bincount(src_int).argmax())
+                else:
+                    flight_line_val = 0
+
+                # Dominant sensor_type
+                st_map = tile_sensor_type_map.get(tidx, {})
+                dominant_sensor_type = sensor_type
+                if not dominant_sensor_type and st_map:
+                    best_st = max(st_map.items(), key=lambda kv: kv[1])
+                    dominant_sensor_type = best_st[0] if best_st[0] else ''
 
                 self._db.insert_tile(
                     conn, tile_id=tile_id, filename=f"{tile_id}.las",
-                    bbox=tile_bboxes[tidx], point_count=len(xs),
+                    bbox=tile_bboxes[tidx], point_count=n_pts,
+                    flight_line=flight_line_val,
+                    scanner=dominant_scanner,
+                    all_scanners=all_scanner_names,
+                    sensor_type=dominant_sensor_type,
+                    flightline_sensor_types=tile_fl_sensor_types.get(tidx),
                     status=TileStatus.IMPORTED,
                 )
                 imported_ids.append(tile_id)
+
+                # Clean up chunks for this tile
+                for p in chunk_paths:
+                    p.unlink()
+
+                if progress_callback:
+                    pct = 90.0 + ((i + 1) / len(tile_idxs)) * 10.0
+                    progress_callback(f"Tile {i+1}/{len(tile_idxs)}…", pct)
+
+        # Remove temp directory if empty
+        try:
+            chunk_dir.rmdir()
+        except OSError:
+            pass
 
         if progress_callback:
             progress_callback("Import complete", 100.0)
@@ -345,7 +625,8 @@ class TileManager:
         Load all point attributes for a tile.
 
         Returns a dict with keys ``x, y, z, classification, intensity,
-        return_number``.  Each value is a 1-D numpy array.
+        return_number, point_source_id, sensor_type`` (and optional LAS fields).
+        ``sensor_type`` is encoded as 0=unknown, 1=topo, 2=bathy.  Each value is a 1-D numpy array.
         """
         tile_info = self._db.get_tile(tile_id)
         if tile_info is None:
@@ -366,20 +647,48 @@ class TileManager:
                     "z": np.array(las_data.z, dtype=np.float64),
                 }
                 # Optional fields
-                if hasattr(las_data, "classification"):
-                    result["classification"] = np.array(las_data.classification, dtype=np.uint8)
-                else:
-                    result["classification"] = np.zeros(len(result["x"]), dtype=np.uint8)
+                _safe = lambda attr, dtype, default: (
+                    np.array(getattr(las_data, attr), dtype=dtype)
+                    if hasattr(las_data, attr) else
+                    np.full(len(result["x"]), default, dtype=dtype)
+                )
+                result["classification"] = _safe("classification", np.uint8, 0)
+                result["intensity"] = _safe("intensity", np.uint16, 0)
+                result["return_number"] = _safe("return_number", np.uint8, 1)
+                result["num_returns"] = _safe("num_returns", np.uint8, 1)
+                result["point_source_id"] = _safe("point_source_id", np.uint16, 0)
+                result["scan_direction_flag"] = _safe("scan_direction_flag", np.uint8, 0)
+                result["edge_of_flight_line"] = _safe("edge_of_flight_line", np.uint8, 0)
+                result["scan_angle_rank"] = _safe("scan_angle_rank", np.int8, 0)
+                result["user_data"] = _safe("user_data", np.uint8, 0)
+                result["gps_time"] = _safe("gps_time", np.float64, 0.0)
+                result["red"] = _safe("red", np.uint16, 0)
+                result["green"] = _safe("green", np.uint16, 0)
+                result["blue"] = _safe("blue", np.uint16, 0)
+                result["key_point"] = _safe("key_point", np.uint8, 0)
+                result["synthetic"] = _safe("synthetic", np.uint8, 0)
+                result["withheld"] = _safe("withheld", np.uint8, 0)
+                result["overlap"] = _safe("overlap", np.uint8, 0)
 
-                if hasattr(las_data, "intensity"):
-                    result["intensity"] = np.array(las_data.intensity, dtype=np.uint16)
-                else:
-                    result["intensity"] = np.zeros(len(result["x"]), dtype=np.uint16)
-
-                if hasattr(las_data, "return_number"):
-                    result["return_number"] = np.array(las_data.return_number, dtype=np.uint8)
-                else:
-                    result["return_number"] = np.ones(len(result["x"]), dtype=np.uint8)
+                # Build per-point sensor_type from flightline→sensor_type mapping
+                fl_st_raw = tile_info.get("flightline_sensor_types", "{}")
+                try:
+                    fl_st_json: dict = json.loads(fl_st_raw) if isinstance(fl_st_raw, str) else fl_st_raw
+                    # JSON keys are strings; convert to int
+                    fl_to_st: Dict[int, int] = {}
+                    for k, v in fl_st_json.items():
+                        if v == "topo":
+                            fl_to_st[int(k)] = 1
+                        elif v == "bathy":
+                            fl_to_st[int(k)] = 2
+                    if fl_to_st:
+                        src_ids = result["point_source_id"]
+                        st_arr = np.zeros(len(result["x"]), dtype=np.uint8)
+                        for fl, st_code in fl_to_st.items():
+                            st_arr[src_ids == fl] = st_code
+                        result["sensor_type"] = st_arr
+                except Exception:
+                    logger.debug("Could not parse flightline_sensor_types for %s", tile_id)
 
                 return result
         except Exception as exc:
@@ -481,11 +790,156 @@ class TileManager:
 # ── Internal helpers ──────────────────────────────────────────────────
 
 
+# Known scanner/sensor name patterns (Riegl, Leica, Optech, etc.)
+_SCANNER_PATTERN = re.compile(
+    r'(?:^|[^a-zA-Z0-9])('
+    r'vq\d{3,4}[a-z]?'          # Riegl VQ series: vq820g, vq580, vq1560i
+    r'|vux-\d+[a-z]?'           # Riegl VUX series: vux-1, vux-240
+    r'|vq-\d+[a-z]?'            # Riegl VQ hyphenated: vq-880g
+    r'|minivux-\d+[a-z]?'       # Riegl miniVUX
+    r'|als\d+'                  # Leica ALS series: als50, als70, als80
+    r'|pegasus.*?\d+'           # Leica Pegasus
+    r'|orion.*?\w\d+'           # Optech Orion
+    r'|gemini.*?\w\d+'          # Optech Gemini
+    r'|alta\s*x\d+'             # Teledyne Optech ALTA
+    r'|galaxy.*?\w\d+'          # Teledyne Optech Galaxy
+    r'|ri.*?copl\d+'            # RIEGL RiCOPTER
+    r')(?:[^a-zA-Z0-9]|$)',
+    re.IGNORECASE,
+)
+
+
+def _detect_sensor_type(scanner_name: str) -> str:
+    """
+    Determine sensor type from scanner name.
+
+    RIEGL convention: models ending in ``-G`` or ``g`` are green-laser
+    bathymetric scanners (e.g. VQ-820-G, VQ-880-G, VQ-840-G).
+    Also recognizes other known bathymetric systems (Chiroptera, Hawkeye).
+
+    Returns ``'bathy'``, ``'topo'``, or ``''`` when unknown.
+    """
+    if not scanner_name:
+        return ''
+    name = scanner_name.strip().lower()
+
+    # RIEGL -G suffix = bathymetric green laser
+    if re.search(r'vq\d{3,4}-?g\b', name):
+        return 'bathy'
+    if name in ('chiroptera', 'hawkeye', 'dragoneye'):
+        return 'bathy'
+
+    # Any other recognised scanner → topo
+    if _SCANNER_PATTERN.search(name):
+        return 'topo'
+    return ''
+
+
+def _detect_scanner_from_filename(filepath: os.PathLike) -> str:
+    """Extract scanner/sensor name from a LAS filename.
+
+    Scans the filename (stem + parent dir) for known LiDAR sensor patterns.
+    Returns the lowercased match or ``''`` if nothing is recognised.
+
+    Examples:
+        ``1 - vq820g - 210430_105206_vq820g - originalpoints.las`` → ``'vq820g'``
+        ``vq580_flight03.las`` → ``'vq580'``
+        ``als70_hd_strip_01.laz`` → ``'als70'``
+    """
+    fname = str(Path(filepath).stem)
+    m = _SCANNER_PATTERN.search(fname)
+    if m:
+        return m.group(1).lower()
+    # Also try the parent directory name
+    parent = str(Path(filepath).parent.name)
+    m = _SCANNER_PATTERN.search(parent)
+    if m:
+        return m.group(1).lower()
+    return ''
+
+
+def _read_las_header_meta(las_path: os.PathLike) -> dict:
+    """Read extended metadata from a LAS header.
+
+    Returns a dict with keys:
+        ``system_id``, ``software``, ``file_source_id``, ``version``.
+    """
+    import laspy as _laspy
+    meta = {"system_id": "", "software": "", "file_source_id": 0, "version": ""}
+    try:
+        with _laspy.open(las_path) as reader:
+            hdr = reader.header
+            meta["system_id"] = getattr(hdr, 'system_identifier', '') or ''
+            meta["software"] = getattr(hdr, 'generating_software', '') or ''
+            meta["file_source_id"] = int(getattr(hdr, 'file_source_id', 0) or 0)
+            meta["version"] = f"{hdr.version.major}.{hdr.version.minor}"
+    except Exception:
+        pass
+    return meta
+
+
+def _read_las_header_template(las_path: Path) -> dict:
+    """Snapshot the header of the first input LAS file as a template for output tiles.
+
+    Returns a dict with keys:
+        ``version``, ``point_format_id``, ``extra_dimensions``,
+        ``vlrs``, ``x_scale``, ``y_scale``, ``z_scale``.
+    """
+    import laspy as _laspy
+    with _laspy.open(las_path) as reader:
+        hdr = reader.header
+        pf = hdr.point_format
+        template = {
+            "version": f"{hdr.version.major}.{hdr.version.minor}",
+            "point_format_id": pf.id,
+            "extra_dimensions": list(pf.extra_dimensions),
+            "vlrs": list(hdr.vlrs) if hasattr(hdr, 'vlrs') else [],
+            "x_scale": float(hdr.x_scale),
+            "y_scale": float(hdr.y_scale),
+            "z_scale": float(hdr.z_scale),
+        }
+    return template
+
+
 def _safe_attr(las_chunk, attr: str, dtype, default):
     """Return ``las_chunk.<attr>`` as a numpy array, or *default* if missing."""
     if hasattr(las_chunk, attr):
         return np.array(getattr(las_chunk, attr), dtype=dtype)
     return np.full(len(las_chunk), default, dtype=dtype)
+
+
+def _flush_tile_buffers(
+    tile_buffers: Dict[int, Dict[str, list]],
+    chunk_dir: Path,
+    file_idx: int,
+) -> Dict[int, int]:
+    """Serialize accumulated in-memory tile buffers to raw binary chunks on disk.
+
+    Returns a dict mapping ``tile_idx → point_count`` for the flushed chunk.
+    """
+    tile_pts: Dict[int, int] = {}
+    for tidx, buf in tile_buffers.items():
+        # Concatenate all per-attribute lists into flat arrays
+        arrays: Dict[str, np.ndarray] = {}
+        n_pts = 0
+        for buf_key, field_name in _TILE_BUF_TO_CHUNK.items():
+            arr = np.concatenate(buf[buf_key])
+            arrays[field_name] = arr
+            if n_pts == 0:
+                n_pts = len(arr)
+        if n_pts == 0:
+            continue
+
+        # Build structured array and write raw binary
+        data = np.empty(n_pts, dtype=_TILE_CHUNK_DTYPE)
+        for field_name, arr in arrays.items():
+            data[field_name] = arr
+
+        chunk_path = chunk_dir / f"tile_{tidx:04d}_{file_idx:04d}.bin"
+        data.tofile(str(chunk_path))
+        tile_pts[tidx] = n_pts
+
+    return tile_pts
 
 
 def _compute_tile_grid(
@@ -531,45 +985,129 @@ def _write_las_file(
     classes: Optional[np.ndarray] = None,
     intensities: Optional[np.ndarray] = None,
     return_numbers: Optional[np.ndarray] = None,
+    num_returns: Optional[np.ndarray] = None,
     point_source_ids: Optional[np.ndarray] = None,
+    gps_times: Optional[np.ndarray] = None,
+    scan_angle_ranks: Optional[np.ndarray] = None,
+    scan_angles: Optional[np.ndarray] = None,
+    scan_direction_flags: Optional[np.ndarray] = None,
+    edge_of_flight_lines: Optional[np.ndarray] = None,
+    user_data_array: Optional[np.ndarray] = None,
+    reds: Optional[np.ndarray] = None,
+    greens: Optional[np.ndarray] = None,
+    blues: Optional[np.ndarray] = None,
+    key_points: Optional[np.ndarray] = None,
+    synthetics: Optional[np.ndarray] = None,
+    withhelds: Optional[np.ndarray] = None,
+    overlaps: Optional[np.ndarray] = None,
+    header_template: Optional[dict] = None,
 ) -> None:
     """
     Write a set of points to a LAS file via laspy.
 
-    Creates LAS 1.4 point format 6 (includes classification, intensity,
-    return number, point source ID).
+    Creates a LAS header matching *header_template* (point format, version,
+    VLRs, extra dimensions, scales) when provided; falls back to LAS 1.4
+    point format 6 otherwise.  Only writes attributes that the chosen point
+    format actually supports.
     """
     if not HAS_LASPY:
         raise RuntimeError("laspy required")
 
     n = len(xs)
-    header = laspy.LasHeader(version="1.4", point_format=6)
+
+    # ── Build header from template (or fallback) ──────────────────
+    if header_template is not None:
+        header = laspy.LasHeader(
+            version=header_template["version"],
+            point_format=header_template["point_format_id"],
+        )
+        # Copy VLRs (carries CRS, etc.)
+        for vlr in header_template["vlrs"]:
+            header.vlrs.append(vlr)
+        # Copy extra-dimension definitions (union across all input files)
+        for ed in header_template["extra_dimensions"]:
+            # ed is (name, type) tuple from the union, or ExtraBytesParams
+            if isinstance(ed, tuple):
+                dim_name, dim_type = ed
+            else:
+                dim_name, dim_type = ed.name, ed.type
+            try:
+                header.add_extra_dim(name=dim_name, type=dim_type)
+            except Exception:
+                logger.debug("Skipping extra dim %s (may already exist)", dim_name)
+        # Copy scales from source
+        header.x_scale = header_template["x_scale"]
+        header.y_scale = header_template["y_scale"]
+        header.z_scale = header_template["z_scale"]
+    else:
+        header = laspy.LasHeader(version="1.4", point_format=6)
+        header.x_scale = 0.001
+        header.y_scale = 0.001
+        header.z_scale = 0.001
+
+    # Per-tile offsets
     header.x_offset = xs.min() if n > 0 else 0.0
     header.y_offset = ys.min() if n > 0 else 0.0
     header.z_offset = zs.min() if n > 0 else 0.0
-    header.x_scale = 0.001
-    header.y_scale = 0.001
-    header.z_scale = 0.001
 
     las_data = laspy.LasData(header)
     las_data.x = xs
     las_data.y = ys
     las_data.z = zs
 
-    las_data.classification = (
-        classes if classes is not None and len(classes) == n
-        else np.zeros(n, dtype=np.uint8)
-    )
-    las_data.intensity = (
-        intensities if intensities is not None and len(intensities) == n
-        else np.zeros(n, dtype=np.uint16)
-    )
-    las_data.return_number = (
-        return_numbers if return_numbers is not None and len(return_numbers) == n
-        else np.ones(n, dtype=np.uint8)
-    )
-    if point_source_ids is not None and len(point_source_ids) == n:
-        las_data.point_source_id = point_source_ids
+    def _set(attr_name: str, arr: Optional[np.ndarray], default_dtype, default_val) -> None:
+        """Set *attr_name* on *las_data* if the point format supports it."""
+        if not hasattr(las_data, attr_name):
+            return
+        if arr is not None and len(arr) == n:
+            setattr(las_data, attr_name, arr)
+        else:
+            setattr(las_data, attr_name, np.full(n, default_val, dtype=default_dtype))
+
+    _set("classification", classes, np.uint8, 0)
+    _set("intensity", intensities, np.uint16, 0)
+    _set("return_number", return_numbers, np.uint8, 1)
+    _set("number_of_returns", num_returns, np.uint8, 1)
+    _set("point_source_id", point_source_ids, np.uint16, 0)
+    _set("gps_time", gps_times, np.float64, 0.0)
+
+    # scan_angle vs scan_angle_rank: format 0-5 uses scan_angle_rank (int8),
+    # format 6-10 uses scan_angle (int16, stored as scaled integer in file).
+    if hasattr(las_data, "scan_angle_rank"):
+        _set("scan_angle_rank", scan_angle_ranks, np.int8, 0)
+    if hasattr(las_data, "scan_angle"):
+        if scan_angles is not None and len(scan_angles) == n:
+            las_data.scan_angle = scan_angles
+        elif scan_angle_ranks is not None and len(scan_angle_ranks) == n:
+            # Convert int8 rank → float degrees (LAS 1.4 spec: rank * 0.006)
+            las_data.scan_angle = scan_angle_ranks.astype(np.float64) * 0.006
+        else:
+            las_data.scan_angle = np.full(n, 0.0, dtype=np.float64)
+
+    _set("scan_direction_flag", scan_direction_flags, np.uint8, 0)
+    _set("edge_of_flight_line", edge_of_flight_lines, np.uint8, 0)
+    _set("user_data", user_data_array, np.uint8, 0)
+
+    # RGB — only point formats 2, 3, 5, 7, 8, 10
+    if hasattr(las_data, "red"):
+        _set("red", reds, np.uint16, 0)
+    if hasattr(las_data, "green"):
+        _set("green", greens, np.uint16, 0)
+    if hasattr(las_data, "blue"):
+        _set("blue", blues, np.uint16, 0)
+
+    # Classification flags (LAS 1.4 only)
+    for attr_name, arr in [
+        ("key_point", key_points),
+        ("synthetic", synthetics),
+        ("withheld", withhelds),
+        ("overlap", overlaps),
+    ]:
+        if arr is not None and len(arr) == n and hasattr(las_data, attr_name):
+            try:
+                setattr(las_data, attr_name, arr.astype(np.uint8))
+            except Exception:
+                pass
 
     path.parent.mkdir(parents=True, exist_ok=True)
     las_data.write(str(path))
