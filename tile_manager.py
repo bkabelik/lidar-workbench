@@ -118,6 +118,8 @@ class TileManager:
         min_points_per_tile: Optional[int] = None,
         sensor_type: str = '',
         scanner_override: str = '',
+        crs_epsg: Optional[int] = None,
+        crs_wkt: Optional[str] = None,
         progress_callback: Optional[callable] = None,
     ) -> List[str]:
         """
@@ -142,6 +144,8 @@ class TileManager:
                                     or ``''`` to leave unset.
             scanner_override:       Manual scanner name override (ignores filename detection
                                     and LAS header).  Use when filenames don't encode the sensor.
+            crs_epsg:               EPSG code for the CRS. Overrides auto-detection when set.
+            crs_wkt:                OGC WKT string for the CRS. Used when *crs_epsg* is not set.
             progress_callback:      Optional ``callable(step: str, pct: float)`` for progress
                                     reporting.
 
@@ -242,7 +246,7 @@ class TileManager:
                 # Sensor type: explicit > auto-detect from scanner > ''
                 file_sensor_type = sensor_type
                 if not file_sensor_type and scanner:
-                    file_sensor_type = _detect_sensor_type(scanner)
+                    file_sensor_type = _detect_sensor_type(scanner, las_path)
 
                 header_infos.append({
                     "path": las_path,
@@ -553,6 +557,8 @@ class TileManager:
                     all_scanners=all_scanner_names,
                     sensor_type=dominant_sensor_type,
                     flightline_sensor_types=tile_fl_sensor_types.get(tidx),
+                    crs_epsg=crs_epsg,
+                    crs_wkt=crs_wkt,
                     status=TileStatus.IMPORTED,
                 )
                 imported_ids.append(tile_id)
@@ -790,13 +796,68 @@ class TileManager:
 # ── Internal helpers ──────────────────────────────────────────────────
 
 
+def _detect_sensor_type_from_las(las_path: os.PathLike) -> str:
+    """
+    Inspect LAS file content for bathymetric indicators.
+
+    Checks VLR descriptions and extra dimension names for keywords
+    that suggest a green-laser bathymetric sensor:
+
+    - VLR descriptions containing: green, bathy, hydro, water, 532, cwlaser
+    - Extra dimension names: amplitude, reflectance, deviation, water_depth,
+      water_surface, bottom_return
+    - RIEGL VLRs with model name ending in -G / g
+
+    Returns ``'bathy'``, ``'topo'``, or ``''`` when no indicators found.
+    """
+    import laspy as _laspy
+    try:
+        with _laspy.open(las_path) as reader:
+            hdr = reader.header
+            pf = hdr.point_format
+
+            # ── Check VLR descriptions for bathy keywords ──────────
+            if hasattr(hdr, 'vlrs'):
+                for vlr in hdr.vlrs:
+                    desc = (getattr(vlr, 'description', '') or '').lower()
+                    if not desc:
+                        continue
+                    # RIEGL VLRs encode full model name: "RIEGL VQ-880-G Extra Bytes"
+                    if re.search(r'vq\d{3,4}-?g\b', desc):
+                        return 'bathy'
+                    # Generic bathy keywords in VLRs
+                    for kw in ('green laser', 'bathy', 'hydrographic',
+                               '532 nm', '532nm', 'water surface',
+                               'cwlaser'):
+                        if kw in desc:
+                            return 'bathy'
+
+            # ── Check extra dimension names ────────────────────────
+            extra_names = set()
+            for ed in pf.extra_dimensions:
+                extra_names.add((ed.name or '').lower())
+
+            _BATHY_DIMS = {
+                'water_depth', 'water surface', 'bottom_return',
+                'bathy_depth', 'sea_floor',
+                'subsea_depth', 'subsea_surface',
+            }
+            if extra_names & _BATHY_DIMS:
+                return 'bathy'
+
+            # ── No bathy indicators ────────────────────────────────
+            return ''
+    except Exception:
+        return ''
+
+
 # Known scanner/sensor name patterns (Riegl, Leica, Optech, etc.)
 _SCANNER_PATTERN = re.compile(
     r'(?:^|[^a-zA-Z0-9])('
-    r'vq\d{3,4}[a-z]?'          # Riegl VQ series: vq820g, vq580, vq1560i
-    r'|vux-\d+[a-z]?'           # Riegl VUX series: vux-1, vux-240
-    r'|vq-\d+[a-z]?'            # Riegl VQ hyphenated: vq-880g
-    r'|minivux-\d+[a-z]?'       # Riegl miniVUX
+    r'vq\d{3,4}(?:-[a-z])?[a-z]?'   # Riegl VQ series: vq820g, vq580, vq1560i
+    r'|vux-\d+(?:-[a-z])?[a-z]?'    # Riegl VUX series: vux-1, vux-240
+    r'|vq-\d+(?:-[a-z])?[a-z]?'     # Riegl VQ hyphenated: vq-860, vq-880-g
+    r'|minivux-\d+(?:-[a-z])?[a-z]?' # Riegl miniVUX
     r'|als\d+'                  # Leica ALS series: als50, als70, als80
     r'|pegasus.*?\d+'           # Leica Pegasus
     r'|orion.*?\w\d+'           # Optech Orion
@@ -809,24 +870,45 @@ _SCANNER_PATTERN = re.compile(
 )
 
 
-def _detect_sensor_type(scanner_name: str) -> str:
+def _detect_sensor_type(scanner_name: str, las_path: Optional[os.PathLike] = None) -> str:
     """
-    Determine sensor type from scanner name.
+    Determine sensor type from scanner name and (optionally) LAS file content.
 
     RIEGL convention: models ending in ``-G`` or ``g`` are green-laser
     bathymetric scanners (e.g. VQ-820-G, VQ-880-G, VQ-840-G).
-    Also recognizes other known bathymetric systems (Chiroptera, Hawkeye).
+    Also recognizes other known bathymetric systems (Chiroptera, Hawkeye,
+    CZMIL, SHOALS, LADS, EAARL).
+
+    When *las_path* is provided and the scanner name alone is ambiguous
+    (matches ``_SCANNER_PATTERN`` but no bathy pattern), inspects VLR
+    descriptions and extra dimension names for bathymetric indicators.
 
     Returns ``'bathy'``, ``'topo'``, or ``''`` when unknown.
     """
     if not scanner_name:
+        # Try LAS content inspection as last resort
+        if las_path is not None:
+            return _detect_sensor_type_from_las(las_path)
         return ''
     name = scanner_name.strip().lower()
 
-    # RIEGL -G suffix = bathymetric green laser
-    if re.search(r'vq\d{3,4}-?g\b', name):
+    # ── Known bathymetric scanners ────────────────────────────────
+    # RIEGL -G suffix = bathymetric green laser (e.g. vq820g, vq-880-g)
+    if re.search(r'vq-?\d{3,4}-?g\b', name):
         return 'bathy'
-    if name in ('chiroptera', 'hawkeye', 'dragoneye'):
+
+    # Hardcoded bathymetric system names
+    _BATHY_NAMES = (
+        'chiroptera', 'hawkeye', 'dragoneye',   # Leica / Teledyne
+        'czmil', 'shoals', 'lads', 'eaarl',     # USACE / Optech / NASA
+        'coastal', 'aquarius',                   # Teledyne Optech Aquarius
+    )
+    for bn in _BATHY_NAMES:
+        if bn in name:
+            return 'bathy'
+
+    # RIEGL model with 'g' appended directly: vq820g, vq880g
+    if re.search(r'vq-?\d{3,4}g\b', name):
         return 'bathy'
 
     # Any other recognised scanner → topo

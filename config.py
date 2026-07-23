@@ -52,19 +52,20 @@ DEFAULT_ROR_MIN_POINTS: Final[int] = 5
 DEFAULT_FILTER_WORKERS: Final[int] = 4     # parallel filter threads
 DEFAULT_CLASSIFY_WORKERS: Final[int] = 1  # parallel classify processes (GPU-heavy)
 
-# ── TerraSolid-style filter defaults ──────────────────────────────────
-DEFAULT_ISOLATED_SEARCH_RADIUS: Final[float] = 3.0
-DEFAULT_ISOLATED_MIN_DISTANCE: Final[float] = 0.5
+# ── Advanced filter defaults ──────────────────────────────────────
+DEFAULT_ISOLATED_SEARCH_RADIUS: Final[float] = 0.5
+DEFAULT_ISOLATED_MIN_NEIGHBORS: Final[int] = 3
 DEFAULT_LOW_POINTS_SEARCH_RADIUS: Final[float] = 2.0
 DEFAULT_LOW_POINTS_BELOW: Final[float] = 1.0
 DEFAULT_LOW_POINTS_ABOVE: Final[float] = 10.0
 DEFAULT_SURFACE_NOISE_GRID: Final[float] = 0.5
-DEFAULT_SURFACE_NOISE_TOLERANCE: Final[float] = 0.05
-DEFAULT_SURFACE_NOISE_PROXIMITY: Final[float] = 0.25
+DEFAULT_SURFACE_NOISE_TOLERANCE: Final[float] = 0.15
 
 # ── Profile defaults ──────────────────────────────────────────────────
 DEFAULT_PROFILE_WIDTH_M: Final[float] = 5.0     # meters
 DEFAULT_BRUSH_RADIUS_M: Final[float] = 2.0      # meters
+DEFAULT_RECT_WIDTH_M: Final[float] = 4.0        # meters (half-width for rect_brush)
+DEFAULT_RECT_HEIGHT_M: Final[float] = 2.0       # meters (half-height for rect_brush)
 
 # ── Pointcept defaults ────────────────────────────────────────────────
 DEFAULT_BATCH_SIZE: Final[int] = 1
@@ -128,9 +129,10 @@ class TileStatus:
     FILTERED: Final[str] = "FILTERED"
     CLASSIFIED: Final[str] = "CLASSIFIED"
     EDITED: Final[str] = "EDITED"
+    NOISE: Final[str] = "NOISE"
     ERROR: Final[str] = "ERROR"
 
-    ALL: Final[Tuple[str, ...]] = (IMPORTED, FILTERED, CLASSIFIED, EDITED, ERROR)
+    ALL: Final[Tuple[str, ...]] = (IMPORTED, FILTERED, CLASSIFIED, EDITED, NOISE, ERROR)
 
 # ── Project directory layout ──────────────────────────────────────────
 PROJECT_SUBDIRS: Final[Tuple[str, ...]] = ("tiles", "dtm")

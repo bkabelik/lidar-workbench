@@ -10,6 +10,7 @@ run in sequence.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import List, Optional
 
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -40,13 +42,12 @@ from ..config import (
     DEFAULT_SOR_NB_NEIGHBORS,
     DEFAULT_SOR_STD_RATIO,
     DEFAULT_ISOLATED_SEARCH_RADIUS,
-    DEFAULT_ISOLATED_MIN_DISTANCE,
+    DEFAULT_ISOLATED_MIN_NEIGHBORS,
     DEFAULT_LOW_POINTS_SEARCH_RADIUS,
     DEFAULT_LOW_POINTS_BELOW,
     DEFAULT_LOW_POINTS_ABOVE,
     DEFAULT_SURFACE_NOISE_GRID,
     DEFAULT_SURFACE_NOISE_TOLERANCE,
-    DEFAULT_SURFACE_NOISE_PROXIMITY,
     get_class_color,
 )
 from ..noise_filter import (
@@ -58,6 +59,7 @@ from ..noise_filter import (
     surface_noise_removal,
     multipath_reflection_removal,
     bilateral_filter,
+    thin_points_average,
 )
 from ..tile_manager import TileManager
 from .view_3d import View3D
@@ -69,11 +71,12 @@ FILTER_TYPES = [
     ("ROR (Radius Outlier Removal)", "ror"),
     ("DBSCAN — Above (aerial noise)", "dbscan_above"),
     ("DBSCAN — Below (sub-surface noise)", "dbscan_below"),
-    ("Isolated Points (TerraSolid)", "isolated"),
-    ("Low Points — Multipath (TerraSolid)", "low_points"),
-    ("Surface Proximity Noise (TerraSolid)", "surface_noise"),
+    ("Isolated Points (fliers)", "isolated"),
+    ("Low Points — Multipath", "low_points"),
+    ("Surface Proximity Noise", "surface_noise"),
     ("Multipath Reflection Removal", "multipath"),
     ("Bilateral Filter (Edge-Preserving)", "bilateral"),
+    ("Thin — Grid Average", "thin_average"),
 ]
 
 
@@ -185,12 +188,11 @@ class FilterDialog(QDialog):
         self._isolated_radius_spin.setValue(DEFAULT_ISOLATED_SEARCH_RADIUS)
         self._isolated_radius_spin.setSuffix(" m")
         iso_f.addRow("Search Radius:", self._isolated_radius_spin)
-        self._isolated_min_dist_spin = QDoubleSpinBox()
-        self._isolated_min_dist_spin.setRange(0.05, 10.0)
-        self._isolated_min_dist_spin.setDecimals(2)
-        self._isolated_min_dist_spin.setValue(DEFAULT_ISOLATED_MIN_DISTANCE)
-        self._isolated_min_dist_spin.setSuffix(" m")
-        iso_f.addRow("Min Neighbour Dist:", self._isolated_min_dist_spin)
+        self._isolated_min_nbr_spin = QSpinBox()
+        self._isolated_min_nbr_spin.setRange(1, 20)
+        self._isolated_min_nbr_spin.setValue(DEFAULT_ISOLATED_MIN_NEIGHBORS)
+        self._isolated_min_nbr_spin.setSuffix(" pts")
+        iso_f.addRow("Min Neighbours:", self._isolated_min_nbr_spin)
         self._isolated_group.setVisible(False)
         left.addWidget(self._isolated_group)
 
@@ -228,17 +230,11 @@ class FilterDialog(QDialog):
         self._surf_grid_spin.setSuffix(" m")
         sf.addRow("Grid Size:", self._surf_grid_spin)
         self._surf_tol_spin = QDoubleSpinBox()
-        self._surf_tol_spin.setRange(0.01, 1.0)
+        self._surf_tol_spin.setRange(0.01, 2.0)
         self._surf_tol_spin.setDecimals(3)
         self._surf_tol_spin.setValue(DEFAULT_SURFACE_NOISE_TOLERANCE)
         self._surf_tol_spin.setSuffix(" m")
-        sf.addRow("Surface Tolerance:", self._surf_tol_spin)
-        self._surf_prox_spin = QDoubleSpinBox()
-        self._surf_prox_spin.setRange(0.05, 5.0)
-        self._surf_prox_spin.setDecimals(2)
-        self._surf_prox_spin.setValue(DEFAULT_SURFACE_NOISE_PROXIMITY)
-        self._surf_prox_spin.setSuffix(" m")
-        sf.addRow("Noise Band Upper:", self._surf_prox_spin)
+        sf.addRow("Tolerance (±):", self._surf_tol_spin)
         self._surf_group.setVisible(False)
         left.addWidget(self._surf_group)
 
@@ -276,7 +272,17 @@ class FilterDialog(QDialog):
         self._bilateral_group.setVisible(False)
         left.addWidget(self._bilateral_group)
 
-        # --- Bilateral params ---
+        # --- Thin Average params ---
+        self._thin_group = QGroupBox("Thin — Grid Average Parameters")
+        tf = QFormLayout(self._thin_group)
+        self._thin_grid_spin = QDoubleSpinBox()
+        self._thin_grid_spin.setRange(0.1, 100.0)
+        self._thin_grid_spin.setDecimals(2)
+        self._thin_grid_spin.setValue(2.0)
+        self._thin_grid_spin.setSuffix(" m")
+        tf.addRow("Grid Size:", self._thin_grid_spin)
+        self._thin_group.setVisible(False)
+        left.addWidget(self._thin_group)
 
         # --- Add to pipeline button ---
         add_btn = QPushButton("➕ Add to Pipeline & Preview")
@@ -300,6 +306,15 @@ class FilterDialog(QDialog):
         self._clear_btn = QPushButton("Clear All")
         self._clear_btn.clicked.connect(self._on_clear_pipeline)
         btn_row.addWidget(self._clear_btn)
+        btn_row.addStretch()
+        self._save_btn = QPushButton("💾 Save Preset")
+        self._save_btn.setToolTip("Save current pipeline as a preset file (.json)")
+        self._save_btn.clicked.connect(self._on_save_preset)
+        btn_row.addWidget(self._save_btn)
+        self._load_btn = QPushButton("📂 Load Preset")
+        self._load_btn.setToolTip("Load a saved pipeline preset")
+        self._load_btn.clicked.connect(self._on_load_preset)
+        btn_row.addWidget(self._load_btn)
         mid.addLayout(btn_row)
 
         # --- Tile navigation ---
@@ -354,6 +369,25 @@ class FilterDialog(QDialog):
         self._preview_timer.setInterval(250)
         self._preview_timer.timeout.connect(self._update_preview)
 
+        # Connect all parameter spinboxes for live preview updates
+        self._connect_live_preview()
+
+    def _connect_live_preview(self):
+        """Wire all parameter spinboxes to trigger a debounced preview update."""
+        spinboxes = [
+            self._sor_nb_spin, self._sor_std_spin,
+            self._ror_radius_spin, self._ror_min_spin,
+            self._dbscan_eps_spin, self._dbscan_min_samples_spin, self._dbscan_min_cluster_spin,
+            self._isolated_radius_spin, self._isolated_min_nbr_spin,
+            self._lowpts_radius_spin, self._lowpts_below_spin, self._lowpts_above_spin,
+            self._surf_grid_spin, self._surf_tol_spin,
+            self._mp_depth_spin,
+            self._bilat_spatial_spin, self._bilat_range_spin, self._bilat_knn_spin,
+            self._thin_grid_spin,
+        ]
+        for sb in spinboxes:
+            sb.valueChanged.connect(self._schedule_preview_update)
+
     # ── filter type switching ──────────────────────────────────────
 
     def _on_filter_type_changed(self, index):
@@ -366,6 +400,7 @@ class FilterDialog(QDialog):
         self._surf_group.setVisible(ft == "surface_noise")
         self._multipath_group.setVisible(ft == "multipath")
         self._bilateral_group.setVisible(ft == "bilateral")
+        self._thin_group.setVisible(ft == "thin_average")
 
     def _on_sor_slider_changed(self, value):
         self._sor_std_spin.blockSignals(True)
@@ -402,15 +437,17 @@ class FilterDialog(QDialog):
             elif step["type"] == "ror":
                 label += f"  (r={step['radius']}, min={step['min_points']})"
             elif step["type"] == "isolated":
-                label += f"  (r={step['search_radius']}, d={step['min_distance']})"
+                label += f"  (r={step['search_radius']}, n={step['min_neighbors']})"
             elif step["type"] == "low_points":
                 label += f"  (r={step['search_radius']}, ↓{step['below_threshold']} ↑{step['above_threshold']})"
             elif step["type"] == "surface_noise":
-                label += f"  (grid={step['grid_size']}, band=({step['surface_tolerance']},{step['proximity_threshold']}])"
+                label += f"  (grid={step['grid_size']}, tol=±{step['tolerance']}m)"
             elif step["type"] == "multipath":
                 label += f"  (depth_thresh={step['depth_threshold']})"
             elif step["type"] == "bilateral":
                 label += f"  (σs={step['spatial_sigma']}, σr={step['range_sigma']}, k={step['knn']})"
+            elif step["type"] == "thin_average":
+                label += f"  (grid={step['grid_size']}m)"
             else:
                 label += f"  (ε={step['eps']}, min_s={step['min_samples']}, min_c={step['min_cluster_size']})"
             self._pipeline_list.addItem(QListWidgetItem(label))
@@ -428,7 +465,7 @@ class FilterDialog(QDialog):
         elif ft == "isolated":
             return {"type": "isolated",
                     "search_radius": self._isolated_radius_spin.value(),
-                    "min_distance": self._isolated_min_dist_spin.value()}
+                    "min_neighbors": self._isolated_min_nbr_spin.value()}
         elif ft == "low_points":
             return {"type": "low_points",
                     "search_radius": self._lowpts_radius_spin.value(),
@@ -437,8 +474,7 @@ class FilterDialog(QDialog):
         elif ft == "surface_noise":
             return {"type": "surface_noise",
                     "grid_size": self._surf_grid_spin.value(),
-                    "surface_tolerance": self._surf_tol_spin.value(),
-                    "proximity_threshold": self._surf_prox_spin.value()}
+                    "tolerance": self._surf_tol_spin.value()}
         elif ft == "multipath":
             return {"type": "multipath",
                     "depth_threshold": self._mp_depth_spin.value()}
@@ -447,6 +483,9 @@ class FilterDialog(QDialog):
                     "spatial_sigma": self._bilat_spatial_spin.value(),
                     "range_sigma": self._bilat_range_spin.value(),
                     "knn": self._bilat_knn_spin.value()}
+        elif ft == "thin_average":
+            return {"type": "thin_average",
+                    "grid_size": self._thin_grid_spin.value()}
         elif ft == "":
             return {"type": "sor", "nb_neighbors": 20, "std_ratio": 2.0}
         else:
@@ -470,8 +509,33 @@ class FilterDialog(QDialog):
             self._preview_status.setText("Failed to load preview data.")
             return
         n = len(data["x"])
-        if n > 50_000:
-            indices = np.random.choice(n, 50_000, replace=False)
+        TARGET = 500_000
+        if n > TARGET:
+            # Spatial cluster around a random center, with margin from
+            # tile edges so the cluster fits fully inside the tile.
+            # Compute expected cluster radius from point density.
+            x_range = float(data["x"].max() - data["x"].min())
+            y_range = float(data["y"].max() - data["y"].min())
+            area = x_range * y_range if x_range > 0 and y_range > 0 else 1.0
+            density = n / area
+            cluster_radius = np.sqrt(TARGET / (density * np.pi)) if density > 0 else x_range
+            margin = max(cluster_radius, 1.0)
+
+            x_min, x_max = float(data["x"].min()), float(data["x"].max())
+            y_min, y_max = float(data["y"].min()), float(data["y"].max())
+            if x_max - x_min > 2 * margin and y_max - y_min > 2 * margin:
+                cx = np.random.uniform(x_min + margin, x_max - margin)
+                cy = np.random.uniform(y_min + margin, y_max - margin)
+                cz = float(data["z"].mean())  # height doesn't matter for XY
+            else:
+                # Tile too small for margin — use centroid
+                cx, cy, cz = float(data["x"].mean()), float(data["y"].mean()), float(data["z"].mean())
+
+            # XY-only distance → cylinder, not sphere. Includes noise
+            # points far above/below ground that would be excluded by a
+            # spherical 3D distance.
+            dists = (data["x"] - cx)**2 + (data["y"] - cy)**2
+            indices = np.argpartition(dists, TARGET)[:TARGET]
             data = {k: v[indices] for k, v in data.items()}
         self._preview_points = data
         self._update_preview()
@@ -501,48 +565,60 @@ class FilterDialog(QDialog):
         pts = self._preview_points
         n = len(pts["x"])
 
+        # Get live UI params for the currently selected filter type
+        live_params = self._get_current_params()
+
         # Start with all points kept, then apply pipeline
         keep = np.ones(n, dtype=bool)
-        for step in self._pipeline:
+        for i, step in enumerate(self._pipeline):
+            # If this is the last step and its type matches the current
+            # filter type, use live UI values instead of stored params
+            # so parameter changes preview instantly.
+            is_last = (i == len(self._pipeline) - 1)
+            params = live_params if (is_last and step["type"] == live_params["type"]) else step
             try:
-                if step["type"] == "sor":
+                if params["type"] == "sor":
                     k, _ = statistical_outlier_removal(
                         pts["x"][keep], pts["y"][keep], pts["z"][keep],
-                        nb_neighbors=step["nb_neighbors"],
-                        std_ratio=step["std_ratio"],
+                        nb_neighbors=params["nb_neighbors"],
+                        std_ratio=params["std_ratio"],
                     )
-                elif step["type"] == "ror":
+                elif params["type"] == "ror":
                     k, _ = radius_outlier_removal(
                         pts["x"][keep], pts["y"][keep], pts["z"][keep],
-                        radius=step["radius"],
-                        min_points=step["min_points"],
+                        radius=params["radius"],
+                        min_points=params["min_points"],
                     )
-                elif step["type"] == "isolated":
+                elif params["type"] == "isolated":
                     k, _ = isolated_point_removal(
                         pts["x"][keep], pts["y"][keep], pts["z"][keep],
-                        search_radius=step["search_radius"],
-                        min_distance=step["min_distance"],
+                        search_radius=params["search_radius"],
+                        min_neighbors=params["min_neighbors"],
                     )
-                elif step["type"] == "low_points":
+                elif params["type"] == "low_points":
                     k, _ = low_point_removal(
                         pts["x"][keep], pts["y"][keep], pts["z"][keep],
-                        search_radius=step["search_radius"],
-                        below_threshold=step["below_threshold"],
-                        above_threshold=step["above_threshold"],
+                        search_radius=params["search_radius"],
+                        below_threshold=params["below_threshold"],
+                        above_threshold=params["above_threshold"],
                     )
-                elif step["type"] == "surface_noise":
+                elif params["type"] == "surface_noise":
                     k, _ = surface_noise_removal(
                         pts["x"][keep], pts["y"][keep], pts["z"][keep],
-                        grid_size=step["grid_size"],
-                        surface_tolerance=step["surface_tolerance"],
-                        proximity_threshold=step["proximity_threshold"],
+                        grid_size=params["grid_size"],
+                        tolerance=params["tolerance"],
+                    )
+                elif params["type"] == "thin_average":
+                    k, _ = thin_points_average(
+                        pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                        grid_size=params["grid_size"],
                     )
                 else:
-                    mode = "above" if step["type"] == "dbscan_above" else "below"
+                    mode = "above" if params["type"] == "dbscan_above" else "below"
                     k, _ = dbscan_outlier_removal(
                         pts["x"][keep], pts["y"][keep], pts["z"][keep],
-                        eps=step["eps"], min_samples=step["min_samples"],
-                        min_cluster_size=step["min_cluster_size"],
+                        eps=params["eps"], min_samples=params["min_samples"],
+                        min_cluster_size=params["min_cluster_size"],
                         mode=mode,
                     )
                 # Map back to original indices
@@ -583,3 +659,55 @@ class FilterDialog(QDialog):
         if self._batch_check.isChecked():
             self.filter_applied.emit(self._tile_ids, self._pipeline)
         self.accept()
+
+    # ── preset save / load ─────────────────────────────────────────
+
+    def _on_save_preset(self):
+        """Save the current pipeline as a JSON preset file."""
+        if not self._pipeline:
+            self._preview_status.setText("No pipeline steps to save.")
+            return
+        import json
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Filter Preset", "filter_preset.json",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w") as f:
+                json.dump({
+                    "description": "LiDAR Workbench filter pipeline preset",
+                    "pipeline": self._pipeline,
+                }, f, indent=2)
+            self._preview_status.setText(f"Preset saved: {path}")
+        except Exception as exc:
+            self._preview_status.setText(f"Save failed: {exc}")
+
+    def _on_load_preset(self):
+        """Load a pipeline from a JSON preset file."""
+        import json
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Filter Preset", "",
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r") as f:
+                data = json.load(f)
+            loaded = data.get("pipeline", [])
+            if not isinstance(loaded, list):
+                self._preview_status.setText("Invalid preset: 'pipeline' must be a list.")
+                return
+            # Validate basic structure
+            for step in loaded:
+                if not isinstance(step, dict) or "type" not in step:
+                    self._preview_status.setText("Invalid preset: each step must have 'type'.")
+                    return
+            self._pipeline = loaded
+            self._rebuild_pipeline_list()
+            self._update_preview()
+            self._preview_status.setText(f"Loaded {len(loaded)} step(s) from: {path}")
+        except Exception as exc:
+            self._preview_status.setText(f"Load failed: {exc}")

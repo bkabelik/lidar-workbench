@@ -72,6 +72,9 @@ class ViewDTM(QWidget):
         self._offset_y: float = 0.0
         self._scale: float = 1.0  # pixels per CRS unit
 
+        # Display toggle: show DTM raster or point scatter
+        self._show_dtm: bool = False
+
         # Profile drawing state
         self._drawing_profile: bool = False
         self._profile_start: Optional[Tuple[float, float]] = None
@@ -153,11 +156,30 @@ class ViewDTM(QWidget):
             self._dtm_grid_z = gz
             self._dtm_bbox = bbox
             self._render_dtm()
+            self._show_dtm = True  # auto-switch to DTM view
             self._fit_view()
             self.update()
             logger.info("DTM generated: %dx%d grid", gz.shape[0], gz.shape[1])
         except Exception as exc:
             logger.warning("DTM generation failed: %s", exc)
+
+    def toggle_dtm(self) -> None:
+        """Toggle between DTM raster and point scatter view."""
+        self._show_dtm = not self._show_dtm
+        self._fit_view()
+        self.update()
+
+    def contextMenuEvent(self, event) -> None:
+        """Right-click context menu."""
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        label = "🟢 Show Points" if self._show_dtm else "🗻 Show DTM"
+        toggle_action = menu.addAction(label)
+        toggle_action.triggered.connect(self.toggle_dtm)
+        menu.addSeparator()
+        gen_action = menu.addAction("Generate DTM from Ground")
+        gen_action.triggered.connect(lambda: self.generate_dtm())
+        menu.exec(event.globalPos())
 
     def clear(self) -> None:
         """Clear all data."""
@@ -365,20 +387,20 @@ class ViewDTM(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), QColor("#1a1a2e"))
 
-        # Draw DTM raster
-        if self._dtm_pixmap is not None and not self._dtm_pixmap.isNull():
+        # Draw DTM raster (if toggled on)
+        if self._show_dtm and self._dtm_pixmap is not None and not self._dtm_pixmap.isNull():
             x_min, x_max, y_min, y_max = self._dtm_bbox
             top_left = self._world_to_widget(x_min, y_min)
             bottom_right = self._world_to_widget(x_max, y_max)
             target_rect = QRectF(top_left, bottom_right)
             painter.drawPixmap(target_rect.toRect(), self._dtm_pixmap)
 
-        # Draw point overlay (if zoomed in enough)
-        if self._points_x is not None and self._scale > 0.05:
+        # Draw point overlay — always visible when we have points
+        if self._points_x is not None:
             painter.setPen(Qt.NoPen)
             n = len(self._points_x)
             # Downsample for performance
-            step = max(1, n // 20_000)
+            step = max(1, n // 75_000)
             for i in range(0, n, step):
                 pt = self._world_to_widget(self._points_x[i], self._points_y[i])
                 cls = self._points_class[i] if self._points_class is not None else 0

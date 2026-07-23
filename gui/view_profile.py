@@ -35,6 +35,7 @@ SELECT_LINE_ABOVE = "line_above"
 SELECT_LINE_BELOW = "line_below"
 SELECT_RECTANGLE = "rectangle"
 SELECT_BRUSH = "brush"
+SELECT_RECT_BRUSH = "rect_brush"
 
 
 class ViewProfile(QWidget):
@@ -56,6 +57,7 @@ class ViewProfile(QWidget):
     selection_mode_changed = Signal(str)
     profile_width_changed = Signal(float)
     point_hovered = Signal(int, float, float, float, int, int)  # idx, x, y, z, class, intensity
+    point_picked = Signal(int, float, float, float, int, int)   # idx, x, y, z, class, intensity (click)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -86,12 +88,33 @@ class ViewProfile(QWidget):
         self._sel_start: Optional[Tuple[float, float]] = None
         self._sel_end: Optional[Tuple[float, float]] = None
         self._brush_radius: float = 2.0
+        self._rect_width: float = 4.0    # half-width in meters for rect_brush
+        self._rect_height: float = 2.0   # half-height in meters for rect_brush
         self._current_mask: Optional[np.ndarray] = None
+        self._cursor_world: Optional[Tuple[float, float]] = None  # mouse pos in world coords
 
         # Width-adjust mode: after profile is loaded, scroll adjusts width
         # until the user clicks to confirm and enter selection mode.
         self._width_adjusting: bool = False
         self._total_width: float = 5.0   # current corridor width (m)
+
+        # Point Info tool state
+        self._point_info_active: bool = False
+        self._picked_point: Optional[Tuple[float, float, float, int, int, int, float]] = None
+        # (x, y, z, class, intensity, index, distance_on_profile)
+
+    @property
+    def point_info_active(self) -> bool:
+        """Whether the Point Info tool is active."""
+        return self._point_info_active
+
+    @point_info_active.setter
+    def point_info_active(self, value: bool) -> None:
+        """Enable/disable Point Info tool. Clears the picked-point marker when off."""
+        self._point_info_active = value
+        if not value:
+            self._picked_point = None
+            self.update()
 
     # ── public API ─────────────────────────────────────────────────
 
@@ -156,17 +179,25 @@ class ViewProfile(QWidget):
     def set_selection_mode(self, mode: str) -> None:
         """Set the active selection tool. Exits width-adjust mode if active."""
         if mode not in (SELECT_NONE, SELECT_LINE_ABOVE, SELECT_LINE_BELOW,
-                         SELECT_RECTANGLE, SELECT_BRUSH):
+                         SELECT_RECTANGLE, SELECT_BRUSH, SELECT_RECT_BRUSH):
             logger.warning("Unknown selection mode: %s", mode)
             return
         self._width_adjusting = False  # confirm width when user picks a tool
         self._select_mode = mode
+        self._cursor_world = None  # reset cursor on mode change
         self.selection_mode_changed.emit(mode)
         logger.debug("Profile selection mode: %s", mode)
 
     def set_brush_radius(self, radius: float) -> None:
         """Set the brush selection radius in meters."""
         self._brush_radius = max(0.1, radius)
+        self.update()
+
+    def set_rect_size(self, width: float, height: float) -> None:
+        """Set the rect_brush half-size in meters."""
+        self._rect_width = max(0.1, width)
+        self._rect_height = max(0.1, height)
+        self.update()
 
     def set_selection_mask(self, mask: np.ndarray) -> None:
         """Apply an externally-computed selection mask."""
@@ -201,11 +232,19 @@ class ViewProfile(QWidget):
         return d, z
 
     def _fit_view(self) -> None:
-        """Auto-fit to data bounds."""
+        """Auto-fit to data bounds, clipping extreme outliers via percentiles."""
         if self._distances is None or len(self._distances) == 0:
             return
         d_min, d_max = self._distances.min(), self._distances.max()
-        z_min, z_max = self._elevations.min(), self._elevations.max()
+
+        # Use 2nd / 98th percentiles for elevation to clip noise outliers
+        # (points far above/below ground that would otherwise flatten the profile)
+        n = len(self._elevations)
+        if n >= 50:
+            z_min = float(np.percentile(self._elevations, 2))
+            z_max = float(np.percentile(self._elevations, 98))
+        else:
+            z_min, z_max = float(self._elevations.min()), float(self._elevations.max())
 
         pad_d = (d_max - d_min) * 0.1 if d_max > d_min else 1.0
         pad_z = (z_max - z_min) * 0.1 if z_max > z_min else 1.0
@@ -215,8 +254,12 @@ class ViewProfile(QWidget):
 
         w = self.width() or 1
         h = self.height() or 1
-        self._scale_x = w / (d_max - d_min + 2 * pad_d) * 0.9 if (d_max - d_min) > 0 else 1.0
-        self._scale_y = h / (z_max - z_min + 2 * pad_z) * 0.9 if (z_max - z_min) > 0 else 1.0
+        data_w = d_max - d_min + 2 * pad_d if (d_max - d_min) > 0 else 1.0
+        data_h = z_max - z_min + 2 * pad_z if (z_max - z_min) > 0 else 1.0
+        # Uniform scale — preserves true proportions (1m = same pixels on both axes)
+        scale = min(w / data_w, h / data_h) * 0.9
+        self._scale_x = scale
+        self._scale_y = scale
 
     # ── painting ───────────────────────────────────────────────────
 
@@ -285,8 +328,32 @@ class ViewProfile(QWidget):
                 painter.drawRect(rect)
             elif self._select_mode == SELECT_BRUSH:
                 pt = self._world_to_widget(*self._sel_end)
-                r = self._brush_radius * self._scale_x
-                painter.drawEllipse(pt, r, r)
+                rx = self._brush_radius * self._scale_x
+                ry = self._brush_radius * self._scale_y
+                painter.drawEllipse(pt, rx, ry)
+            elif self._select_mode == SELECT_RECT_BRUSH:
+                d, z = self._sel_end
+                p1 = self._world_to_widget(d - self._rect_width, z - self._rect_height)
+                p2 = self._world_to_widget(d + self._rect_width, z + self._rect_height)
+                rect = QRectF(p1, p2).normalized()
+                painter.drawRect(rect)
+
+        # Persistent cursor indicator for click-to-place tools (brush / rect_brush)
+        if (not self._selecting and not self._width_adjusting
+                and self._cursor_world is not None
+                and self._select_mode in (SELECT_BRUSH, SELECT_RECT_BRUSH)):
+            painter.setPen(QPen(QColor("#ffaa00"), 1, Qt.DashLine))
+            if self._select_mode == SELECT_BRUSH:
+                pt = self._world_to_widget(*self._cursor_world)
+                rx = self._brush_radius * self._scale_x
+                ry = self._brush_radius * self._scale_y
+                painter.drawEllipse(pt, rx, ry)
+            elif self._select_mode == SELECT_RECT_BRUSH:
+                d, z = self._cursor_world
+                p1 = self._world_to_widget(d - self._rect_width, z - self._rect_height)
+                p2 = self._world_to_widget(d + self._rect_width, z + self._rect_height)
+                rect = QRectF(p1, p2).normalized()
+                painter.drawRect(rect)
 
         # Width-adjust mode overlay
         if self._width_adjusting:
@@ -296,15 +363,45 @@ class ViewProfile(QWidget):
                 f"Width: {self._total_width:.1f} m — scroll to adjust, click to confirm"
             )
 
+        # Point Info picked-point marker
+        if self._picked_point is not None and self._point_info_active:
+            px, py, pz, cls, intens, idx, d_val = self._picked_point
+            # Draw a bright crosshair at the picked point
+            z_val = pz
+            pt = self._world_to_widget(d_val, z_val)
+            cx, cy = pt.x(), pt.y()
+            r = 8
+            # Outer ring
+            painter.setPen(QPen(QColor(0, 255, 128, 220), 2.5))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawEllipse(QPointF(cx, cy), r, r)
+            # Crosshair
+            painter.drawLine(QPointF(cx - r - 4, cy), QPointF(cx + r + 4, cy))
+            painter.drawLine(QPointF(cx, cy - r - 4), QPointF(cx, cy + r + 4))
+            # Inner dot
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(QColor(0, 255, 128, 255)))
+            painter.drawEllipse(QPointF(cx, cy), 3, 3)
+
         painter.end()
 
     # ── mouse events ───────────────────────────────────────────────
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        # ── Point Info tool: click always picks a point ────────────
+        if self._point_info_active and event.button() in (Qt.LeftButton, Qt.RightButton):
+            if self._width_adjusting:
+                self._width_adjusting = False
+                self.profile_width_changed.emit(self._total_width)
+                self.update()
+            wx, wy = self._widget_to_world(event.position().x(), event.position().y())
+            self._pick_nearest_point(wx, wy)
+            return
+
+        # ── Width-adjust mode: first click confirms width ──────────
         if self._width_adjusting:
-            # Any click exits width-adjust mode → enter selection mode
             self._width_adjusting = False
-            self.profile_width_changed.emit(self._total_width)  # final width
+            self.profile_width_changed.emit(self._total_width)
             self.update()
             return  # don't start selection on the confirming click
 
@@ -314,9 +411,12 @@ class ViewProfile(QWidget):
             self._sel_start = (wx, wy)
             self._sel_end = (wx, wy)
 
-            # Brush: select immediately
+            # Brush / Rect Brush: select immediately on click
             if self._select_mode == SELECT_BRUSH:
                 self._compute_brush_selection(wx, wy)
+                self._selecting = False
+            elif self._select_mode == SELECT_RECT_BRUSH:
+                self._compute_rect_brush_selection(wx, wy)
                 self._selecting = False
 
             self.update()
@@ -328,15 +428,52 @@ class ViewProfile(QWidget):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         wx, wy = self._widget_to_world(event.position().x(), event.position().y())
+        self._cursor_world = (wx, wy)  # track for persistent cursor indicator
+
         if self._selecting:
             self._sel_end = (wx, wy)
             self.update()
         elif self._select_mode == SELECT_BRUSH and event.buttons() & Qt.LeftButton:
             # Continuous brush painting
             self._compute_brush_selection(wx, wy, additive=True)
+        elif self._select_mode == SELECT_RECT_BRUSH and event.buttons() & Qt.LeftButton:
+            # Continuous rect brush painting
+            self._compute_rect_brush_selection(wx, wy, additive=True)
         else:
-            # Emit hover info for nearest point
-            self._emit_hover(wx, wy)
+            # Emit hover info for nearest point (only when Point Info is off)
+            if not self._point_info_active:
+                self._emit_hover(wx, wy)
+
+        # Repaint for cursor indicator in brush/rect_brush modes
+        if self._select_mode in (SELECT_BRUSH, SELECT_RECT_BRUSH):
+            self.update()
+
+    def _pick_nearest_point(self, d: float, z: float) -> None:
+        """Find the nearest profile point to (d, z) and emit point_picked."""
+        if self._distances is None or len(self._distances) == 0:
+            return
+
+        d_dist = self._distances - d
+        e_dist = self._elevations - z
+        dists = np.sqrt(d_dist * d_dist + e_dist * e_dist)
+        nearest = int(np.argmin(dists))
+
+        # Only pick if within reasonable distance in world coords
+        if dists[nearest] > self._brush_radius * 3:
+            return
+
+        idx = int(self._profile_indices[nearest]) if self._profile_indices is not None else int(nearest)
+        px = float(self._xs[nearest]) if self._xs is not None else 0.0
+        py = float(self._ys[nearest]) if self._ys is not None else 0.0
+        pz = float(self._elevations[nearest])
+        cls = int(self._classifications[nearest]) if self._classifications is not None else 0
+        intens = int(self._intensities[nearest]) if self._intensities is not None else 0
+
+        # Store for marker rendering
+        self._picked_point = (px, py, pz, cls, intens, idx, d)
+        self.update()
+
+        self.point_picked.emit(idx, px, py, pz, cls, intens)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if not self._selecting:
@@ -353,8 +490,8 @@ class ViewProfile(QWidget):
         elif self._select_mode == SELECT_RECTANGLE:
             self._compute_rect_selection()
 
-        # Don't emit on brush — it's continuous
-        if self._select_mode != SELECT_BRUSH and self._current_mask is not None:
+        # Don't emit on brush/rect_brush — they're continuous
+        if self._select_mode not in (SELECT_BRUSH, SELECT_RECT_BRUSH) and self._current_mask is not None:
             self.selection_changed.emit(self._current_mask.copy())
 
         self.update()
@@ -383,13 +520,19 @@ class ViewProfile(QWidget):
         d1, z1 = self._sel_start
         d2, z2 = self._sel_end
 
+        # Constrain to points whose distance falls within the drawn segment
+        d_min, d_max = sorted([d1, d2])
+        in_range = (self._distances >= d_min) & (self._distances <= d_max)
+
         if abs(d2 - d1) < 1e-9:
             mask = self._distances >= d1 if above else self._distances < d1
+            mask = mask & in_range
         else:
             m = (z2 - z1) / (d2 - d1)
             b = z1 - m * d1
             line_z = m * self._distances + b
             mask = self._elevations > line_z if above else self._elevations < line_z
+            mask = mask & in_range
 
         self._current_mask = mask
         logger.debug("Line selection: %d points %s line", mask.sum(),
@@ -430,6 +573,27 @@ class ViewProfile(QWidget):
         self.selection_changed.emit(self._current_mask.copy())
         self.update()
 
+    def _compute_rect_brush_selection(
+        self, d: float, z: float, additive: bool = False
+    ) -> None:
+        if self._distances is None:
+            return
+
+        new_mask = (
+            (self._distances >= d - self._rect_width)
+            & (self._distances <= d + self._rect_width)
+            & (self._elevations >= z - self._rect_height)
+            & (self._elevations <= z + self._rect_height)
+        )
+
+        if additive and self._current_mask is not None:
+            self._current_mask = self._current_mask | new_mask
+        else:
+            self._current_mask = new_mask
+
+        self.selection_changed.emit(self._current_mask.copy())
+        self.update()
+
     def _emit_hover(self, d: float, z: float) -> None:
         """Find the nearest profile point and emit point_hovered signal."""
         if self._distances is None or len(self._distances) == 0:
@@ -456,3 +620,8 @@ class ViewProfile(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         # Keep view centered; don't re-fit (preserve user zoom)
+
+    def leaveEvent(self, event) -> None:
+        """Clear cursor indicator when mouse leaves the widget."""
+        self._cursor_world = None
+        self.update()

@@ -15,10 +15,12 @@ from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -61,6 +63,8 @@ class _ImportWorker(QThread):
         min_points_per_tile: Optional[int] = None,
         sensor_type: str = '',
         scanner_override: str = '',
+        crs_epsg: Optional[int] = None,
+        crs_wkt: Optional[str] = None,
         parent: Optional[QThread] = None,
     ) -> None:
         super().__init__(parent)
@@ -72,6 +76,8 @@ class _ImportWorker(QThread):
         self._min_points = min_points_per_tile
         self._sensor_type = sensor_type
         self._scanner_override = scanner_override
+        self._crs_epsg = crs_epsg
+        self._crs_wkt = crs_wkt
 
     def run(self) -> None:
         """Execute the import (runs in the worker thread)."""
@@ -84,6 +90,8 @@ class _ImportWorker(QThread):
                 min_points_per_tile=self._min_points,
                 sensor_type=self._sensor_type,
                 scanner_override=self._scanner_override,
+                crs_epsg=self._crs_epsg,
+                crs_wkt=self._crs_wkt,
                 progress_callback=lambda msg, pct: self.progress.emit(msg, pct),
             )
             self.finished_import.emit(tile_ids)
@@ -383,11 +391,277 @@ class _SensorParamsPage(QWizardPage):
         return self._scanner_edit.text().strip()
 
 
-# ── Page 4: progress ───────────────────────────────────────────────────
+# ── Page 4: CRS selection ──────────────────────────────────────────
+
+class _CrsParamsPage(QWizardPage):
+    """Fourth wizard page — auto-detect or select CRS."""
+
+    def __init__(self, parent: Optional[QWizard] = None) -> None:
+        super().__init__(parent)
+        self.setTitle("Coordinate Reference System")
+        self.setSubTitle(
+            "Select the CRS for the imported data. The CRS is "
+            "read from LAS metadata when available."
+        )
+
+        layout = QVBoxLayout(self)
+
+        # Auto / manual toggle
+        self._auto_crs = QRadioButton("Auto-detect CRS from LAS files (recommended)")
+        self._auto_crs.setChecked(True)
+        layout.addWidget(self._auto_crs)
+
+        self._manual_crs = QRadioButton("Assign CRS manually:")
+        layout.addWidget(self._manual_crs)
+
+        # Detection result label
+        self._detect_result = QLabel("")
+        self._detect_result.setWordWrap(True)
+        self._detect_result.setStyleSheet(
+            "QLabel { padding: 6px; border-radius: 4px; }"
+        )
+        self._detect_result.setVisible(False)
+        layout.addWidget(self._detect_result)
+
+        # EPSG combo + search button
+        epsg_layout = QHBoxLayout()
+        epsg_layout.setContentsMargins(20, 0, 0, 0)
+        self._epsg_combo = QComboBox()
+        self._epsg_combo.setEditable(True)
+        self._epsg_combo.setEnabled(False)
+        self._epsg_combo.setMinimumWidth(300)
+        self._epsg_combo.addItem("— Select EPSG code —", -1)
+        _COMMON_EPSG_CODES = [
+            (4326, "WGS 84 (geographic)"),
+            (32601, "WGS 84 / UTM zone 1N"),
+            (32632, "WGS 84 / UTM zone 32N"),
+            (32633, "WGS 84 / UTM zone 33N"),
+            (32634, "WGS 84 / UTM zone 34N"),
+            (25832, "ETRS89 / UTM zone 32N"),
+            (25833, "ETRS89 / UTM zone 33N"),
+            (31254, "MGI / Austria GK East"),
+            (31255, "MGI / Austria GK Central"),
+            (31256, "MGI / Austria GK West"),
+            (5514, "S-JTSK / Krovak East North"),
+            (21781, "CH1903 / LV03"),
+            (2056, "CH1903+ / LV95"),
+        ]
+        for code, desc in _COMMON_EPSG_CODES:
+            self._epsg_combo.addItem(f"EPSG:{code} — {desc}", code)
+        epsg_layout.addWidget(self._epsg_combo)
+        self._search_btn = QPushButton("Search…")
+        self._search_btn.setEnabled(False)
+        self._search_btn.clicked.connect(self._on_search_crs)
+        epsg_layout.addWidget(self._search_btn)
+        epsg_layout.addStretch()
+        layout.addLayout(epsg_layout)
+
+        self._auto_crs.toggled.connect(self._on_auto_toggled)
+        self._manual_crs.toggled.connect(lambda c: self.completeChanged.emit())
+        self._epsg_combo.currentIndexChanged.connect(lambda _: self.completeChanged.emit())
+        self._epsg_combo.editTextChanged.connect(lambda _: self.completeChanged.emit())
+
+        # Info
+        self._crs_info_label = QLabel(
+            "The Coordinate Reference System (CRS) defines how the "
+            "X,Y coordinates map to real-world locations. Most LAS "
+            "files include this information in their header.\n\n"
+            "<b>Auto-detect:</b> reads the OGC WKT from the LAS VLR. "
+            "If all files share the same CRS, it is used automatically. "
+            "Mixed CRS files will trigger a warning.\n\n"
+            "<b>Manual:</b> use when the LAS files lack CRS metadata "
+            "or when you need to override it."
+        )
+        self._crs_info_label.setWordWrap(True)
+        layout.addWidget(self._crs_info_label)
+
+        layout.addStretch()
+
+        self._detected_epsg: Optional[int] = None
+        self._detected_wkt: Optional[str] = None
+
+    # ── Page lifecycle ──────────────────────────────────────────
+
+    def initializePage(self) -> None:
+        """Called when this page becomes current — try to read CRS."""
+        super().initializePage()
+        self._detect_crs_from_files()
+
+    def _detect_crs_from_files(self) -> None:
+        """Read CRS from the first LAS file in the selected directory."""
+        wizard = self.wizard()
+        if wizard is None:
+            return
+        pages = wizard.pageIds()
+        file_page = wizard.page(pages[0])
+        directory = getattr(file_page, 'selected_directory', None)
+        if not directory:
+            return
+
+        from pathlib import Path
+        dir_path = Path(directory)
+        las_files = sorted(list(dir_path.glob("*.las")) + list(dir_path.glob("*.laz")))
+        if not las_files:
+            return
+
+        try:
+            from .crs import read_crs_from_las, wkt_to_epsg, get_crs_info
+        except ImportError:
+            return
+
+        # Try first 3 files (some may be corrupted)
+        epsg: Optional[int] = None
+        wkt: Optional[str] = None
+        for f in las_files[:3]:
+            wkt = read_crs_from_las(f)
+            if wkt:
+                epsg = wkt_to_epsg(wkt)
+                break
+
+        if epsg and wkt:
+            self._detected_epsg = epsg
+            self._detected_wkt = wkt
+            info = get_crs_info(wkt)
+            self._detect_result.setText(
+                f"✅ Found: <b>EPSG:{epsg}</b> — {info.get('name', 'Unknown')} "
+                f"({info.get('type', '')}, {info.get('unit', '')})"
+            )
+            self._detect_result.setStyleSheet(
+                "QLabel { background: #e8f5e9; color: #2e7d32; "
+                "padding: 6px; border-radius: 4px; }"
+            )
+            self._auto_crs.setChecked(True)
+        else:
+            self._detected_epsg = None
+            self._detected_wkt = None
+            self._detect_result.setText(
+                "⚠ <b>No CRS found</b> in LAS file metadata. "
+                "Please select the CRS manually or use Search to find it."
+            )
+            self._detect_result.setStyleSheet(
+                "QLabel { background: #fff3e0; color: #e65100; "
+                "padding: 6px; border-radius: 4px; }"
+            )
+            self._manual_crs.setChecked(True)
+            # Auto-open search after a short delay so the UI is visible
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(200, self._on_search_crs)
+
+        self._detect_result.setVisible(True)
+        self.completeChanged.emit()
+
+    def _on_auto_toggled(self, checked: bool) -> None:
+        self._epsg_combo.setEnabled(not checked)
+        self._search_btn.setEnabled(not checked)
+        if checked and self._detected_epsg is None:
+            # No CRS found — force manual
+            self._detect_result.setText(
+                "⚠ <b>No CRS found</b> in LAS files. Please select one manually."
+            )
+            self._detect_result.setStyleSheet(
+                "QLabel { background: #fff3e0; color: #e65100; "
+                "padding: 6px; border-radius: 4px; }"
+            )
+        self.completeChanged.emit()
+
+    def _on_search_crs(self) -> None:
+        """Open a small search dialog to find an EPSG code."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLineEdit, QListWidget, QListWidgetItem
+        from PySide6.QtCore import Qt
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Search EPSG Code")
+        dlg.setMinimumWidth(420)
+        layout = QVBoxLayout(dlg)
+
+        search_edit = QLineEdit()
+        search_edit.setPlaceholderText("Type to search (e.g. 'UTM 33', 'austria', 'MGI')…")
+        layout.addWidget(search_edit)
+
+        results_list = QListWidget()
+        layout.addWidget(results_list)
+
+        def do_search(text: str) -> None:
+            if len(text) < 1:
+                results_list.clear()
+                return
+            try:
+                from .crs import get_epsg_suggestions
+                results = get_epsg_suggestions(text, limit=25)
+            except ImportError:
+                results = []
+            results_list.clear()
+            for r in results:
+                item = QListWidgetItem(f"EPSG:{r['epsg']} — {r['name']}  [{r['type']}]")
+                item.setData(Qt.UserRole, r['epsg'])
+                results_list.addItem(item)
+
+        search_edit.textChanged.connect(do_search)
+        # Pre-populate with common codes
+        do_search("")
+
+        def on_pick(item: QListWidgetItem) -> None:
+            epsg = item.data(Qt.UserRole)
+            if epsg:
+                idx = self._epsg_combo.findData(epsg)
+                if idx < 0:
+                    self._epsg_combo.addItem(item.text(), epsg)
+                    idx = self._epsg_combo.count() - 1
+                self._epsg_combo.setCurrentIndex(idx)
+            dlg.accept()
+
+        results_list.itemDoubleClicked.connect(on_pick)
+
+        dlg.exec()
+
+    def _epsg_from_combo(self) -> Optional[int]:
+        """Get the EPSG code from the combo, handling typed-in values."""
+        code = self._epsg_combo.currentData()
+        if code and code > 0:
+            return int(code)
+        # User may have typed an EPSG code directly
+        text = self._epsg_combo.currentText().strip()
+        try:
+            val = int(text)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+        return None
+
+    def isComplete(self) -> bool:
+        """Page is complete if auto-detect found a CRS or manual EPSG selected."""
+        if self._auto_crs.isChecked():
+            return self._detected_epsg is not None
+        return self._epsg_from_combo() is not None
+
+    # ── Properties ──────────────────────────────────────────────
+
+    @property
+    def crs_epsg(self) -> Optional[int]:
+        if self._auto_crs.isChecked():
+            return self._detected_epsg
+        return self._epsg_from_combo()
+
+    @property
+    def crs_wkt(self) -> Optional[str]:
+        epsg = self.crs_epsg
+        if epsg is None:
+            return None
+        if self._auto_crs.isChecked() and self._detected_wkt:
+            return self._detected_wkt
+        try:
+            from .crs import epsg_to_wkt
+            return epsg_to_wkt(epsg)
+        except ImportError:
+            return None
+
+
+# ── Page 5: progress ───────────────────────────────────────────────────
 
 
 class _ProgressPage(QWizardPage):
-    """Third wizard page — display import progress."""
+    """Fifth wizard page — display import progress."""
 
     def __init__(self, parent: Optional[QWizard] = None) -> None:
         super().__init__(parent)
@@ -434,6 +708,9 @@ class _ProgressPage(QWizardPage):
         file_page: _ImportFilePage = wizard.page(pages[0])  # type: ignore[assignment]
         params_page: _TilingParamsPage = wizard.page(pages[1])  # type: ignore[assignment]
         sensor_page: _SensorParamsPage = wizard.page(pages[2])  # type: ignore[assignment]
+        crs_page: Optional[_CrsParamsPage] = None
+        if len(pages) > 3 and isinstance(wizard.page(pages[3]), _CrsParamsPage):
+            crs_page = wizard.page(pages[3])  # type: ignore[assignment]
 
         directory = file_page.selected_directory
         if directory is None:
@@ -452,6 +729,8 @@ class _ProgressPage(QWizardPage):
         min_points = params_page.min_points_per_tile
         sensor_type = sensor_page.sensor_type
         scanner_override = sensor_page.scanner_override
+        crs_epsg = crs_page.crs_epsg if crs_page else None
+        crs_wkt = crs_page.crs_wkt if crs_page else None
 
         self._worker = _ImportWorker(
             tile_manager, directory, tile_size, overlap,
@@ -459,6 +738,8 @@ class _ProgressPage(QWizardPage):
             min_points_per_tile=min_points,
             sensor_type=sensor_type,
             scanner_override=scanner_override,
+            crs_epsg=crs_epsg,
+            crs_wkt=crs_wkt,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_import.connect(self._on_finished)
@@ -524,11 +805,13 @@ class ImportWizard(QWizard):
         self._file_page = _ImportFilePage(self)
         self._params_page = _TilingParamsPage(self)
         self._sensor_page = _SensorParamsPage(self)
+        self._crs_page = _CrsParamsPage(self)
         self._progress_page = _ProgressPage(self)
 
         self.addPage(self._file_page)
         self.addPage(self._params_page)
         self.addPage(self._sensor_page)
+        self.addPage(self._crs_page)
         self.addPage(self._progress_page)
 
         # If a directory is pre-selected, fill the file page and jump ahead

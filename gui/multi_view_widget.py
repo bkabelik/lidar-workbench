@@ -81,6 +81,7 @@ class MultiViewWidget(QWidget):
         self._sel_mode_combo.addItem("↗ Above Line", "line_above")
         self._sel_mode_combo.addItem("↘ Below Line", "line_below")
         self._sel_mode_combo.addItem("▭ Rectangle", "rectangle")
+        self._sel_mode_combo.addItem("▬ Rect Brush", "rect_brush")
         self._sel_mode_combo.currentIndexChanged.connect(self._on_sel_mode_changed)
         toolbar.addWidget(QLabel("Select:"))
         toolbar.addWidget(self._sel_mode_combo)

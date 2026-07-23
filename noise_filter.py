@@ -298,28 +298,33 @@ def isolated_point_removal(
     xs: np.ndarray,
     ys: np.ndarray,
     zs: np.ndarray,
-    search_radius: float = 3.0,
-    min_distance: float = 0.5,
+    search_radius: float = 0.5,
+    min_neighbors: int = 3,
     progress: ProgressCB = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Isolated-point filter (TerraSolid: FnScanClassifyIsolated).
+    Isolated-point filter (count-based).
 
-    Points whose nearest neighbour is farther than *min_distance*
-    within *search_radius* are flagged as noise — catches flying
-    artifacts, birds, sensor errors.
+    Counts how many neighbours each point has within *search_radius*.
+    Points with fewer than *min_neighbors* neighbours (including
+    themselves) are flagged as noise — catches flying artifacts,
+    birds, sensor errors, and other isolated points.
+
+    This matches the Terrascan ``Isolated Points`` routine:
+    e.g. ``min_neighbors=3, search_radius=0.5`` means "at least
+    3 points within 0.5 m".
 
     Args:
         xs, ys, zs:     Point coordinates.
         search_radius:  Search radius in CRS units (metres).
-        min_distance:   Minimum required distance to the closest neighbour.
+        min_neighbors:  Minimum neighbours (including self) to keep.
         progress:       Optional callback.
 
     Returns:
         ``(keep_mask, outlier_mask)``.
     """
     n = len(xs)
-    if n < 2:
+    if n < 1:
         empty = np.array([], dtype=bool)
         return np.ones(n, dtype=bool), empty
 
@@ -330,34 +335,30 @@ def isolated_point_removal(
     try:
         from scipy.spatial import KDTree
         tree = KDTree(points)
-        k = min(2, n)
-        dists, _ = tree.query(points, k=k)
-        if dists.ndim == 1:
-            nn_dist = dists
-        else:
-            nn_dist = dists[:, 1]
+        if progress:
+            progress("Isolated filter: counting neighbours…", 30.0)
+        # Count neighbours within search_radius for each point
+        counts = tree.query_ball_point(points, search_radius, return_length=True)
+        counts = np.array(counts, dtype=int)
     except ImportError:
-        # fallback: compute pairwise and take min non-self distance
         logger.debug("scipy not available — using brute-force for isolated filter")
-        nn_dist = np.full(n, np.inf)
+        counts = np.zeros(n, dtype=int)
+        r2 = search_radius * search_radius
         for i in range(n):
             diff = points - points[i]
-            d = np.sqrt((diff * diff).sum(axis=1))
-            d[i] = np.inf
-            nn_dist[i] = d.min()
+            d2 = (diff * diff).sum(axis=1)
+            counts[i] = (d2 <= r2).sum()
 
-    if progress:
-        progress("Isolated filter: computing mask…", 60.0)
-
-    keep_mask = nn_dist <= min_distance
+    # Keep points with at least min_neighbors (including self)
+    keep_mask = counts >= min_neighbors
     outlier_mask = ~keep_mask
 
     if progress:
         progress(f"Isolated: {outlier_mask.sum()} outliers / {n} points", 100.0)
 
     logger.info(
-        "Isolated (r=%.2f, min_dist=%.2f): %d outliers removed out of %d",
-        search_radius, min_distance, outlier_mask.sum(), n,
+        "Isolated (r=%.2f, min_nbr=%d): %d outliers removed out of %d",
+        search_radius, min_neighbors, outlier_mask.sum(), n,
     )
     return keep_mask, outlier_mask
 
@@ -372,7 +373,7 @@ def low_point_removal(
     progress: ProgressCB = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Low-point filter (TerraSolid: FnScanClassifyLow).
+    Low-point filter.
 
     For each point the lowest and highest Z among neighbours within
     *search_radius* is found.  If the point is more than
@@ -438,31 +439,33 @@ def surface_noise_removal(
     ys: np.ndarray,
     zs: np.ndarray,
     grid_size: float = 0.5,
-    surface_tolerance: float = 0.05,
-    proximity_threshold: float = 0.25,
+    tolerance: float = 0.15,
+    classifications: Optional[np.ndarray] = None,
+    reference_class: Optional[int] = None,
     progress: ProgressCB = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Surface-proximity noise filter (TerraSolid: FnScanClassifySurface
-    + FnScanClassifyCloseby).
+    Surface-proximity noise filter.
 
-    Builds a smooth minimum-Z surface grid, then flags points that
-    sit in a narrow band just above the surface — near-ground noise
-    that is too high to be ground but too low to be real features.
+    Builds a smooth surface grid from the lowest points (or from
+    *reference_class* points if given), then flags points of any
+    class that sit within *tolerance* of that surface (above or
+    below) — near-ground noise that is too close to be real features.
 
-    Algorithm:
-        1.  Grid points at *grid_size*, keep minimum Z per cell.
-        2.  Hole-fill and median-smooth the grid.
-        3.  Bilinear-interpolate surface height for every point.
-        4.  Points with height-above-surface in
-            ``(surface_tolerance, proximity_threshold]`` are flagged.
+    When used post-classification with ``reference_class=2`` (ground),
+    this catches stray non-ground points hugging the terrain — grass
+    stubble, sensor artifacts, low vegetation touching the ground.
 
     Args:
-        xs, ys, zs:           Point coordinates.
-        grid_size:            Cell size for the surface raster (metres).
-        surface_tolerance:    Max height to be "on" the surface (metres).
-        proximity_threshold:  Upper bound of the noise band (metres).
-        progress:             Optional callback.
+        xs, ys, zs:       Point coordinates.
+        grid_size:         Cell size for the surface raster (metres).
+        tolerance:         Band around the surface to flag as noise (metres).
+        classifications:   Point classification codes (needed if
+                           *reference_class* is set).
+        reference_class:   If set, build the surface from only this class
+                           (e.g. 2 = ground).  If None, use min-Z of all
+                           points (original behaviour).
+        progress:          Optional callback.
 
     Returns:
         ``(keep_mask, outlier_mask)``.
@@ -484,14 +487,24 @@ def surface_noise_removal(
     ny = int(np.ceil((max_y - min_y) / grid_size)) + 1
 
     # --- minimum Z per cell ---
+    # If reference_class is set, only use those points to build the surface
+    if reference_class is not None and classifications is not None:
+        ref_mask = classifications == reference_class
+        if ref_mask.sum() < 10:
+            logger.warning("Surface-noise: too few reference-class points (%d)", ref_mask.sum())
+            return np.ones(n, dtype=bool), np.zeros(n, dtype=bool)
+        grid_xs, grid_ys, grid_zs = xs[ref_mask], ys[ref_mask], zs[ref_mask]
+    else:
+        grid_xs, grid_ys, grid_zs = xs, ys, zs
+
     grid = np.full((nx, ny), np.inf, dtype=np.float32)
-    gx = np.clip(((xs - min_x) / grid_size).astype(np.int32), 0, nx - 1)
-    gy = np.clip(((ys - min_y) / grid_size).astype(np.int32), 0, ny - 1)
+    gx = np.clip(((grid_xs - min_x) / grid_size).astype(np.int32), 0, nx - 1)
+    gy = np.clip(((grid_ys - min_y) / grid_size).astype(np.int32), 0, ny - 1)
 
     flat_idx = gx * ny + gy
     sort_idx = np.argsort(flat_idx)
     sorted_flat = flat_idx[sort_idx]
-    sorted_z = zs[sort_idx]
+    sorted_z = grid_zs[sort_idx]
     unique_bins, first_idx = np.unique(sorted_flat, return_index=True)
     last_idx = np.append(first_idx[1:], len(sort_idx))
     for j, bin_id in enumerate(unique_bins):
@@ -535,7 +548,9 @@ def surface_noise_removal(
                  _safe(grid[x1, y1]) * wx * wy)
 
     h_above = zs - z_surface
-    is_noise = (h_above > surface_tolerance) & (h_above <= proximity_threshold)
+    # Flag points within tolerance of the surface (either side),
+    # excluding a 1 cm gap for points exactly on the surface.
+    is_noise = (np.abs(h_above) <= tolerance) & (np.abs(h_above) > 0.01)
 
     keep_mask = ~is_noise
     outlier_mask = is_noise
@@ -544,9 +559,90 @@ def surface_noise_removal(
         progress(f"Surface-noise: {outlier_mask.sum()} outliers / {n} points", 100.0)
 
     logger.info(
-        "Surface-noise (grid=%.2f, band=(%.2f, %.2f]): "
+        "Surface-noise (grid=%.2f, tol=%.2f): "
         "%d outliers removed out of %d",
-        grid_size, surface_tolerance, proximity_threshold, outlier_mask.sum(), n,
+        grid_size, tolerance, outlier_mask.sum(), n,
+    )
+    return keep_mask, outlier_mask
+
+
+# ── point thinning ────────────────────────────────────────────────────
+
+
+def thin_points_average(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    grid_size: float = 2.0,
+    progress: ProgressCB = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Grid-based point thinning via averaging (TerraSolid FnScanThinAverage).
+
+    Partitions points into a regular grid at *grid_size* resolution,
+    keeps the point closest to the cell centroid, and flags the rest
+    as redundant.  This reduces point density while preserving the
+    overall spatial distribution.
+
+    Args:
+        xs, ys, zs:  Point coordinates.
+        grid_size:   Cell size in CRS units (metres).
+        progress:    Optional callback.
+
+    Returns:
+        ``(keep_mask, outlier_mask)`` — one point per occupied cell kept.
+    """
+    n = len(xs)
+    if n < 2 or grid_size <= 0:
+        return np.ones(n, dtype=bool), np.zeros(n, dtype=bool)
+
+    if progress:
+        progress("Thinning points…", 10.0)
+
+    import scipy.spatial  # noqa: F811
+
+    min_x, max_x = xs.min(), xs.max()
+    min_y, max_y = ys.min(), ys.max()
+    nx = max(int(np.ceil((max_x - min_x) / grid_size)), 1)
+    ny = max(int(np.ceil((max_y - min_y) / grid_size)), 1)
+
+    gx = np.clip(((xs - min_x) / grid_size).astype(np.int32), 0, nx - 1)
+    gy = np.clip(((ys - min_y) / grid_size).astype(np.int32), 0, ny - 1)
+    cell_key = gx * ny + gy
+
+    # Sort by cell; for each cell, keep the point closest to its centroid
+    order = np.argsort(cell_key)
+    keep_mask = np.zeros(n, dtype=bool)
+    start = 0
+    while start < n:
+        end = start + 1
+        ck = cell_key[order[start]]
+        while end < n and cell_key[order[end]] == ck:
+            end += 1
+        cell_indices = order[start:end]
+        if len(cell_indices) == 1:
+            keep_mask[cell_indices[0]] = True
+        else:
+            # Keep point closest to the cell centroid
+            cx = xs[cell_indices].mean()
+            cy = ys[cell_indices].mean()
+            cz = zs[cell_indices].mean()
+            dx = xs[cell_indices] - cx
+            dy = ys[cell_indices] - cy
+            dz = zs[cell_indices] - cz
+            dists = dx * dx + dy * dy + dz * dz
+            keep_mask[cell_indices[dists.argmin()]] = True
+        start = end
+
+    outlier_mask = ~keep_mask
+
+    if progress:
+        progress(f"Thinned: {keep_mask.sum():,} kept / {n:,} points "
+                 f"(grid={grid_size:.1f}m)", 100.0)
+
+    logger.info(
+        "Thin-average (grid=%.1fm): %d kept / %d removed",
+        grid_size, keep_mask.sum(), outlier_mask.sum(),
     )
     return keep_mask, outlier_mask
 
@@ -994,7 +1090,15 @@ def ground_classify_tin(
     max_distance: float = 1.4,
     max_angle: float = 6.0,
     max_distance_above: float = 0.15,
+    max_terrain_angle: float = 88.0,
+    max_building_size: Optional[float] = None,
+    reduce_iter_angle_when_edge: Optional[float] = None,
+    stop_tri_when_edge: Optional[float] = None,
+    only_upward: bool = False,
+    echo_rating_data: Optional[np.ndarray] = None,
+    echo_rating_weight: float = 0.5,
     cell_size: Optional[float] = None,
+    follow_surface_trend: bool = True,
     progress: ProgressCB = None,
 ) -> np.ndarray:
     """
@@ -1002,6 +1106,9 @@ def ground_classify_tin(
 
     Based on Axelsson's algorithm — the industry standard for
     progressive TIN densification for ground classification.
+    Extended with enhancements for improved
+    performance on steep terrain, river corridors, and
+    vegetated slopes.
 
     Algorithm:
       1. Select seed points from lowest points in a coarse grid.
@@ -1025,7 +1132,36 @@ def ground_classify_tin(
                              vertices (degrees). Lower = more conservative.
         max_distance_above:  Max allowed distance for points ABOVE the TIN
                              (metres). Very tight to reject water surface.
+        max_terrain_angle:   Maximum allowed slope of TIN triangles (degrees).
+                             Points are not added to triangles steeper than
+                             this. Use 88-90 for man-made terrain, lower
+                             (e.g. 45-60) for purely natural terrain.
+        max_building_size:   Expected size of the largest building in the
+                             project area (metres). Ensures at least one
+                             seed point exists in every area of this size.
+                             Overrides the auto-computed ``cell_size``
+                             heuristic when set.
+        reduce_iter_angle_when_edge:
+                             When the longest edge of a TIN triangle is
+                             shorter than this (metres), reduce the
+                             iteration angle to avoid over-densification.
+        stop_tri_when_edge:  When the longest edge of a TIN triangle is
+                             shorter than this (metres), stop processing
+                             inside that triangle entirely.
+        only_upward:         If ``True``, only add points that are ABOVE
+                             the initial seed surface. Prevents low-error
+                             points from pulling the TIN downward.
+        echo_rating_data:    Optional array of echo length / deviation
+                             values. Values ≤ 0 indicate ground-like
+                             echoes; values > 0 are less likely ground.
+        echo_rating_weight:  Weight (0-1) of the echo rating in the
+                             acceptance decision. Higher = stronger effect.
         cell_size:           Seed grid cell size. Auto when ``None``.
+        follow_surface_trend: If ``True`` (default), locally adapt the
+                             iteration angle based on the slope of the
+                             surrounding terrain. On steep slopes (e.g.
+                             riverbanks) the angle threshold is relaxed
+                             so the TIN can climb the slope.
         progress:            Optional callback.
 
     Returns:
@@ -1040,18 +1176,23 @@ def ground_classify_tin(
     if progress:
         progress("TIN ground: computing spacing…", 5.0)
 
-    if cell_size is None:
-        cell_size = compute_adaptive_spacing(xs, ys)
-        cell_size = max(cell_size * 10, 5.0)  # seed grid ~10x point spacing
+    # --- Determine seed grid cell size ---
+    if max_building_size is not None:
+        seed_cell_size = max_building_size
+    elif cell_size is not None:
+        seed_cell_size = max(cell_size, 5.0)
+    else:
+        seed_cell_size = compute_adaptive_spacing(xs, ys)
+        seed_cell_size = max(seed_cell_size * 10, 5.0)  # seed grid ~10x point spacing
 
     # --- Step 1: select seed points (lowest in each grid cell) ---
     min_x, max_x = xs.min(), xs.max()
     min_y, max_y = ys.min(), ys.max()
-    nx = max(1, int(np.ceil((max_x - min_x) / cell_size)) + 1)
-    ny = max(1, int(np.ceil((max_y - min_y) / cell_size)) + 1)
+    nx = max(1, int(np.ceil((max_x - min_x) / seed_cell_size)) + 1)
+    ny = max(1, int(np.ceil((max_y - min_y) / seed_cell_size)) + 1)
 
-    gx = np.clip(((xs - min_x) / cell_size).astype(np.int32), 0, nx - 1)
-    gy = np.clip(((ys - min_y) / cell_size).astype(np.int32), 0, ny - 1)
+    gx = np.clip(((xs - min_x) / seed_cell_size).astype(np.int32), 0, nx - 1)
+    gy = np.clip(((ys - min_y) / seed_cell_size).astype(np.int32), 0, ny - 1)
     flat_idx = gx * ny + gy
 
     order = np.argsort(flat_idx)
@@ -1060,11 +1201,16 @@ def ground_classify_tin(
     unique_cells, starts = np.unique(sorted_flat, return_index=True)
 
     seed_mask = np.zeros(n, dtype=bool)
+    seed_indices = []
     for i in range(len(unique_cells)):
         start = starts[i]
         end = starts[i + 1] if i + 1 < len(starts) else n
         lowest_local = int(np.argmin(sorted_z[start:end]))
-        seed_mask[order[start + lowest_local]] = True
+        idx = order[start + lowest_local]
+        seed_mask[idx] = True
+        seed_indices.append(idx)
+
+    seed_indices = np.array(seed_indices)
 
     if seed_mask.sum() < 3:
         logger.warning("TIN: too few seed points")
@@ -1074,10 +1220,12 @@ def ground_classify_tin(
     n_ground = seed_mask.sum()
 
     if progress:
-        progress(f"TIN ground: {n_ground} seeds…", 15.0)
+        progress(f"TIN ground: {n_ground} seeds (cell={seed_cell_size:.1f}m)…", 15.0)
 
     max_angle_rad = math.radians(max_angle)
     sin_max_angle = math.sin(max_angle_rad)
+    max_terrain_angle_rad = math.radians(max_terrain_angle)
+    cos_terrain_angle = math.cos(max_terrain_angle_rad)
 
     try:
         from scipy.spatial import Delaunay, KDTree
@@ -1090,6 +1238,27 @@ def ground_classify_tin(
     ys_f64 = np.asarray(ys, dtype=np.float64)
     zs_f64 = np.asarray(zs, dtype=np.float64)
 
+    # --- Only-upward: record initial seed Z surface to prevent downward pulls ---
+    if only_upward:
+        seed_z_surface = np.full(n, np.inf, dtype=np.float64)
+        # For each seed cell, the lowest Z is the floor
+        for i in range(len(unique_cells)):
+            start = starts[i]
+            end = starts[i + 1] if i + 1 < len(starts) else n
+            cell_min_z = sorted_z[start:end].min()
+            cell_mask = flat_idx == unique_cells[i]
+            seed_z_surface[cell_mask] = cell_min_z
+
+    # --- Echo rating pre-processing ---
+    has_echo_rating = echo_rating_data is not None and len(echo_rating_data) == n
+    if has_echo_rating:
+        # Normalize echo data to [-1, +1] range for rating modifier
+        echo_data = np.asarray(echo_rating_data, dtype=np.float64)
+        echo_abs_max = max(abs(echo_data.max()), abs(echo_data.min()), 1e-9)
+        echo_norm = echo_data / echo_abs_max
+        # echo_norm ≤ 0 → ground-like (relax criteria)
+        # echo_norm > 0 → vegetation-like (tighten criteria)
+
     max_iterations = 15
     for iteration in range(max_iterations):
         if progress:
@@ -1101,12 +1270,65 @@ def ground_classify_tin(
         # Build Delaunay triangulation on current ground points
         g_xy = np.column_stack((xs_f64[ground_mask], ys_f64[ground_mask]))
         g_z = zs_f64[ground_mask]
+        # Map from ground_mask indices to consecutive indices in g_xy
+        g_idx_map = np.cumsum(ground_mask) - 1
+        g_indices = np.where(ground_mask)[0]
+
         if len(g_xy) < 3:
             break
         try:
             tri = Delaunay(g_xy)
         except Exception:
             break
+
+        # --- Compute triangle normals and max edge lengths for terrain angle + edge control ---
+        simplices = tri.simplices  # (NT, 3) indices into g_xy
+        tri_normals = np.zeros((len(simplices), 3), dtype=np.float64)
+        tri_slope_ok = np.ones(len(simplices), dtype=bool)
+        tri_max_edge = np.zeros(len(simplices), dtype=np.float64)
+        tri_active = np.ones(len(simplices), dtype=bool)  # whether triangle is still processed
+
+        for ti, s in enumerate(simplices):
+            # Use 3-D triangle vertices for proper normal computation
+            v0_3d = np.array([g_xy[s[0], 0], g_xy[s[0], 1], g_z[s[0]]])
+            v1_3d = np.array([g_xy[s[1], 0], g_xy[s[1], 1], g_z[s[1]]])
+            v2_3d = np.array([g_xy[s[2], 0], g_xy[s[2], 1], g_z[s[2]]])
+            e01 = v1_3d - v0_3d
+            e02 = v2_3d - v0_3d
+            # Triangle normal (cross product of 3-D edge vectors)
+            normal = np.cross(e01, e02)
+            n_len = np.linalg.norm(normal)
+            if n_len > 1e-15:
+                normal /= n_len
+            tri_normals[ti] = normal
+
+            # Slope angle: angle between triangle normal and vertical (Z-axis)
+            # cos_slope = |normal · (0,0,1)| = |normal_z|
+            cos_slope = abs(normal[2])
+            # Terrain angle check: if triangle is steeper than max_terrain_angle
+            tri_slope_ok[ti] = cos_slope >= cos_terrain_angle
+
+            # Max edge length for edge-based iteration control (XY plane)
+            e01_xy = g_xy[s[1]] - g_xy[s[0]]
+            e02_xy = g_xy[s[2]] - g_xy[s[0]]
+            e12_xy = g_xy[s[2]] - g_xy[s[1]]
+            tri_max_edge[ti] = max(
+                np.linalg.norm(e01_xy),
+                np.linalg.norm(e02_xy),
+                np.linalg.norm(e12_xy),
+            )
+
+        # --- Edge-based iteration reduction/stop ---
+        if reduce_iter_angle_when_edge is not None:
+            small_tri_mask = tri_max_edge < reduce_iter_angle_when_edge
+            if small_tri_mask.any():
+                # Linearly reduce sin_max_angle for small triangles
+                frac = np.clip(tri_max_edge[small_tri_mask] / reduce_iter_angle_when_edge, 0.1, 1.0)
+                # We'll apply this per-candidate later
+
+        if stop_tri_when_edge is not None:
+            tiny_tri_mask = tri_max_edge < stop_tri_when_edge
+            tri_active[tiny_tri_mask] = False
 
         # --- Process non-ground candidates ---
         cand_indices = np.where(~ground_mask)[0]
@@ -1157,21 +1379,52 @@ def ground_classify_tin(
                 ) * inv_d
                 w2 = 1.0 - w0 - w1
 
-                # Point is inside triangle + within Z tolerance
+                # Point is inside triangle
                 inside_tri = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
                 if inside_tri.any():
                     tin_z = w0 * v0[:, 2] + w1 * v1[:, 2] + w2 * v2[:, 2]
+
+                    # --- Terrain angle check: reject candidates in too-steep triangles ---
+                    slope_ok = tri_slope_ok[s_ids]
+
+                    # --- Edge-based stop: reject in tiny triangles ---
+                    edge_ok = tri_active[s_ids]
+
+                    # --- Edge-based iteration angle reduction ---
+                    if reduce_iter_angle_when_edge is not None:
+                        edge_frac = np.clip(
+                            tri_max_edge[s_ids] / reduce_iter_angle_when_edge, 0.1, 1.0
+                        )
+                        local_sin_max = sin_max_angle * edge_frac
+                    else:
+                        local_sin_max = np.full(len(s_ids) if isinstance(s_ids, np.ndarray) else sum(inside), sin_max_angle)
 
                     # Asymmetric distance: tight for points above TIN (water surface,
                     # vegetation), standard for points on/below (actual ground).
                     dz = s_z - tin_z                     # positive = above TIN
                     d_above = np.maximum(dz, 0.0)
                     d_below = np.maximum(-dz, 0.0)
-                    d_ok = (d_above <= max_distance_above) & (d_below <= max_distance)
 
-                    # Axelsson angle check: for each vertex V of the TIN triangle,
-                    # the angle between P and the TIN plane is arcsin(d / |P-V|).
-                    # d is the perpendicular distance (|dz|).
+                    # --- Echo rating: adjust distance thresholds ---
+                    if has_echo_rating:
+                        echo_val = echo_norm[s_local]
+                        # echo ≤ 0 (ground-like): relax max_distance_above slightly
+                        # echo > 0 (vegetation-like): tighten max_distance_above
+                        echo_mod = np.where(
+                            echo_val <= 0,
+                            1.0 + echo_rating_weight * abs(echo_val) * 0.5,  # relax up to 50%
+                            1.0 - echo_rating_weight * abs(echo_val) * 0.8,  # tighten up to 80%
+                        )
+                        echo_mod = np.clip(echo_mod, 0.2, 1.5)
+                        d_above_ok = d_above <= (max_distance_above * echo_mod)
+                        d_below_ok = d_below <= (max_distance * echo_mod)
+                    else:
+                        d_above_ok = d_above <= max_distance_above
+                        d_below_ok = d_below <= max_distance
+
+                    d_ok = d_above_ok & d_below_ok
+
+                    # Axelsson angle check
                     d_abs = np.abs(dz)
                     p_xyz = np.column_stack((s_xy, s_z))
                     d_v0 = np.linalg.norm(p_xyz - v0, axis=1)
@@ -1181,9 +1434,51 @@ def ground_classify_tin(
                         np.divide(d_abs, d_v0, out=np.zeros_like(d_abs), where=d_v0 > 1e-9),
                         np.divide(d_abs, d_v1, out=np.zeros_like(d_abs), where=d_v1 > 1e-9)),
                         np.divide(d_abs, d_v2, out=np.zeros_like(d_abs), where=d_v2 > 1e-9))
-                    angle_ok = sin_max <= sin_max_angle
+                    angle_ok = sin_max <= local_sin_max
 
-                    ok = inside_tri & valid_denom & d_ok & angle_ok
+                    # --- Follow surface trend: relax angle + distance on steep natural slopes ---
+                    if follow_surface_trend:
+                        # On steep triangles the fixed max_distance_above is too
+                        # conservative — the TIN plane sags below the actual ground
+                        # between seed points.  Adapt thresholds proportionally to
+                        # the local triangle slope so the TIN can climb riverbanks.
+                        tri_slope_cos = np.abs(tri_normals[:, 2])
+                        tri_slope_deg = np.degrees(np.arccos(np.clip(tri_slope_cos, 0.0, 1.0)))
+                        slope_deg = tri_slope_deg[s_ids]
+
+                        # Scale thresholds for every candidate on steep triangles
+                        # (slope > 10°).  Flat triangles keep the strict defaults.
+                        steep = slope_deg > 10.0
+                        if steep.any():
+                            st_idx = np.where(steep & inside_tri & valid_denom)[0]
+                            if len(st_idx) > 0:
+                                # Adaptive angle: flat → strict, steep → relaxed
+                                adapted_angle = max_angle + slope_deg[st_idx] * 0.5
+                                adapted_sin = np.sin(np.radians(adapted_angle))
+                                # Adaptive distance-above: flat → tight, steep → permissive
+                                adapted_d_above = (
+                                    max_distance_above
+                                    + (slope_deg[st_idx] / 90.0) * max_distance * 0.5
+                                )
+                                # Apply adapted thresholds to steep-triangle candidates
+                                uphill_st = dz[st_idx] > 0
+                                if uphill_st.any():
+                                    u_idx = st_idx[uphill_st]
+                                    # Override angle check for uphill-on-steep
+                                    relaxed_angle_ok = sin_max[u_idx] <= adapted_sin[uphill_st]
+                                    angle_ok[u_idx] = angle_ok[u_idx] | relaxed_angle_ok
+                                    # Override distance-above check for uphill-on-steep
+                                    relaxed_d_ok = d_above[u_idx] <= adapted_d_above[uphill_st]
+                                    d_above_ok[u_idx] = d_above_ok[u_idx] | relaxed_d_ok
+                                    d_ok = d_above_ok & d_below_ok  # recalculate
+
+                    # --- Only-upward check ---
+                    if only_upward:
+                        upward_ok = s_z >= seed_z_surface[s_local]
+                    else:
+                        upward_ok = np.ones(sum(inside), dtype=bool)
+
+                    ok = inside_tri & valid_denom & d_ok & angle_ok & slope_ok & edge_ok & upward_ok
                     new_ground[inside] = ok
 
         # --- Handle points outside convex hull ---
@@ -1196,7 +1491,24 @@ def ground_classify_tin(
             dists, nbrs = tree.query(o_xy, k=1)
             nbr_z = g_z[nbrs]
             dz_out = o_z - nbr_z
-            ok_outside = (dz_out <= max_distance_above) & (-dz_out <= max_distance)
+            d_above_out = np.maximum(dz_out, 0.0)
+            d_below_out = np.maximum(-dz_out, 0.0)
+
+            if has_echo_rating:
+                echo_val_out = echo_norm[o_local]
+                echo_mod_out = np.where(
+                    echo_val_out <= 0,
+                    1.0 + echo_rating_weight * abs(echo_val_out) * 0.5,
+                    1.0 - echo_rating_weight * abs(echo_val_out) * 0.8,
+                )
+                echo_mod_out = np.clip(echo_mod_out, 0.2, 1.5)
+                ok_outside = (d_above_out <= max_distance_above * echo_mod_out) & (d_below_out <= max_distance * echo_mod_out)
+            else:
+                ok_outside = (d_above_out <= max_distance_above) & (d_below_out <= max_distance)
+
+            if only_upward:
+                ok_outside = ok_outside & (o_z >= seed_z_surface[o_local])
+
             new_ground[outside] = ok_outside
 
         # Apply new ground points
@@ -1206,8 +1518,10 @@ def ground_classify_tin(
         ground_mask[cand_indices[new_ground]] = True
 
     logger.info(
-        "TIN ground (max_d=%.2f, max_a=%.1f°): %d ground / %d points",
-        max_distance, max_angle, ground_mask.sum(), n,
+        "TIN ground (max_d=%.2f, max_a=%.1f°, terr_a=%.1f°, build=%.1f): %d ground / %d points",
+        max_distance, max_angle, max_terrain_angle,
+        max_building_size if max_building_size is not None else seed_cell_size,
+        ground_mask.sum(), n,
     )
     return ground_mask
 
@@ -1852,7 +2166,7 @@ def _apply_pipeline(data: dict, pipeline: list) -> np.ndarray:
             k, _ = isolated_point_removal(
                 data["x"][keep], data["y"][keep], data["z"][keep],
                 search_radius=step["search_radius"],
-                min_distance=step["min_distance"],
+                min_neighbors=step["min_neighbors"],
             )
         elif step["type"] == "low_points":
             k, _ = low_point_removal(
@@ -1865,8 +2179,7 @@ def _apply_pipeline(data: dict, pipeline: list) -> np.ndarray:
             k, _ = surface_noise_removal(
                 data["x"][keep], data["y"][keep], data["z"][keep],
                 grid_size=step["grid_size"],
-                surface_tolerance=step["surface_tolerance"],
-                proximity_threshold=step["proximity_threshold"],
+                tolerance=step["tolerance"],
             )
         elif step["type"] == "multipath":
             k, _ = multipath_reflection_removal(
@@ -1887,6 +2200,11 @@ def _apply_pipeline(data: dict, pipeline: list) -> np.ndarray:
             data["y"][keep_indices] = sy
             data["z"][keep_indices] = sz
             continue  # no mask to update
+        elif step["type"] == "thin_average":
+            k, _ = thin_points_average(
+                data["x"][keep], data["y"][keep], data["z"][keep],
+                grid_size=step.get("grid_size", 2.0),
+            )
         elif step["type"] == "topo_discriminator":
             target = step.get("target", "terrain_only")
             is_terrain, is_rock = topo_discriminator(
@@ -1938,6 +2256,14 @@ def _apply_pipeline(data: dict, pipeline: list) -> np.ndarray:
                 data["x"][keep], data["y"][keep], data["z"][keep],
                 max_distance=step.get("max_distance", 1.4),
                 max_angle=step.get("max_angle", 6.0),
+                max_distance_above=step.get("max_distance_above", 0.15),
+                max_terrain_angle=step.get("max_terrain_angle", 88.0),
+                max_building_size=step.get("max_building_size"),
+                reduce_iter_angle_when_edge=step.get("reduce_iter_angle_when_edge"),
+                stop_tri_when_edge=step.get("stop_tri_when_edge"),
+                only_upward=step.get("only_upward", False),
+                echo_rating_data=step.get("echo_rating_data"),
+                echo_rating_weight=step.get("echo_rating_weight", 0.5),
                 cell_size=step.get("cell_size"),
             )
         else:

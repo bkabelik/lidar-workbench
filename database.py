@@ -35,8 +35,10 @@ CREATE TABLE IF NOT EXISTS tiles (
     all_scanners    TEXT    DEFAULT '[]',  -- JSON list of all scanner names in this tile
     sensor_type     TEXT    DEFAULT '' CHECK(sensor_type IN ('', 'topo', 'bathy')),
     flightline_sensor_types TEXT DEFAULT '{}',  -- JSON: {"1": "topo", "2": "bathy"}
+    crs_epsg        INTEGER,               -- EPSG code (e.g. 32633)
+    crs_wkt         TEXT,                  -- OGC WKT string for the CRS
     status          TEXT    NOT NULL DEFAULT 'IMPORTED'
-                    CHECK(status IN ('IMPORTED','FILTERED','CLASSIFIED','EDITED','ERROR')),
+                    CHECK(status IN ('IMPORTED','FILTERED','CLASSIFIED','EDITED','NOISE','ERROR')),
     filter_params   TEXT,   -- JSON
     classification_model TEXT,
     last_modified   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -138,6 +140,57 @@ class Database:
                 conn.execute(sql)
                 logger.debug("Migrated tiles table: added column %s", col)
 
+        # Migrate: add NOISE to status CHECK constraint (v0.2)
+        self._migrate_status_constraint(conn)
+
+    def _migrate_status_constraint(self, conn: sqlite3.Connection) -> None:
+        """Recreate the tiles table if the status CHECK constraint lacks 'NOISE'."""
+        # Check current constraint definition
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='tiles'"
+        ).fetchone()
+        if row and 'NOISE' in row[0]:
+            return  # already migrated
+
+        logger.info("Migrating tiles.status constraint to include NOISE…")
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("BEGIN")
+        try:
+            conn.executescript("""
+                CREATE TABLE tiles_new (
+                    id              TEXT PRIMARY KEY,
+                    filename        TEXT    NOT NULL,
+                    bbox_min_x      REAL,
+                    bbox_min_y      REAL,
+                    bbox_max_x      REAL,
+                    bbox_max_y      REAL,
+                    point_count     INTEGER,
+                    flight_line     INTEGER DEFAULT 0,
+                    scanner         TEXT    DEFAULT '',
+                    all_scanners    TEXT    DEFAULT '[]',
+                    sensor_type     TEXT    DEFAULT '' CHECK(sensor_type IN ('', 'topo', 'bathy')),
+                    flightline_sensor_types TEXT DEFAULT '{}',
+                    crs_epsg        INTEGER,
+                    crs_wkt         TEXT,
+                    status          TEXT    NOT NULL DEFAULT 'IMPORTED'
+                                    CHECK(status IN ('IMPORTED','FILTERED','CLASSIFIED','EDITED','NOISE','ERROR')),
+                    filter_params   TEXT,
+                    classification_model TEXT,
+                    last_modified   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO tiles_new SELECT * FROM tiles;
+                DROP TABLE tiles;
+                ALTER TABLE tiles_new RENAME TO tiles;
+                CREATE INDEX IF NOT EXISTS idx_tiles_status ON tiles(status);
+                CREATE INDEX IF NOT EXISTS idx_tiles_bbox  ON tiles(bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y);
+            """)
+            conn.execute("PRAGMA foreign_keys = ON")
+            logger.info("Status constraint migration complete.")
+        except Exception:
+            conn.execute("ROLLBACK")
+            conn.execute("PRAGMA foreign_keys = ON")
+            raise
+
     # ── tile CRUD ──────────────────────────────────────────────────
 
     def insert_tile(
@@ -152,6 +205,8 @@ class Database:
         all_scanners: Optional[List[str]] = None,
         sensor_type: str = '',
         flightline_sensor_types: Optional[Dict[int, str]] = None,
+        crs_epsg: Optional[int] = None,
+        crs_wkt: Optional[str] = None,
         status: str = TileStatus.IMPORTED,
         filter_params: Optional[Dict[str, Any]] = None,
         classification_model: Optional[str] = None,
@@ -187,6 +242,8 @@ class Database:
             json.dumps(all_scanners) if all_scanners else '[]',
             sensor_type,
             json.dumps(flightline_sensor_types) if flightline_sensor_types else '{}',
+            crs_epsg,
+            crs_wkt,
             status,
             json.dumps(filter_params) if filter_params else None,
             classification_model,
@@ -196,11 +253,32 @@ class Database:
                 """INSERT OR REPLACE INTO tiles
                    (id, filename, bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y,
                     point_count, flight_line, scanner, all_scanners, sensor_type,
-                    flightline_sensor_types,
+                    flightline_sensor_types, crs_epsg, crs_wkt,
                     status, filter_params, classification_model, last_modified)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
                 vals,
             )
+
+    def set_tile_crs(
+        self, conn: sqlite3.Connection, tile_id: str,
+        crs_epsg: Optional[int], crs_wkt: Optional[str],
+    ) -> None:
+        """Set the CRS for a tile."""
+        with Database._write_lock:
+            conn.execute(
+                "UPDATE tiles SET crs_epsg = ?, crs_wkt = ?, last_modified = CURRENT_TIMESTAMP WHERE id = ?",
+                (crs_epsg, crs_wkt, tile_id),
+            )
+
+    def get_project_crs(self) -> Optional[dict]:
+        """Return the first valid CRS from any tile, or None."""
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT crs_epsg, crs_wkt FROM tiles WHERE crs_epsg IS NOT NULL OR crs_wkt IS NOT NULL LIMIT 1"
+            ).fetchone()
+        if row:
+            return {"epsg": row["crs_epsg"], "wkt": row["crs_wkt"]}
+        return None
 
     def update_status(self, conn: sqlite3.Connection, tile_id: str, status: str) -> None:
         """

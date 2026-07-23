@@ -269,15 +269,13 @@ def calculate_cluster_linearity(points):
         return (e1 - e2) / e1
     except:
         return 0
-# ── TerraSolid-inspired noise filters ──────────────────────────────────
+# ── Advanced noise filters ───────────────────────────────────────────
 
 def isolated_point_filter(points, search_radius=3.0, min_distance=0.5):
     """
     Flag points whose nearest neighbour is farther than *min_distance*
     within *search_radius*.  These are isolated "fliers" — aerial noise,
     sensor artifacts, birds.
-
-    TerraSolid equivalent:  FnScanClassifyIsolated("1",7,3,"Any",0.50,0)
 
     Args:
         points: (N, 3) float64 array of xyz coordinates.
@@ -316,8 +314,6 @@ def low_point_filter(points, search_radius=2.0, below_threshold=1.0,
     *search_radius* is found.  If the point Z is more than
     *below_threshold* **below** the lowest neighbour, or more than
     *above_threshold* **above** the highest neighbour, it is noise.
-
-    TerraSolid equivalent:  FnScanClassifyLow("1",7,2,1.00,10.00,0)
 
     Args:
         points: (N, 3) float64 xyz array.
@@ -367,9 +363,6 @@ def surface_noise_filter(points, grid_size=0.5, surface_tolerance=0.05,
     3.  Bilinear-interpolate a surface height for every point.
     4.  Points whose height-above-surface falls in
         ``(surface_tolerance, proximity_threshold]`` are flagged.
-
-    TerraSolid equivalent:
-      FnScanClassifySurface  +  FnScanSmoothenXyz  +  FnScanClassifyCloseby
 
     Args:
         points: (N, 3) float64 xyz array.
@@ -489,7 +482,7 @@ class NoiseFilterApp:
             "intensity_min": 0.0,
             "dtm_grid_size": 2.0,
             "max_gui_points": 25000000,
-            # ── TerraSolid-style filters ──────────────────────
+            # ── Advanced filters ────────────────────────────
             "isolated_radius": 3.0,
             "isolated_min_dist": 0.5,
             "lowpts_radius": 2.0,
@@ -510,7 +503,7 @@ class NoiseFilterApp:
             "dbscan": False,
             "floor": False, # OFF by default for instant launch
             "intensity": False,
-            # ── TerraSolid-style filters ──────────────────────
+            # ── Advanced filters ────────────────────────────
             "isolated": False,
             "low_points": False,
             "surface_noise": False,
@@ -614,20 +607,20 @@ class NoiseFilterApp:
             ("Linearity Protect", "dbscan_linearity", 0.0, 1.0, 0.85)
         ]))
 
-        # Section: Isolated Points (TerraSolid-style)
+        # Section: Isolated Points
         self.panel.add_child(self._create_filter_section("Isolated Points (fliers)", "isolated", [
             ("Search radius (m)", "isolated_radius", 0.5, 10.0, 3.0),
             ("Min neighbour dist (m)", "isolated_min_dist", 0.1, 5.0, 0.5)
         ]))
 
-        # Section: Low Points (TerraSolid-style)
+        # Section: Low Points
         self.panel.add_child(self._create_filter_section("Low Points (multipath)", "low_points", [
             ("Search radius (m)", "lowpts_radius", 0.5, 10.0, 2.0),
             ("Max below (m)", "lowpts_below", 0.1, 20.0, 1.0),
             ("Max above (m)", "lowpts_above", 1.0, 100.0, 10.0)
         ]))
 
-        # Section: Surface Noise (TerraSolid-style)
+        # Section: Surface Noise
         self.panel.add_child(self._create_filter_section("Surface Proximity Noise", "surface_noise", [
             ("Grid size (m)", "surf_grid", 0.1, 5.0, 0.5),
             ("Surface tolerance (m)", "surf_tolerance", 0.01, 0.5, 0.05),

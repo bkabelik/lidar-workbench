@@ -125,19 +125,8 @@ class MainWindow(QMainWindow):
         logger.info("MainWindow initialised")
 
     def closeEvent(self, event) -> None:
-        """Release Open3D resources before the window closes."""
-        try:
-            # Release the multi-view's Open3D resources
-            if hasattr(self, '_multi_view'):
-                self._multi_view.cleanup()
-        except Exception:
-            pass
-        try:
-            # Release the shared hidden renderer window
-            from ._renderer import cleanup_shared_renderer
-            cleanup_shared_renderer()
-        except Exception:
-            pass
+        """Handle window close — skip Open3D cleanup to avoid C++ destructor
+        crashes during Python shutdown (Filament resources already freed)."""
         super().closeEvent(event)
 
     # ── menu bar ───────────────────────────────────────────────────
@@ -227,6 +216,13 @@ class MainWindow(QMainWindow):
 
         tools_menu.addSeparator()
 
+        crs_action = QAction("&CRS / Projection…", self)
+        crs_action.setObjectName("crs_projection")
+        crs_action.triggered.connect(self._on_crs)
+        tools_menu.addAction(crs_action)
+
+        tools_menu.addSeparator()
+
         settings_action = QAction("&Settings…", self)
         settings_action.triggered.connect(self._on_settings)
         tools_menu.addAction(settings_action)
@@ -270,6 +266,12 @@ class MainWindow(QMainWindow):
         bathy_btn = toolbar.addAction("Bathy")
         bathy_btn.setToolTip("Bathymetry processing (refraction, river crop, benthic filter)")
         bathy_btn.triggered.connect(self._on_bathy_process)
+
+        toolbar.addSeparator()
+
+        crs_btn = toolbar.addAction("CRS")
+        crs_btn.setToolTip("CRS / Projection (assign, transform, match points)")
+        crs_btn.triggered.connect(self._on_crs)
 
         toolbar.addSeparator()
 
@@ -321,7 +323,12 @@ class MainWindow(QMainWindow):
         # Rebuild menu to sync all check states
         self._build_class_visibility_menu()
 
-        # Refresh views if a tile is open
+        # Propagate to views instantly (no disk reload needed)
+        self._multi_view._view_3d.set_class_visibility(self.class_visibility)
+        self._multi_view._view_profile.set_class_visibility(self.class_visibility)
+
+        # Also do a full data reload for the profile view (class changes
+        # may affect profile selection state) if a tile is open
         if self._editor.tile_id is not None:
             data = self._tm.load_tile_points_full(self._editor.tile_id)
             if data is not None:
@@ -347,10 +354,20 @@ class MainWindow(QMainWindow):
         self._multi_view._view_profile.selection_changed.connect(self._on_profile_selection)
         # Wire profile view hover → properties panel
         self._multi_view._view_profile.point_hovered.connect(self._on_point_hovered)
+        # Wire profile view click → properties panel (Point Info tool)
+        self._multi_view._view_profile.point_picked.connect(self._on_point_hovered)
         # Wire 3D view point pick → properties panel
         self._multi_view._view_3d.point_picked.connect(self._on_point_hovered)
         # Wire profile view width change → re-extract
         self._multi_view._view_profile.profile_width_changed.connect(self._on_profile_width_changed)
+
+        # Apply saved tool sizes to profile view
+        from .settings_dialog import load_general_settings
+        settings = load_general_settings()
+        self._multi_view._view_profile.set_brush_radius(settings.get("brush_radius", 2.0))
+        self._multi_view._view_profile.set_rect_size(
+            settings.get("rect_width", 4.0), settings.get("rect_height", 2.0))
+
         splitter.addWidget(self._multi_view)
 
         # Right panel: properties panel
@@ -358,6 +375,8 @@ class MainWindow(QMainWindow):
         self._properties_panel.classify_requested.connect(self._on_classify_selected)
         self._properties_panel.undo_requested.connect(self._on_undo)
         self._properties_panel.redo_requested.connect(self._on_redo)
+        # Wire Point Info toggle → views
+        self._properties_panel.point_info_toggled.connect(self._on_point_info_toggled)
         splitter.addWidget(self._properties_panel)
 
         # Proportions: 1 : 3 : 1
@@ -436,6 +455,7 @@ class MainWindow(QMainWindow):
         _make("sel_above", lambda: self._multi_view._sel_mode_combo.setCurrentIndex(1))
         _make("sel_below", lambda: self._multi_view._sel_mode_combo.setCurrentIndex(2))
         _make("sel_rectangle", lambda: self._multi_view._sel_mode_combo.setCurrentIndex(3))
+        _make("sel_rect_brush", lambda: self._multi_view._sel_mode_combo.setCurrentIndex(4))
         _make("next_tile", self._tile_list_widget.select_next_tile)
         _make("prev_tile", self._tile_list_widget.select_previous_tile)
 
@@ -563,6 +583,10 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Clear the 3D view before filtering — Open3D background render
+        # threads crash if they're still running during LAS file writes.
+        self._multi_view.clear()
+
         dialog = FilterDialog(self._tm, selected, parent=self)
         dialog.filter_applied.connect(self._on_filter_applied)
         dialog.exec()
@@ -615,10 +639,9 @@ class MainWindow(QMainWindow):
             self._filter_progress.setValue(int(pct))
 
     def _on_filter_tile_done(self, tile_id: str):
-        """Write filtered tile data back to disk as each tile finishes."""
+        """Write filtered tile: extract noise to tiles/noise/, keep clean points in tile."""
         if not hasattr(self, '_filter_worker'):
             return
-        # Find the keep mask for this tile
         for tid, keep in self._filter_worker._results:
             if tid == tile_id:
                 break
@@ -634,38 +657,119 @@ class MainWindow(QMainWindow):
         tile_info = self._db.get_tile(tile_id)
         if tile_info is None:
             return
-        from ..tile_manager import _write_las_file
-        # Apply keep mask to all fields and write full LAS
-        def _mask(arr, default=None):
-            if arr is None:
-                return default
-            return arr[keep]
 
+        from ..tile_manager import _write_las_file, _read_las_header_template
+
+        n_total = len(data["x"])
+        n_noise = int((~keep).sum())
+        n_kept = int(keep.sum())
+
+        if n_noise == 0:
+            logger.info("Filter on %s: no noise points found", tile_id)
+            self._tm.update_tile_status(tile_id, TileStatus.FILTERED)
+            self._tile_list_widget.update_tile_status(tile_id, TileStatus.FILTERED)
+            return
+
+        # Snapshot header template from original file
+        las_path = tiles_dir / tile_info["filename"]
+        try:
+            header_template = _read_las_header_template(las_path)
+        except Exception:
+            header_template = None
+            logger.warning("Could not read header template from %s — using fallback", las_path)
+
+        # Helper: subset a data dict by boolean mask
+        def _subset(d: dict, mask: np.ndarray) -> dict:
+            return {k: v[mask] for k, v in d.items() if isinstance(v, np.ndarray) and len(v) == n_total}
+
+        # ── Save noise points to tiles/noise/{tile_id}_noise.las ─────
+        noise_dir = tiles_dir / "noise"
+        noise_dir.mkdir(parents=True, exist_ok=True)
+        noise_name = Path(tile_info["filename"]).stem + "_noise.las"
+        noise_path = noise_dir / noise_name
+
+        noise_data = _subset(data, ~keep)
         _write_las_file(
-            tiles_dir / tile_info["filename"],
-            data["x"][keep],
-            data["y"][keep],
-            data["z"][keep],
-            classes=_mask(data.get("classification")),
-            intensities=_mask(data.get("intensity")),
-            return_numbers=_mask(data.get("return_number")),
-            num_returns=_mask(data.get("num_returns")),
-            point_source_ids=_mask(data.get("point_source_id")),
-            gps_times=_mask(data.get("gps_time")),
-            scan_angle_ranks=_mask(data.get("scan_angle_rank")),
-            scan_direction_flags=_mask(data.get("scan_direction_flag")),
-            edge_of_flight_lines=_mask(data.get("edge_of_flight_line")),
-            user_data_array=_mask(data.get("user_data")),
-            reds=_mask(data.get("red")),
-            greens=_mask(data.get("green")),
-            blues=_mask(data.get("blue")),
-            key_points=_mask(data.get("key_point")),
-            synthetics=_mask(data.get("synthetic")),
-            withhelds=_mask(data.get("withheld")),
-            overlaps=_mask(data.get("overlap")),
+            noise_path,
+            noise_data["x"], noise_data["y"], noise_data["z"],
+            classes=noise_data.get("classification"),
+            intensities=noise_data.get("intensity"),
+            return_numbers=noise_data.get("return_number"),
+            num_returns=noise_data.get("num_returns"),
+            point_source_ids=noise_data.get("point_source_id"),
+            gps_times=noise_data.get("gps_time"),
+            scan_angle_ranks=noise_data.get("scan_angle_rank"),
+            scan_direction_flags=noise_data.get("scan_direction_flag"),
+            edge_of_flight_lines=noise_data.get("edge_of_flight_line"),
+            user_data_array=noise_data.get("user_data"),
+            reds=noise_data.get("red"),
+            greens=noise_data.get("green"),
+            blues=noise_data.get("blue"),
+            key_points=noise_data.get("key_point"),
+            synthetics=noise_data.get("synthetic"),
+            withhelds=noise_data.get("withheld"),
+            overlaps=noise_data.get("overlap"),
+            header_template=header_template,
         )
+        logger.info("Noise file saved: %s (%d points)", noise_path, n_noise)
+
+        # ── Register noise tile in database ──────────────────────────
+        noise_tile_id = f"{tile_id}_noise"
+        noise_filename = f"noise/{noise_name}"
+        try:
+            with self._db.connect() as conn:
+                self._db.insert_tile(
+                    conn,
+                    tile_id=noise_tile_id,
+                    filename=noise_filename,
+                    bbox=(float(noise_data["x"].min()), float(noise_data["y"].min()),
+                          float(noise_data["x"].max()), float(noise_data["y"].max())),
+                    point_count=n_noise,
+                    flight_line=tile_info.get("flight_line", 0),
+                    scanner=tile_info.get("scanner", ''),
+                    all_scanners=json.loads(tile_info.get("all_scanners", "[]"))
+                        if isinstance(tile_info.get("all_scanners"), str) else tile_info.get("all_scanners", []),
+                    sensor_type=tile_info.get("sensor_type", ''),
+                    flightline_sensor_types=json.loads(tile_info.get("flightline_sensor_types", "{}"))
+                        if isinstance(tile_info.get("flightline_sensor_types"), str) else tile_info.get("flightline_sensor_types", {}),
+                    crs_epsg=tile_info.get("crs_epsg"),
+                    crs_wkt=tile_info.get("crs_wkt"),
+                    status=TileStatus.NOISE,
+                    filter_params={"source_tile": tile_id, "filter": "isolated"},
+                )
+            logger.info("Noise tile registered: %s", noise_tile_id)
+        except Exception as exc:
+            logger.warning("Failed to register noise tile in DB: %s", exc)
+
+        # ── Write kept (clean) points back to the original tile ──────
+        keep_data = _subset(data, keep)
+        _write_las_file(
+            las_path,
+            keep_data["x"], keep_data["y"], keep_data["z"],
+            classes=keep_data.get("classification"),
+            intensities=keep_data.get("intensity"),
+            return_numbers=keep_data.get("return_number"),
+            num_returns=keep_data.get("num_returns"),
+            point_source_ids=keep_data.get("point_source_id"),
+            gps_times=keep_data.get("gps_time"),
+            scan_angle_ranks=keep_data.get("scan_angle_rank"),
+            scan_direction_flags=keep_data.get("scan_direction_flag"),
+            edge_of_flight_lines=keep_data.get("edge_of_flight_line"),
+            user_data_array=keep_data.get("user_data"),
+            reds=keep_data.get("red"),
+            greens=keep_data.get("green"),
+            blues=keep_data.get("blue"),
+            key_points=keep_data.get("key_point"),
+            synthetics=keep_data.get("synthetic"),
+            withhelds=keep_data.get("withheld"),
+            overlaps=keep_data.get("overlap"),
+            header_template=header_template,
+        )
+
+        # Update tile status
         self._tm.update_tile_status(tile_id, TileStatus.FILTERED)
         self._tile_list_widget.update_tile_status(tile_id, TileStatus.FILTERED)
+        logger.info("Filtered %s: %d kept, %d noise → %s", tile_id, n_kept, n_noise, noise_name)
 
     def _on_filter_finished(self, tile_ids: list, keep_masks: list):
         self._refresh_tile_list()
@@ -673,6 +777,26 @@ class MainWindow(QMainWindow):
         self.set_status(f"Filter applied to {n} tile(s)", timeout=5000)
         if hasattr(self, '_filter_progress'):
             self._filter_progress.close()
+
+        # If a filtered tile is currently open in the editor, close it
+        # so the user re-opens the freshly-written file.
+        # Defer the view clear to avoid Open3D segfaults from pending
+        # background render operations.
+        open_tid = self._editor.tile_id
+        if open_tid is not None and open_tid in tile_ids:
+            self._editor.close_tile()
+            self._profile_start = None
+            self._profile_end = None
+            self._dtm_ref_distances = None
+            self._dtm_ref_elevations = None
+            # Defer clear to next event-loop iteration so any in-flight
+            # Open3D render operations complete first.
+            QTimer.singleShot(0, self._multi_view.clear)
+            self.set_status(
+                f"Filter applied — tile '{open_tid}' was updated. "
+                f"Re-open it to continue editing.",
+                timeout=8000,
+            )
 
     def _on_filter_error(self, msg: str):
         logger.error("Filter error: %s", msg)
@@ -822,6 +946,141 @@ class MainWindow(QMainWindow):
             timeout=8000,
         )
 
+    def _on_crs(self) -> None:
+        """Open the CRS / Projection dialog."""
+        # Get current CRS from the project database
+        crs_info = self._db.get_project_crs() if self._db else None
+        current_epsg = crs_info.get("epsg") if crs_info else None
+        current_wkt = crs_info.get("wkt", "") if crs_info else ""
+
+        from .crs_dialog import CrsDialog
+        dlg = CrsDialog(
+            current_crs_wkt=current_wkt or "",
+            current_epsg=current_epsg,
+            parent=self,
+        )
+        dlg.crs_assigned.connect(self._on_crs_assigned)
+        dlg.transform_applied.connect(self._on_crs_transform)
+        dlg.match_transform_applied.connect(self._on_match_transform_applied)
+        dlg.exec()
+
+    def _on_crs_assigned(self, wkt: str, epsg: int) -> None:
+        """Handle CRS assignment from the dialog."""
+        tile_ids = self._tile_list_widget.get_selected_tile_ids()
+        if not tile_ids:
+            tile_ids = [t["id"] for t in self._db.list_tiles()] if self._db else []
+        if tile_ids and self._db:
+            for tid in tile_ids:
+                self._db.set_tile_crs(tid, epsg, wkt)
+            self.set_status(
+                f"CRS assigned: EPSG:{epsg} to {len(tile_ids)} tile(s)",
+                timeout=5000,
+            )
+            # Refresh metadata panel if currently open tile is among them
+            if self._editor.tile_id and self._editor.tile_id in tile_ids:
+                self._populate_las_header(self._editor.tile_id)
+
+    def _on_crs_transform(self, source_epsg: str, target_epsg: str) -> None:
+        """Handle CRS transformation request from the dialog."""
+        from ..crs import transform_coordinates, HAS_PYPROJ
+        if not HAS_PYPROJ:
+            QMessageBox.warning(self, "pyproj Required",
+                                "Coordinate transformation requires pyproj.\n"
+                                "Install with: pip install pyproj")
+            return
+
+        tile_ids = self._tile_list_widget.get_selected_tile_ids()
+        if not tile_ids:
+            QMessageBox.information(self, "No Tiles Selected",
+                                    "Select tiles in the tile list to transform.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Confirm CRS Transform",
+            f"Transform {len(tile_ids)} tile(s) from EPSG:{source_epsg} to "
+            f"EPSG:{target_epsg}?\n\nThis will modify the X, Y, Z coordinates "
+            "of all points. A backup is recommended.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.set_status(f"Transforming {len(tile_ids)} tile(s)…", timeout=0)
+        try:
+            for tid in tile_ids:
+                data = self._tm.load_tile_points_full(tid)
+                if data is None:
+                    continue
+                new_x, new_y, new_z = transform_coordinates(
+                    data["x"], data["y"], data["z"],
+                    int(source_epsg), int(target_epsg),
+                )
+                data["x"], data["y"] = new_x, new_y
+                if new_z is not None:
+                    data["z"] = new_z
+                # Write back
+                self._editor.open_tile(tid)
+                self._multi_load_for_edit(data)
+                self._tile_list_widget.update_tile_status(tid, TileStatus.EDITED)
+                if self._db:
+                    self._db.set_tile_crs(tid, int(target_epsg), None)
+            self._regenerate_dtm()
+            self.set_status(
+                f"CRS transformed {len(tile_ids)} tile(s): EPSG:{source_epsg} → EPSG:{target_epsg}",
+                timeout=8000,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Transform Failed", str(exc))
+            self.set_status("CRS transform failed", timeout=5000)
+
+    def _on_match_transform_applied(self, method: str, params: dict) -> None:
+        """Apply a match-points estimated transformation to selected tiles."""
+        from ..crs import apply_helmert_3d, apply_affine_3d
+
+        tile_ids = self._tile_list_widget.get_selected_tile_ids()
+        if not tile_ids:
+            QMessageBox.information(self, "No Tiles Selected",
+                                    "Select tiles in the tile list to transform.")
+            return
+
+        label = "Helmert 7-param" if method == "helmert" else "Affine 12-param"
+        reply = QMessageBox.question(
+            self, f"Apply {label} Transform",
+            f"Apply the estimated {label} transformation to "
+            f"{len(tile_ids)} tile(s)?\n\n"
+            f"RMSE: {params.get('rmse', '?'):.4f} m\n\n"
+            "This will modify X, Y, Z of all points.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self.set_status(f"Applying {label} to {len(tile_ids)} tile(s)…", timeout=0)
+        try:
+            apply_fn = apply_helmert_3d if method == "helmert" else apply_affine_3d
+            for tid in tile_ids:
+                data = self._tm.load_tile_points_full(tid)
+                if data is None:
+                    continue
+                new_x, new_y, new_z = apply_fn(
+                    data["x"], data["y"], data["z"], params,
+                )
+                data["x"], data["y"], data["z"] = new_x, new_y, new_z
+                self._editor.open_tile(tid)
+                self._multi_load_for_edit(data)
+                self._tile_list_widget.update_tile_status(tid, TileStatus.EDITED)
+            self._regenerate_dtm()
+            self.set_status(
+                f"Applied {label} to {len(tile_ids)} tile(s) "
+                f"(RMSE={params.get('rmse', 0):.4f} m)",
+                timeout=8000,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Transform Failed", str(exc))
+            self.set_status("Match transform failed", timeout=5000)
+
     def _on_export_raster(self, tile_ids: Optional[List[str]] = None) -> None:
         """Open the DTM / DSM export dialog."""
         if tile_ids is None:
@@ -873,6 +1132,12 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self)
         dialog.shortcuts_changed.connect(self._apply_shortcuts)
         dialog.exec()
+        # Re-apply tool sizes from saved settings
+        from .settings_dialog import load_general_settings
+        settings = load_general_settings()
+        self._multi_view._view_profile.set_brush_radius(settings.get("brush_radius", 2.0))
+        self._multi_view._view_profile.set_rect_size(
+            settings.get("rect_width", 4.0), settings.get("rect_height", 2.0))
 
     def _apply_shortcuts(self, shortcuts: dict) -> None:
         """Update menu shortcuts and re-register global shortcuts."""
@@ -908,15 +1173,44 @@ class MainWindow(QMainWindow):
             except Exception:
                 all_scanners = []
             self._properties_panel.set_selection_count(tile_info.get("point_count", 0))
+            # Fetch CRS from DB
+            crs_db = ""
+            crs_epsg = tile_info.get("crs_epsg")
+            if crs_epsg:
+                crs_db = f"EPSG:{crs_epsg}"
+            fl_sensor_raw = tile_info.get("flightline_sensor_types", "{}")
+            try:
+                fl_sensor_types = json.loads(fl_sensor_raw) if isinstance(fl_sensor_raw, str) else fl_sensor_raw
+            except Exception:
+                fl_sensor_types = {}
             self._properties_panel.set_tile_metadata(
                 scanner=tile_info.get("scanner", ''),
                 all_scanners=all_scanners,
                 sensor_type=tile_info.get("sensor_type", ''),
                 flight_line=tile_info.get("flight_line", 0),
+                flightline_sensor_types=fl_sensor_types,
                 point_count=tile_info.get("point_count", 0),
+                crs=crs_db,
+                filename=tile_info.get("filename", ""),
+                modified=self._file_modified(tile_info),
             )
             # Read LAS header for version
             self._populate_las_header(tile_id)
+
+    def _file_modified(self, tile_info: dict) -> str:
+        """Return a human-readable modification time for a tile's LAS file."""
+        try:
+            tiles_dir = self._pm.tiles_dir
+            if tiles_dir is None:
+                return ""
+            las_path = tiles_dir / tile_info["filename"]
+            if las_path.is_file():
+                from datetime import datetime
+                ts = las_path.stat().st_mtime
+                return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+        return ""
 
     def _on_tile_open(self, tile_id: str) -> None:
         """Open a tile in the multi-view for inspection and editing."""
@@ -944,7 +1238,7 @@ class MainWindow(QMainWindow):
 
         # Auto-generate DTM if tile is classified
         tile_info = self._db.get_tile(tile_id)
-        if tile_info and tile_info.get("status") in (TileStatus.CLASSIFIED, TileStatus.EDITED):
+        if tile_info and tile_info.get("status") in (TileStatus.CLASSIFIED, TileStatus.EDITED, TileStatus.FILTERED):
             self._multi_view._view_dtm.generate_dtm()
 
         # Populate metadata panel
@@ -954,12 +1248,26 @@ class MainWindow(QMainWindow):
                 all_scanners = json.loads(all_scanners_raw) if isinstance(all_scanners_raw, str) else all_scanners_raw
             except Exception:
                 all_scanners = []
+            fl_sensor_raw = tile_info.get("flightline_sensor_types", "{}")
+            try:
+                fl_sensor_types = json.loads(fl_sensor_raw) if isinstance(fl_sensor_raw, str) else fl_sensor_raw
+            except Exception:
+                fl_sensor_types = {}
+            # Fetch CRS from DB (may not be in LAS file VLR)
+            crs_db = ""
+            crs_epsg = tile_info.get("crs_epsg")
+            if crs_epsg:
+                crs_db = f"EPSG:{crs_epsg}"
             self._properties_panel.set_tile_metadata(
                 scanner=tile_info.get("scanner", ''),
                 all_scanners=all_scanners,
                 sensor_type=tile_info.get("sensor_type", ''),
                 flight_line=tile_info.get("flight_line", 0),
+                flightline_sensor_types=fl_sensor_types,
                 point_count=tile_info.get("point_count", 0),
+                crs=crs_db,
+                filename=tile_info.get("filename", ""),
+                modified=self._file_modified(tile_info),
             )
             self._populate_las_header(tile_id)
 
@@ -1041,13 +1349,21 @@ class MainWindow(QMainWindow):
 
     def _on_point_hovered(self, idx: int, x: float, y: float, z: float,
                           classification: int, intensity: int) -> None:
-        """Update the properties panel when hovering over a profile point."""
+        """Update the properties panel when hovering over or clicking a point.
+        Only updates when the Point Info tool is active."""
+        if not self._properties_panel.point_info_active:
+            return
         self._properties_panel.set_point_info(
             x=x, y=y, z=z,
             classification=classification,
             intensity=intensity,
             point_index=idx,
         )
+
+    def _on_point_info_toggled(self, active: bool) -> None:
+        """Propagate Point Info toggle state to both views."""
+        self._multi_view._view_3d.point_info_active = active
+        self._multi_view._view_profile.point_info_active = active
 
     def _on_profile_width_changed(self, new_width: float) -> None:
         """Called when the user scrolls to change the profile corridor width."""
@@ -1307,6 +1623,19 @@ class MainWindow(QMainWindow):
             return
         try:
             import laspy
+
+            # Parse all_scanners and flightline_sensor_types from DB
+            all_scanners_raw = tile_info.get("all_scanners", "[]")
+            try:
+                all_scanners = json.loads(all_scanners_raw) if isinstance(all_scanners_raw, str) else all_scanners_raw
+            except Exception:
+                all_scanners = []
+            fl_sensor_raw = tile_info.get("flightline_sensor_types", "{}")
+            try:
+                fl_sensor_types = json.loads(fl_sensor_raw) if isinstance(fl_sensor_raw, str) else fl_sensor_raw
+            except Exception:
+                fl_sensor_types = {}
+
             with laspy.open(las_path) as reader:
                 hdr = reader.header
                 las_ver = f"{hdr.version.major}.{hdr.version.minor}"
@@ -1320,13 +1649,22 @@ class MainWindow(QMainWindow):
                             break
                 except Exception:
                     pass
+                # Fall back to DB CRS if LAS file has no CRS VLR
+                if not crs_str:
+                    crs_epsg = tile_info.get("crs_epsg")
+                    if crs_epsg:
+                        crs_str = f"EPSG:{crs_epsg} (assigned)"
                 self._properties_panel.set_tile_metadata(
                     scanner=tile_info.get("scanner", ''),
+                    all_scanners=all_scanners,
                     sensor_type=tile_info.get("sensor_type", ''),
                     flight_line=tile_info.get("flight_line", 0),
+                    flightline_sensor_types=fl_sensor_types,
                     las_version=las_ver,
                     point_count=tile_info.get("point_count", 0),
                     crs=crs_str,
+                    filename=tile_info.get("filename", ""),
+                    modified=self._file_modified(tile_info),
                 )
         except Exception:
             pass

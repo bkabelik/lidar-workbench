@@ -11,9 +11,9 @@ Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.c
 ### Point Cloud Processing
 - **LAS/LAZ Preview** — standalone file inspector with bounding box, subsampled, and full-resolution LODs before import
 - **Drag-and-drop import** of `.las`/`.laz` flight strips with automatic spatial tiling
-- **Interactive noise filtering** — SOR, ROR, and DBSCAN with real-time 3D preview
+- **Interactive noise filtering** — SOR, ROR, DBSCAN, isolated-point, low-point, and surface-proximity filters with real-time 3D preview
 - **Pointcept integration** — deep-learning classification via Point Transformer V3
-- **Manual editing** — profile-based inspection, line/rectangle/brush selections, class reassignment
+- **Manual editing** — profile-based inspection with brush, rect brush, line-above/below, and rectangle selection tools; class reassignment
 - **Full undo/redo** stack for all classification edits
 
 ### Multi-View Workspace
@@ -22,7 +22,7 @@ Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.c
 - **2D profile side** — corridor cross-section with selection tools and DTM reference overlay
 - **3D profile slice** — perspective view of the profile corridor
 
-### DTM / DSM Export (NEW)
+### DTM / DSM Export
 - **DTM** — Delaunay-triangulation (TIN) interpolation of ground points (class 2) to a regular grid
 - **DSM** — highest-point-per-cell (max-Z) from user-selected ASPRS classes
 - **Hillshade** — Horn's method illumination raster exported as GeoTIFF (.tif) alongside every DTM/DSM
@@ -49,7 +49,6 @@ cd lidar-workbench
 # Install core dependencies (PyPI)
 pip install PySide6 numpy scipy laspy open3d
 
-# For DTM/DSM export, scipy is already included — no extra deps needed.
 # For GeoTIFF output (optional), install GDAL:
 #   pip install gdal
 #   or: conda install -c conda-forge gdal
@@ -65,11 +64,10 @@ cd PointceptALS
 # Follow its README to set up the conda environment:
 conda env create -f environment.yml
 conda activate pointcept
-
-
 ```
+
 You'll also need a trained model checkpoint (.pth) and config (.py).
-Place them in models/ and configs/ respectively.
+Place them in `models/` and `configs/` respectively.
 
 **Download here:** [Pointcept Model](https://drive.google.com/file/d/15MlZ6cwed0jFsd7WKOdkDjQIQTiCy5nJ/view?usp=sharing)
 
@@ -94,11 +92,16 @@ python -m lidar_workbench.main /path/to/project
    - Check point density (bbox + grid-based effective density)
    - Click **Import…** from the preview to proceed to the import wizard
 3. **Import LAS/LAZ data** — *File → Import LAS/LAZ* (Ctrl+I) or drag-and-drop a folder onto the window
-4. **Apply noise filter** — Select tiles in the tile list → *Tools → Noise Filter* → choose SOR/ROR/DBSCAN → *Apply*
+4. **Apply noise filter** — Select tiles in the tile list → *Tools → Noise Filter* → choose filter type → *Apply*
 5. **Classify with Pointcept** (optional) — Select filtered tiles → *Tools → Classify (Pointcept)* → configure → *Start*
 6. **Manual editing** — Double-click a classified tile to open the multi-view:
    - Draw a profile line in the DTM view (right-click + drag)
-   - Select misclassified points in the profile view (brush, line, rectangle)
+   - Select misclassified points in the profile view using any selection tool:
+     - **Brush** (B) — click/drag to paint a circular region
+     - **Rect Brush** (Shift+R) — click/drag to paint a rectangular region
+     - **Above Line** (A) / **Below Line** (L) — draw a line to classify points above/below it
+     - **Rectangle** (R) — drag to select points in a rectangular area
+   - Tool sizes (brush radius, rect brush dimensions) are configurable in *Tools → Settings*
    - Click a class button in the properties panel to reclassify
    - *Undo*/*Redo* as needed (Ctrl+Z / Ctrl+Y)
 7. **Export raster** — *Tools → Export Raster (DTM / DSM)*:
@@ -135,11 +138,11 @@ lidar_workbench/
 ├── project_manager.py           # Project lifecycle (create/open/save)
 ├── tile_manager.py              # LAS import, spatial tiling, I/O
 ├── import_wizard.py             # Guided import dialog (QWizard)
-├── preview_dialog.py            # LAS/LAZ preview inspector (NEW)
-├── noise_filter.py              # SOR / ROR / DBSCAN filter algorithms
+├── preview_dialog.py            # LAS/LAZ preview inspector
+├── noise_filter.py              # SOR / ROR / DBSCAN / advanced filter algorithms
 ├── pointcept_worker.py          # Background subprocess inference runner
-├── dtm_generator.py             # In-memory DTM interpolation (griddata)
-├── export_manager.py            # DTM/DSM/Hillshade export engine (NEW)
+├── dtm_generator.py             # In-memory DTM interpolation
+├── export_manager.py            # DTM/DSM/Hillshade export engine
 ├── manual_edit.py               # Profile extraction, selections, undo/redo
 ├── gui/
 │   ├── main_window.py           # QMainWindow (menus, toolbar, 3-panel splitter)
@@ -151,10 +154,10 @@ lidar_workbench/
 │   ├── view_profile_3d.py       # 3D profile corridor view
 │   ├── filter_dialog.py         # Noise filter parameter dialog
 │   ├── classification_dialog.py # Pointcept configuration dialog
-│   ├── export_dialog.py         # DTM/DSM export configuration dialog (NEW)
-│   ├── preview_dialog.py        # LAS/LAZ preview with density analysis (NEW)
+│   ├── export_dialog.py         # DTM/DSM export configuration dialog
+│   ├── preview_dialog.py        # LAS/LAZ preview with density analysis
 │   ├── properties_panel.py      # Point properties + quick-classify
-│   └── settings_dialog.py       # Keyboard shortcut editor
+│   └── settings_dialog.py       # Keyboard shortcuts + tool size settings
 └── Pointcept/                   # Bundled deep-learning library
     ├── prediction.py
     ├── postclassification.py
@@ -223,7 +226,7 @@ my_project/
 | laspy     | 2.5     | LAS/LAZ read/write                   |
 | open3d    | 0.18    | 3D point cloud rendering             |
 
-**Optional**: GDAL (for GeoTIFF output instead of ASCII Grid), matplotlib (height colour ramps).
+**Optional**: GDAL (for GeoTIFF output), matplotlib (height colour ramps).
 
 For Pointcept classification, a separate conda environment with PyTorch and Point Transformer V3 dependencies is required — see the [PointceptALS](https://github.com/bkabelik/PointceptALS.git) README.
 
@@ -231,7 +234,7 @@ For Pointcept classification, a separate conda environment with PyTorch and Poin
 
 ## Key Design Decisions
 
-- **TIN interpolation for DTM** — preserves terrain discontinuities better than IDW-only methods; Delaunay triangulation is the same algorithm used by TerraScan/TerraModeler
+- **TIN interpolation for DTM** — preserves terrain discontinuities better than IDW-only methods, using Delaunay triangulation
 - **Max-Z for DSM** — industry standard (PDAL, LASTools) for surface models from LiDAR; avoids the "averaging" artefacts that smooth out building edges and vegetation
 - **ESRI ASCII Grid by default** — universal interchange format; every GIS package reads it; no GDAL dependency required
 - **Seamless tiling via master grid** — avoids the common pitfall of per-tile floating-point origin drift causing 1-pixel gaps
@@ -249,9 +252,9 @@ Edit `lidar_workbench/config.py` to adjust:
 - Default tile size and overlap (`DEFAULT_TILE_SIZE_M`, `DEFAULT_TILE_OVERLAP_M`)
 - ASPRS class colour map (`ASPRS_CLASS_COLORS`)
 - Filter parameters (SOR neighbours, ROR radius)
-- Point budget for 3D rendering (`MAX_POINTS_PER_VIEW`)
+- Default tool sizes (`DEFAULT_BRUSH_RADIUS_M`, `DEFAULT_RECT_WIDTH_M`, `DEFAULT_RECT_HEIGHT_M`)
 
-Keyboard shortcuts can be customised via *Tools → Settings*.
+Keyboard shortcuts and tool sizes can be customised via *Tools → Settings*.
 
 ---
 
@@ -266,5 +269,5 @@ This workbench integrates and builds upon several incredible open-source project
 - [NumPy](https://numpy.org) (BSD 3-Clause)
 - [SciPy](https://scipy.org) (BSD 3-Clause)
 
-The custom workbench code in this repository is licensed under the **MIT License**.
+The custom workbench code in this repository is licensed under the **GNU General Public License v3.0 (GPLv3)**.
 See the [`LICENSE`](LICENSE) file for details.

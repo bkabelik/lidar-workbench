@@ -16,6 +16,7 @@ from PySide6.QtGui import QKeyEvent, QKeySequence
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QHBoxLayout,
     QKeySequenceEdit,
     QLabel,
@@ -33,9 +34,15 @@ _SHORTCUTS_FILE = ".settings.json"
 
 def load_general_settings() -> dict:
     """Load general settings, falling back to defaults."""
-    from ..config import DEFAULT_FILTER_WORKERS, DEFAULT_CLASSIFY_WORKERS
+    from ..config import (
+        DEFAULT_FILTER_WORKERS, DEFAULT_CLASSIFY_WORKERS,
+        DEFAULT_BRUSH_RADIUS_M, DEFAULT_RECT_WIDTH_M, DEFAULT_RECT_HEIGHT_M,
+    )
     defaults = {"filter_workers": DEFAULT_FILTER_WORKERS,
-                "classify_workers": DEFAULT_CLASSIFY_WORKERS}
+                "classify_workers": DEFAULT_CLASSIFY_WORKERS,
+                "brush_radius": DEFAULT_BRUSH_RADIUS_M,
+                "rect_width": DEFAULT_RECT_WIDTH_M,
+                "rect_height": DEFAULT_RECT_HEIGHT_M}
     try:
         with open(_SHORTCUTS_FILE, "r") as f:
             saved = json.load(f)
@@ -67,6 +74,7 @@ DEFAULTS: Dict[str, str] = {
     "sel_above": "A",
     "sel_below": "L",
     "sel_rectangle": "R",
+    "sel_rect_brush": "Shift+R",
     "next_tile": "Tab",
     "prev_tile": "Shift+Tab",
     "classify_created": "Ctrl+0",
@@ -103,6 +111,7 @@ ACTION_LABELS: Dict[str, str] = {
     "sel_above": "Select: Above Line",
     "sel_below": "Select: Below Line",
     "sel_rectangle": "Select: Rectangle",
+    "sel_rect_brush": "Select: Rect Brush",
     "next_tile": "Next Tile",
     "prev_tile": "Previous Tile",
     "classify_created": "Quick Classify: Created (0)",
@@ -211,6 +220,41 @@ class SettingsDialog(QDialog):
         gen2_layout.addStretch()
         layout.addLayout(gen2_layout)
 
+        # ── Manual edit tool sizes ─────────────────────────────────
+        layout.addWidget(QLabel("<b>Manual Edit Tools</b>"))
+        
+        brush_layout = QHBoxLayout()
+        brush_layout.addWidget(QLabel("Brush radius (m):"))
+        self._brush_radius_spin = QDoubleSpinBox()
+        self._brush_radius_spin.setRange(0.1, 50.0)
+        self._brush_radius_spin.setSingleStep(0.5)
+        self._brush_radius_spin.setDecimals(1)
+        self._brush_radius_spin.setValue(self._settings.get("brush_radius", 2.0))
+        self._brush_radius_spin.setToolTip("Radius of the brush selection tool in meters")
+        brush_layout.addWidget(self._brush_radius_spin)
+        brush_layout.addStretch()
+        layout.addLayout(brush_layout)
+
+        rect_layout = QHBoxLayout()
+        rect_layout.addWidget(QLabel("Rect brush width (m):"))
+        self._rect_width_spin = QDoubleSpinBox()
+        self._rect_width_spin.setRange(0.1, 100.0)
+        self._rect_width_spin.setSingleStep(0.5)
+        self._rect_width_spin.setDecimals(1)
+        self._rect_width_spin.setValue(self._settings.get("rect_width", 4.0))
+        self._rect_width_spin.setToolTip("Half-width of the rectangle brush tool in meters")
+        rect_layout.addWidget(self._rect_width_spin)
+        rect_layout.addWidget(QLabel("  Height (m):"))
+        self._rect_height_spin = QDoubleSpinBox()
+        self._rect_height_spin.setRange(0.1, 100.0)
+        self._rect_height_spin.setSingleStep(0.5)
+        self._rect_height_spin.setDecimals(1)
+        self._rect_height_spin.setValue(self._settings.get("rect_height", 2.0))
+        self._rect_height_spin.setToolTip("Half-height of the rectangle brush tool in meters")
+        rect_layout.addWidget(self._rect_height_spin)
+        rect_layout.addStretch()
+        layout.addLayout(rect_layout)
+
         # Buttons
         btn_box = QDialogButtonBox()
         reset_btn = QPushButton("Restore Defaults")
@@ -243,6 +287,9 @@ class SettingsDialog(QDialog):
         save_shortcuts(self._shortcuts)
         self._settings["filter_workers"] = self._filter_workers_spin.value()
         self._settings["classify_workers"] = self._classify_workers_spin.value()
+        self._settings["brush_radius"] = self._brush_radius_spin.value()
+        self._settings["rect_width"] = self._rect_width_spin.value()
+        self._settings["rect_height"] = self._rect_height_spin.value()
         save_general_settings(self._settings)
         self.shortcuts_changed.emit(self._shortcuts)
         self.accept()

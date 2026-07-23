@@ -440,6 +440,14 @@ class ManualEditor:
     def tile_id(self) -> Optional[str]:
         return self._tile_id
 
+    def close_tile(self) -> None:
+        """Close the currently open tile, releasing in-memory data."""
+        self._tile_id = None
+        self._point_data = None
+        self._profile = None
+        self._selected_indices = None
+        self._edit_stack.clear()
+
     @property
     def point_data(self) -> Optional[Dict[str, np.ndarray]]:
         return self._point_data

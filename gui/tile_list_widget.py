@@ -35,6 +35,9 @@ _STATUS_COLORS: Dict[str, QColor] = {
     TileStatus.FILTERED:   QColor("#f39c12"),  # orange
     TileStatus.CLASSIFIED: QColor("#2ecc71"),  # green
     TileStatus.EDITED:     QColor("#9b59b6"),  # purple
+    TileStatus.NOISE:      QColor("#e74c3c"),  # red
+    TileStatus.ERROR:      QColor("#e74c3c"),  # red
+    TileStatus.EDITED:     QColor("#9b59b6"),  # purple
     TileStatus.ERROR:      QColor("#e74c3c"),  # red
 }
 

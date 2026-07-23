@@ -161,6 +161,10 @@ class View3D(QWidget):
         self._colour_mode = "class"
         self._has_geometry = False
 
+        # World offset: UTMs are large (394000, 5216000) — subtracting the
+        # centroid before Open3D rendering avoids float32 precision issues.
+        self._world_offset: Optional[np.ndarray] = None  # (3,) xyz offset
+
         # Open3D
         self._renderer = None   # OffscreenRenderer
         self._scene = None      # Open3DScene
@@ -178,8 +182,14 @@ class View3D(QWidget):
         self._picked_pt: Optional[np.ndarray] = None  # (3,) xyz
         self._picked_geom: Optional[str] = None
 
+        # Point Info tool state (controlled externally)
+        self._point_info_active: bool = False
+
         # Flightline visibility: None = all visible
         self._hidden_flightlines: set = set()
+
+        # Class visibility: None = all visible (bool array indexed by class code)
+        self._class_visibility: Optional[np.ndarray] = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -194,17 +204,24 @@ class View3D(QWidget):
 
         if HAS_OPEN3D:
             self._init_renderer()
-        self.destroyed.connect(self._cleanup_renderer)
+        # Don't connect destroyed → _cleanup_renderer here.
+        # Open3D's C++ destructor can crash during Python shutdown
+        # when Filament resources are already freed by other destructors.
+        # Cleanup is done explicitly via MultiViewWidget.cleanup().
 
     def _cleanup_renderer(self):
-        """Release OpenGL resources (called on destroyed signal)."""
+        """Release OpenGL resources. Called explicitly, not on destroyed."""
         if self._renderer is not None:
+            # Null Python references first so the C++ destructor
+            # doesn't try to access already-freed Filament resources.
+            self._scene = None
+            self._picked_geom = None
+            self._highlight_geom = None
             try:
-                self._scene = None
                 del self._renderer
-                self._renderer = None
             except Exception:
                 pass
+            self._renderer = None
 
     # ── public API ─────────────────────────────────────────────────
 
@@ -240,7 +257,17 @@ class View3D(QWidget):
         }
         self._has_geometry = True
         self._hidden_flightlines.clear()
-        self._fit_camera(xs, ys, zs)
+
+        # Center large UTM coordinates for GPU float32 precision
+        self._world_offset = np.array([float(xs.mean()), float(ys.mean()), float(zs.mean())])
+        xs_local = xs - self._world_offset[0]
+        ys_local = ys - self._world_offset[1]
+        zs_local = zs - self._world_offset[2]
+        self._point_data["x"] = xs_local
+        self._point_data["y"] = ys_local
+        self._point_data["z"] = zs_local
+
+        self._fit_camera(xs_local, ys_local, zs_local)
         self._rebuild_scene()
 
     def load_point_cloud_colored(self, xs, ys, zs, colors):
@@ -259,8 +286,18 @@ class View3D(QWidget):
         self._colour_mode = "_custom"
         self._has_geometry = True
         self._hidden_flightlines.clear()
-        self._fit_camera(xs, ys, zs)
-        self._build_and_render(xs, ys, zs, np.asarray(colors, dtype=np.float64))
+
+        # Center for GPU float32 precision
+        self._world_offset = np.array([float(xs.mean()), float(ys.mean()), float(zs.mean())])
+        xs_local = xs - self._world_offset[0]
+        ys_local = ys - self._world_offset[1]
+        zs_local = zs - self._world_offset[2]
+        self._point_data["x"] = xs_local
+        self._point_data["y"] = ys_local
+        self._point_data["z"] = zs_local
+
+        self._fit_camera(xs_local, ys_local, zs_local)
+        self._build_and_render(xs_local, ys_local, zs_local, np.asarray(colors, dtype=np.float64))
 
     def set_colour_mode(self, mode: str):
         if mode not in self.COLOUR_MODES and mode != "_custom":
@@ -311,6 +348,13 @@ class View3D(QWidget):
         if self._point_data is not None:
             self._rebuild_scene()
 
+    def set_class_visibility(self, visibility: np.ndarray) -> None:
+        """Set which ASPRS classes are visible (bool array indexed by class code).
+        Triggers an immediate scene rebuild."""
+        self._class_visibility = visibility
+        if self._point_data is not None:
+            self._rebuild_scene()
+
     @property
     def flightlines(self) -> list[int]:
         """Return sorted list of flightline numbers in the current data."""
@@ -320,17 +364,34 @@ class View3D(QWidget):
         ids = np.unique(d["point_source_id"])
         return sorted(int(x) for x in ids if x > 0)
 
+    @property
+    def point_info_active(self) -> bool:
+        """Whether the Point Info tool is active."""
+        return self._point_info_active
+
+    @point_info_active.setter
+    def point_info_active(self, value: bool) -> None:
+        """Enable/disable Point Info tool. When disabled, clears the pick marker."""
+        self._point_info_active = value
+        if not value:
+            # Clear pick marker when tool is deactivated
+            self._picked_pt = None
+            if self._scene is not None and self._picked_geom is not None:
+                self._scene.remove_geometry(self._picked_geom)
+                self._picked_geom = None
+            self._render()
+
     def clear(self):
         self._point_data = None
         self._has_geometry = False
         self._hidden_flightlines.clear()
         self._picked_pt = None
-        if self._scene is not None:
-            if self._picked_geom is not None:
-                self._scene.remove_geometry(self._picked_geom)
-            self._scene.clear_geometry()
         self._picked_geom = None
         self._highlight_geom = None
+        self._world_offset = None
+        # Don't touch the Open3D scene — clear_geometry can segfault if
+        # the renderer is in an inconsistent state. _build_and_render
+        # will clear and rebuild the scene when new data arrives.
         self._view.set_pixmap(QPixmap())
         self._view.update()
 
@@ -339,6 +400,19 @@ class View3D(QWidget):
         return self._has_geometry
 
     # ── internals ──────────────────────────────────────────────────
+
+    def _safe_clear_scene(self) -> None:
+        """Clear the Open3D scene, recreating the renderer if it crashes."""
+        if self._scene is None:
+            return
+        try:
+            self._scene.clear_geometry()
+        except Exception:
+            # Open3D C++ may have crashed internally — recreate renderer
+            logger.warning("clear_geometry failed — recreating renderer")
+            self._renderer = None
+            self._scene = None
+            self._init_renderer()
 
     def _init_renderer(self):
         if self._renderer is not None:
@@ -362,21 +436,35 @@ class View3D(QWidget):
         if self._point_data is None or self._scene is None:
             return
         d = self._point_data
+        n = len(d["x"])
 
-        # Filter out hidden flightlines
+        # Build combined mask from flightline + class visibility filters
+        mask = np.ones(n, dtype=bool)
+
+        # Flightline filter
         if self._hidden_flightlines and d.get("point_source_id") is not None:
-            mask = np.ones(len(d["x"]), dtype=bool)
             for fl in self._hidden_flightlines:
                 mask &= (d["point_source_id"] != fl)
-            if mask.sum() == 0:
-                self._scene.clear_geometry()
-                self._highlight_geom = None
-                self._render()
-                return
+
+        # Class visibility filter
+        if self._class_visibility is not None and d.get("classification") is not None:
+            cls_mask = self._class_visibility[d["classification"]]
+            mask &= cls_mask
+
+        if mask.sum() == 0:
+            self._safe_clear_scene()
+            self._highlight_geom = None
+            self._render()
+            return
+
+        if mask.all():
+            # No filtering needed — fast path
+            colors = self._compute_colours(d)
+            self._build_and_render(d["x"], d["y"], d["z"], colors)
+        else:
             xs = d["x"][mask]
             ys = d["y"][mask]
             zs = d["z"][mask]
-            # recompute colors for subset
             sub_data = {
                 "x": xs, "y": ys, "z": zs,
                 "classification": d["classification"][mask] if d["classification"] is not None else None,
@@ -386,14 +474,11 @@ class View3D(QWidget):
             }
             colors = self._compute_colours(sub_data)
             self._build_and_render(xs, ys, zs, colors)
-        else:
-            colors = self._compute_colours(d)
-            self._build_and_render(d["x"], d["y"], d["z"], colors)
 
     def _build_and_render(self, xs, ys, zs, colors):
         if self._scene is None:
             return
-        self._scene.clear_geometry()
+        self._safe_clear_scene()
         self._highlight_geom = None
         self._picked_geom = None
 
@@ -404,6 +489,7 @@ class View3D(QWidget):
         mat = o3d_render.MaterialRecord()
         mat.shader = "defaultUnlit"
         mat.point_size = 2.5
+
         self._scene.add_geometry("_points", pcd, mat)
 
         # Re-add pick marker if one exists
@@ -533,7 +619,12 @@ class View3D(QWidget):
     def _on_click(self, sx, sy):
         """Handle a click in the 3D view — project all points to screen
         space, find the nearest one to the click, emit point_picked,
-        and show a marker sphere."""
+        and show a marker sphere.
+
+        Only active when Point Info tool is toggled on.
+        """
+        if not self._point_info_active:
+            return
         if self._point_data is None or self._renderer is None:
             return
         d = self._point_data
@@ -553,7 +644,7 @@ class View3D(QWidget):
         # Distance in pixels from click to each projected point
         sx_arr = screen_pts[:, 0]
         sy_arr = screen_pts[:, 1]
-        in_front = screen_pts[:, 2]  # depth
+        in_front = screen_pts[:, 2].astype(bool)  # depth (column_stack coerces bool→float)
 
         pixel_dist = np.sqrt((sx_arr - sx)**2 + (sy_arr - sy)**2)
         pixel_dist[~in_front] = np.inf
@@ -567,12 +658,18 @@ class View3D(QWidget):
         cls = int(d["classification"][nearest]) if d["classification"] is not None else 0
         intens = int(d["intensity"][nearest]) if d["intensity"] is not None else 0
 
-        # Store picked point and show marker
+        # Store picked point (local coords for marker)
         self._picked_pt = np.array([px, py, pz])
         self._show_pick_marker()
         self._render()
 
-        self.point_picked.emit(nearest, px, py, pz, cls, intens)
+        # Emit world coordinates (add back the UTM offset)
+        wx, wy, wz = px, py, pz
+        if self._world_offset is not None:
+            wx += self._world_offset[0]
+            wy += self._world_offset[1]
+            wz += self._world_offset[2]
+        self.point_picked.emit(nearest, wx, wy, wz, cls, intens)
 
     def _on_dblclick(self, sx, sy):
         """Double-click: re-center the orbit on the nearest point."""
@@ -593,8 +690,7 @@ class View3D(QWidget):
 
         sx_arr = screen_pts[:, 0]
         sy_arr = screen_pts[:, 1]
-        in_front = screen_pts[:, 2]
-
+        in_front = screen_pts[:, 2].astype(bool)
         pixel_dist = np.sqrt((sx_arr - sx)**2 + (sy_arr - sy)**2)
         pixel_dist[~in_front] = np.inf
 
@@ -638,7 +734,7 @@ class View3D(QWidget):
         return np.column_stack((sx, sy, in_front))
 
     def _show_pick_marker(self):
-        """Add a small sphere at the picked point location."""
+        """Add a sphere at the picked point location, sized to ~1% of point-cloud extent."""
         if self._scene is None:
             return
         # Remove old marker
@@ -648,12 +744,21 @@ class View3D(QWidget):
         if self._picked_pt is None:
             return
 
+        # Compute a visible radius — 1% of point cloud extent, min 0.1 m
+        radius = 0.5  # default fallback
+        if self._point_data is not None and len(self._point_data["x"]) > 0:
+            d = self._point_data
+            extent = max(
+                float(np.ptp(d["x"])), float(np.ptp(d["y"])), float(np.ptp(d["z"]))
+            )
+            radius = max(extent * 0.008, 0.1)
+
         import open3d as o3d
-        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.15)
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
         sphere.translate(self._picked_pt)
-        sphere.paint_uniform_color([1.0, 0.2, 0.2])  # bright red
+        sphere.paint_uniform_color([1.0, 0.15, 0.15])  # bright red
         mat = o3d_render.MaterialRecord()
         mat.shader = "defaultUnlit"
-        mat.base_color = [1.0, 0.2, 0.2, 1.0]
+        mat.base_color = [1.0, 0.15, 0.15, 1.0]
         self._picked_geom = "_picked_marker"
         self._scene.add_geometry(self._picked_geom, sphere, mat)

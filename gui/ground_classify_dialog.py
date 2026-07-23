@@ -15,6 +15,7 @@ import numpy as np
 
 from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -65,7 +66,12 @@ class _GroundClassifyWorker(QThread):
                     max_distance=self._params["max_distance"],
                     max_angle=self._params["max_angle"],
                     max_distance_above=self._params.get("max_distance_above", 0.15),
-                    cell_size=self._params.get("cell_size"),
+                    max_terrain_angle=self._params.get("max_terrain_angle", 88.0),
+                    reduce_iter_angle_when_edge=self._params.get("reduce_iter_angle_when_edge"),
+                    stop_tri_when_edge=self._params.get("stop_tri_when_edge"),
+                    only_upward=self._params.get("only_upward", False),
+                    follow_surface_trend=self._params.get("follow_surface_trend", True),
+                    cell_size=None,  # auto-computed from point density
                     progress=lambda msg, pct: self.progress.emit(msg, pct),
                 )
             self.finished.emit(mask)
@@ -168,6 +174,70 @@ class GroundClassifyDialog(QDialog):
             "Very tight (0.10–0.20 m) to reject water surface."
         )
         tf.addRow("Max Above TIN:", self._tin_above)
+
+        # Terrain angle
+        self._tin_terrain_angle = QDoubleSpinBox()
+        self._tin_terrain_angle.setRange(10.0, 90.0)
+        self._tin_terrain_angle.setDecimals(1)
+        self._tin_terrain_angle.setValue(88.0)
+        self._tin_terrain_angle.setSuffix("°")
+        self._tin_terrain_angle.setToolTip(
+            "Max allowed slope of TIN triangles. "
+            "Lower values (45-60°) for natural terrain prevent "
+            "classification on steep riverbanks, cliffs. "
+            "Use 88-90° for man-made structures."
+        )
+        tf.addRow("Max Terrain Angle:", self._tin_terrain_angle)
+
+        # Max building size — removed (Pointcept already classifies buildings).
+        # Seed grid is computed from point density instead.
+
+        # Edge-based iteration control (optional, off by default)
+        self._tin_reduce_edge = QDoubleSpinBox()
+        self._tin_reduce_edge.setRange(0.0, 20.0)
+        self._tin_reduce_edge.setDecimals(1)
+        self._tin_reduce_edge.setValue(0.0)
+        self._tin_reduce_edge.setSuffix(" m")
+        self._tin_reduce_edge.setSpecialValueText("Off")
+        self._tin_reduce_edge.setToolTip(
+            "When triangle edges are shorter than this, reduce "
+            "iteration angle to avoid over-densification. "
+            "0 = disabled."
+        )
+        tf.addRow("Reduce Iter. Angle < Edge:", self._tin_reduce_edge)
+
+        self._tin_stop_edge = QDoubleSpinBox()
+        self._tin_stop_edge.setRange(0.0, 10.0)
+        self._tin_stop_edge.setDecimals(2)
+        self._tin_stop_edge.setValue(0.0)
+        self._tin_stop_edge.setSuffix(" m")
+        self._tin_stop_edge.setSpecialValueText("Off")
+        self._tin_stop_edge.setToolTip(
+            "Stop processing in triangles with edges shorter than "
+            "this. 0 = disabled."
+        )
+        tf.addRow("Stop Triang. < Edge:", self._tin_stop_edge)
+
+        # Only upward
+        self._tin_only_upward = QCheckBox("Only add points above initial surface")
+        self._tin_only_upward.setToolTip(
+            "If checked, only points ABOVE the initial seed surface "
+            "are added. Prevents low-error noise from pulling the "
+            "TIN downward."
+        )
+        tf.addRow(self._tin_only_upward)
+
+        # Follow surface trend
+        self._tin_follow_trend = QCheckBox("Follow surface trend (adapt to local slope)")
+        self._tin_follow_trend.setChecked(True)
+        self._tin_follow_trend.setToolTip(
+            "If checked, the iteration angle is locally relaxed on "
+            "steep natural slopes (riverbanks, cliffs). This helps "
+            "the TIN climb slopes where the terrain angle changes "
+            "rapidly. Disable for flat urban areas."
+        )
+        tf.addRow(self._tin_follow_trend)
+
         self._tin_group.setVisible(False)
         layout.addWidget(self._tin_group)
 
@@ -177,7 +247,12 @@ class GroundClassifyDialog(QDialog):
             "Uses progressive morphological opening.\n\n"
             "<b>TIN Densification</b>: iterative, "
             "preserves sharp terrain breaks (cliffs, riverbanks). "
-            "Slower but more precise on complex terrain."
+            "Slower but more precise on complex terrain.\n\n"
+            "<b>TIN tips:</b> lower <i>Max Terrain Angle</i> to 45-60° "
+            "for natural terrain with steep riverbanks. "
+            "Enable <i>Only Upward</i> if low-error points "
+            "are pulling the surface down. Edge controls "
+            "are optional — leave off for faster processing."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -224,6 +299,19 @@ class GroundClassifyDialog(QDialog):
                 "max_distance": self._tin_dist.value(),
                 "max_angle": self._tin_angle.value(),
                 "max_distance_above": self._tin_above.value(),
+                "max_terrain_angle": self._tin_terrain_angle.value(),
+                "reduce_iter_angle_when_edge": (
+                    self._tin_reduce_edge.value()
+                    if self._tin_reduce_edge.value() > 0
+                    else None
+                ),
+                "stop_tri_when_edge": (
+                    self._tin_stop_edge.value()
+                    if self._tin_stop_edge.value() > 0
+                    else None
+                ),
+                "only_upward": self._tin_only_upward.isChecked(),
+                "follow_surface_trend": self._tin_follow_trend.isChecked(),
                 "cell_size": None,
             }
 

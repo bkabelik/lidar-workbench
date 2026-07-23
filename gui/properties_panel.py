@@ -8,7 +8,7 @@ buttons, context-sensitive to the active view and selection.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -84,13 +84,14 @@ class PropertiesPanel(QWidget):
     classify_requested = Signal(int)
     undo_requested = Signal()
     redo_requested = Signal()
-    point_info_requested = Signal()  # user clicked the Info button
+    point_info_toggled = Signal(bool)  # emitted when Point Info tool is toggled on/off
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setMinimumWidth(180)
         self._tile_data: Optional[dict] = None  # full point arrays for current tile
         self._current_point_idx: int = -1       # index of the hovered/selected point
+        self._point_info_active: bool = False   # Point Info tool on/off
         self._info_dlg: Optional[QDialog] = None  # reusable non-modal info dialog
         self._info_text: Optional[QTextEdit] = None
         self._setup_ui()
@@ -123,26 +124,27 @@ class PropertiesPanel(QWidget):
 
         layout.addWidget(prop_group)
 
-        # Info button
-        self._info_btn = QPushButton("ℹ Point Info…")
-        self._info_btn.setToolTip("Show all attributes of the currently hovered/selected point (non-blocking)")
+        # Point Info toggle button
+        self._info_btn = QPushButton("📍 Point Info")
+        self._info_btn.setToolTip("Toggle Point Info tool — click a point in 3D or profile view to inspect it")
         self._info_btn.setCheckable(True)
-        self._info_btn.clicked.connect(self._toggle_point_info_dialog)
+        self._info_btn.setChecked(False)
+        self._info_btn.clicked.connect(self._on_info_btn_toggled)
         self._info_btn.setEnabled(False)
+        self._update_info_btn_style()
         layout.addWidget(self._info_btn)
 
         # ── File / LAS header metadata ─────────────────────────────
-        meta_group = QGroupBox("File Metadata")
+        meta_group = QGroupBox("Tile Info")
         meta_form = QFormLayout(meta_group)
 
         self._scanner_label = QLabel("—")
-        meta_form.addRow("Scanner:", self._scanner_label)
+        self._scanner_label.setWordWrap(True)
+        meta_form.addRow("Scanner(s):", self._scanner_label)
 
-        self._sensor_type_label = QLabel("—")
-        meta_form.addRow("Sensor Type:", self._sensor_type_label)
-
-        self._flight_line_label = QLabel("—")
-        meta_form.addRow("Flight Line:", self._flight_line_label)
+        self._flightlines_label = QLabel("—")
+        self._flightlines_label.setWordWrap(True)
+        meta_form.addRow("Flight Lines:", self._flightlines_label)
 
         self._las_version_label = QLabel("—")
         meta_form.addRow("LAS Version:", self._las_version_label)
@@ -150,7 +152,15 @@ class PropertiesPanel(QWidget):
         self._file_point_count_label = QLabel("—")
         meta_form.addRow("Total Points:", self._file_point_count_label)
 
+        self._filename_label = QLabel("—")
+        self._filename_label.setWordWrap(True)
+        meta_form.addRow("Filename:", self._filename_label)
+
+        self._modified_label = QLabel("—")
+        meta_form.addRow("Modified:", self._modified_label)
+
         self._crs_label = QLabel("—")
+        self._crs_label.setWordWrap(True)
         meta_form.addRow("CRS:", self._crs_label)
 
         layout.addWidget(meta_group)
@@ -214,6 +224,11 @@ class PropertiesPanel(QWidget):
 
     # ── public API ─────────────────────────────────────────────────
 
+    @property
+    def point_info_active(self) -> bool:
+        """Whether the Point Info tool is currently active."""
+        return self._point_info_active
+
     def set_tile_data(self, point_data: Optional[dict]) -> None:
         """
         Store the full point arrays for the currently loaded tile,
@@ -225,7 +240,14 @@ class PropertiesPanel(QWidget):
                         plus any extra LAS fields that are available.
         """
         self._tile_data = point_data
-        self._info_btn.setEnabled(point_data is not None and len(point_data.get("x", [])) > 0)
+        has_data = point_data is not None and len(point_data.get("x", [])) > 0
+        self._info_btn.setEnabled(has_data)
+        if not has_data and self._point_info_active:
+            # Deactivate if tile is unloaded
+            self._point_info_active = False
+            self._info_btn.setChecked(False)
+            self._update_info_btn_style()
+            self.point_info_toggled.emit(False)
 
     def set_point_info(
         self,
@@ -270,9 +292,12 @@ class PropertiesPanel(QWidget):
         else:
             self._height_label.setText("—")
 
-        # Auto-refresh non-modal info dialog if open
-        if self._info_dlg is not None and self._info_dlg.isVisible():
-            self._update_info_dialog()
+        # Auto-refresh or auto-open the detailed point info dialog when tool is active
+        if self._point_info_active and point_index >= 0 and self._tile_data is not None:
+            if self._info_dlg is not None and self._info_dlg.isVisible():
+                self._update_info_dialog()
+            else:
+                self._show_info_dialog()
 
     def set_selection_count(self, count: int) -> None:
         """Update the selected-point count label."""
@@ -290,14 +315,41 @@ class PropertiesPanel(QWidget):
         """Show undo/redo stack sizes."""
         self.set_undo_state(undo_count > 0, redo_count > 0)
 
-    def _toggle_point_info_dialog(self) -> None:
-        """Toggle the non-modal point info dialog on/off."""
+    def _on_info_btn_toggled(self, checked: bool) -> None:
+        """Handle Point Info toggle button click."""
+        self._point_info_active = checked
+        self._update_info_btn_style()
+        self.point_info_toggled.emit(checked)
+        # Show detailed info dialog when activating if a point is selected
+        if checked and self._tile_data is not None and self._current_point_idx >= 0:
+            self._show_info_dialog()
+
+    def _update_info_btn_style(self) -> None:
+        """Update the button appearance based on active state."""
+        if self._point_info_active:
+            self._info_btn.setText("📍 Point Info  [ON]")
+            self._info_btn.setStyleSheet(
+                "QPushButton {"
+                "  text-align: left;"
+                "  padding: 6px 10px;"
+                "  font-weight: bold;"
+                "  background: #2d6a4f;"
+                "  color: #ffffff;"
+                "  border: 2px solid #40916c;"
+                "  border-radius: 3px;"
+                "}"
+                "QPushButton:hover { background: #40916c; }"
+            )
+        else:
+            self._info_btn.setText("📍 Point Info")
+            self._info_btn.setStyleSheet("")
+
+    def _show_info_dialog(self) -> None:
+        """Open the non-modal detailed point info dialog."""
         if self._info_dlg is not None and self._info_dlg.isVisible():
             self._info_dlg.close()
             self._info_dlg = None
             self._info_text = None
-            self._info_btn.setChecked(False)
-            return
         if self._tile_data is None:
             return
         self._info_dlg = QDialog(self)
@@ -312,14 +364,12 @@ class PropertiesPanel(QWidget):
         close_btn.clicked.connect(self._info_dlg.accept)
         layout.addWidget(close_btn)
         self._info_dlg.finished.connect(self._on_info_dlg_closed)
-        self._info_btn.setChecked(True)
         self._update_info_dialog()
         self._info_dlg.show()
 
     def _on_info_dlg_closed(self) -> None:
         self._info_dlg = None
         self._info_text = None
-        self._info_btn.setChecked(False)
 
     def _update_info_dialog(self) -> None:
         """Refresh the contents of the non-modal info dialog."""
@@ -382,9 +432,12 @@ class PropertiesPanel(QWidget):
         all_scanners: Optional[List[str]] = None,
         sensor_type: str = '',
         flight_line: int = 0,
+        flightline_sensor_types: Optional[Dict[int, str]] = None,
         las_version: str = '',
         point_count: int = 0,
         crs: str = '',
+        filename: str = '',
+        modified: str = '',
     ) -> None:
         """
         Update the file metadata display with info from the database
@@ -395,23 +448,44 @@ class PropertiesPanel(QWidget):
             all_scanners: List of all scanner names in this tile.
             sensor_type:  ``'topo'``, ``'bathy'``, or ``''``.
             flight_line:  Flight-line number (0 = unknown).
+            flightline_sensor_types: Dict mapping flight_line → sensor_type
+                                     (e.g. ``{1: 'topo', 2: 'bathy'}``).
             las_version:  LAS format version string (e.g. ``'1.4'``).
             point_count:  Number of points in the tile.
             crs:          Coordinate reference system description.
+            filename:     LAS file name.
+            modified:     Last modification timestamp string.
         """
+        # ── Scanner(s) ─────────────────────────────────────────────
         if all_scanners and len(all_scanners) > 0:
-            # Show dominant first, then all
-            scanner_text = scanner if scanner else all_scanners[0]
-            if len(all_scanners) > 1:
-                scanner_text += f" (+{len(all_scanners)-1} more: {', '.join(all_scanners[1:])})"
-            self._scanner_label.setText(scanner_text)
+            self._scanner_label.setText(", ".join(all_scanners))
         elif scanner:
             self._scanner_label.setText(scanner)
         else:
             self._scanner_label.setText("—")
-        st_display = {'topo': 'Topography', 'bathy': 'Bathymetry'}
-        self._sensor_type_label.setText(st_display.get(sensor_type, sensor_type) if sensor_type else "—")
-        self._flight_line_label.setText(str(flight_line) if flight_line else "—")
+
+        # ── Flight Lines (with sensor types) ───────────────────────
+        if flightline_sensor_types and len(flightline_sensor_types) > 0:
+            st_display = {'topo': 'Topo', 'bathy': 'Bathy'}
+            parts = []
+            for fl_id in sorted(flightline_sensor_types.keys()):
+                st = flightline_sensor_types[fl_id]
+                st_label = st_display.get(st, st) if st else "?"
+                parts.append(f"FL {fl_id} ({st_label})")
+            self._flightlines_label.setText(", ".join(parts))
+        elif flight_line:
+            st_display = {'topo': 'Topography', 'bathy': 'Bathymetry'}
+            st_label = st_display.get(sensor_type, sensor_type) if sensor_type else ""
+            text = f"FL {flight_line}"
+            if st_label:
+                text += f" ({st_label})"
+            self._flightlines_label.setText(text)
+        else:
+            self._flightlines_label.setText("—")
+
+        # ── LAS version / points / file / CRS ───────────────────────
         self._las_version_label.setText(las_version if las_version else "—")
         self._file_point_count_label.setText(f"{point_count:,}" if point_count else "—")
+        self._filename_label.setText(filename if filename else "—")
+        self._modified_label.setText(modified if modified else "—")
         self._crs_label.setText(crs if crs else "—")

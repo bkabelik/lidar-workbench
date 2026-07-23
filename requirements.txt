@@ -1,0 +1,8 @@
+PySide6>=6.5
+numpy>=1.24
+open3d>=0.18
+laspy>=2.5
+rasterio>=1.3
+scipy>=1.10
+scikit-learn>=1.3
+pyproj>=3.5
