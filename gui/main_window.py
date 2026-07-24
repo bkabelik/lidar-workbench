@@ -48,6 +48,7 @@ from ..tile_manager import TileManager
 from .classification_dialog import ClassificationDialog
 from .export_dialog import ExportDialog
 from .filter_dialog import FilterDialog
+from .ground_control_dialog import GroundControlDialog
 from .multi_view_widget import MultiViewWidget
 from .preview_dialog import PreviewDialog
 from .properties_panel import PropertiesPanel
@@ -209,6 +210,13 @@ class MainWindow(QMainWindow):
 
         tools_menu.addSeparator()
 
+        ground_control_action = QAction("&Ground Control…", self)
+        ground_control_action.setObjectName("ground_control")
+        ground_control_action.triggered.connect(self._on_ground_control)
+        tools_menu.addAction(ground_control_action)
+
+        tools_menu.addSeparator()
+
         export_action = QAction("&Export Raster (DTM / DSM)…", self)
         export_action.setObjectName("export_raster")
         export_action.triggered.connect(self._on_export_raster)
@@ -266,6 +274,10 @@ class MainWindow(QMainWindow):
         bathy_btn = toolbar.addAction("Bathy")
         bathy_btn.setToolTip("Bathymetry processing (refraction, river crop, benthic filter)")
         bathy_btn.triggered.connect(self._on_bathy_process)
+
+        gc_btn = toolbar.addAction("GndCtrl")
+        gc_btn.setToolTip("Ground control points and roof surfaces adjustment")
+        gc_btn.triggered.connect(self._on_ground_control)
 
         toolbar.addSeparator()
 
@@ -944,6 +956,154 @@ class MainWindow(QMainWindow):
         self.set_status(
             f"Bathymetry done: {len(result['x']):,} points",
             timeout=8000,
+        )
+
+    def _on_ground_control(self) -> None:
+        """Open the Ground Control dialog for the currently open tile."""
+        if self._editor.tile_id is None:
+            QMessageBox.information(self, "No Tile Open",
+                                    "Please open a tile first (double-click in tile list).")
+            return
+
+        data = self._tm.load_tile_points_full(self._editor.tile_id)
+        if data is None:
+            return
+
+        dlg = GroundControlDialog(data, parent=self)
+        dlg.shift_applied.connect(self._apply_ground_control_shift)
+        dlg.visualize_point.connect(self._on_visualize_control_point)
+        dlg.exec()
+
+    def _apply_ground_control_shift(self, dx: float, dy: float, dz: float) -> None:
+        """Apply an XYZ shift to the current tile based on ground control results."""
+        if self._editor.tile_id is None:
+            return
+
+        data = self._tm.load_tile_points_full(self._editor.tile_id)
+        if data is None:
+            return
+
+        # Apply XYZ shift
+        data["x"] = data["x"] + dx
+        data["y"] = data["y"] + dy
+        data["z"] = data["z"] + dz
+
+        # Write back to LAS file
+        tile_info = self._db.get_tile(self._editor.tile_id)
+        if tile_info is None:
+            return
+
+        tiles_dir = self._pm.tiles_dir
+        if tiles_dir is None:
+            return
+
+        las_path = tiles_dir / tile_info["filename"]
+        if not las_path.is_file():
+            return
+
+        try:
+            import laspy
+            import shutil
+
+            # Backup
+            backup_path = las_path.with_suffix(las_path.suffix + ".bak")
+            if not backup_path.exists():
+                shutil.copy2(las_path, backup_path)
+
+            with laspy.open(las_path, mode="rw") as writer:
+                writer.header = writer.header
+                las_data = writer.read()
+                las_data.x = data["x"]
+                las_data.y = data["y"]
+                las_data.z = data["z"]
+                writer.write(las_data)
+
+            self._editor.open_tile(self._editor.tile_id)
+            self._multi_load_for_edit(data)
+            self._tile_list_widget.update_tile_status(
+                self._editor.tile_id, TileStatus.EDITED
+            )
+            self._regenerate_dtm()
+            if dx == 0.0 and dy == 0.0:
+                self.set_status(
+                    f"Ground control Z shift applied: {dz:+.3f} m",
+                    timeout=8000,
+                )
+            else:
+                mag = float(np.sqrt(dx*dx + dy*dy + dz*dz))
+                self.set_status(
+                    f"Ground control XYZ shift applied: "
+                    f"({dx:+.3f}, {dy:+.3f}, {dz:+.3f}) m, |Shift|={mag:.3f} m",
+                    timeout=8000,
+                )
+        except Exception as exc:
+            logger.exception("Failed to apply ground control shift")
+            QMessageBox.critical(self, "Shift Failed", str(exc))
+
+    def _on_visualize_control_point(self, x: float, y: float, label: str) -> None:
+        """
+        Navigate the 3-D view to a specific control point location.
+        Loads a snapshot of ~500k points around the location if the tile
+        data is available.
+        """
+        if self._editor.tile_id is None:
+            return
+
+        data = self._tm.load_tile_points_full(self._editor.tile_id)
+        if data is None:
+            return
+
+        xs = data["x"]
+        ys = data["y"]
+        zs = data["z"]
+
+        # Find points within a 50 m radius of the target
+        radius = 50.0
+        dists = np.sqrt((xs - x) ** 2 + (ys - y) ** 2)
+        nearby = dists < radius
+
+        if nearby.sum() == 0:
+            self.set_status(
+                f"No points found within {radius:.0f} m of ({x:.2f}, {y:.2f})",
+                timeout=3000,
+            )
+            return
+
+        # Limit to ~500k points
+        n_nearby = int(nearby.sum())
+        if n_nearby > 500_000:
+            idx = np.where(nearby)[0]
+            step = max(1, n_nearby // 500_000)
+            subset = np.zeros(len(xs), dtype=bool)
+            subset[idx[::step]] = True
+        else:
+            subset = nearby
+
+        n_show = int(subset.sum())
+
+        # Push the subset to the 3-D view
+        self._multi_view._view_3d.load_point_cloud(
+            data["x"][subset], data["y"][subset], data["z"][subset],
+            data.get("classification")[subset] if data.get("classification") is not None else None,
+            data.get("intensity")[subset] if data.get("intensity") is not None else None,
+            data.get("return_number")[subset] if data.get("return_number") is not None else None,
+            data.get("point_source_id")[subset] if data.get("point_source_id") is not None else None,
+        )
+
+        # Add a highlight sphere at the control point location
+        try:
+            import open3d as o3d
+            sphere = o3d.geometry.TriangleMesh.create_sphere(radius=1.0)
+            sphere.translate([x, y, float(np.median(data["z"][subset]))])
+            sphere.paint_uniform_color([1.0, 0.0, 0.0])
+            # We can't easily add to the offscreen renderer from here,
+            # but the 3-D view is now centered on the region.
+        except Exception:
+            pass
+
+        self.set_status(
+            f"Visual check: \"{label}\" — {n_show:,} points within {radius:.0f} m",
+            timeout=5000,
         )
 
     def _on_crs(self) -> None:

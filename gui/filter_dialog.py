@@ -339,6 +339,16 @@ class FilterDialog(QDialog):
         self._preview_status.setStyleSheet("font-weight: bold; color: #333;")
         mid.addWidget(self._preview_status)
 
+        # --- Noise visibility toggle ---
+        self._show_noise_check = QCheckBox("Show noise (red) points in preview")
+        self._show_noise_check.setChecked(True)
+        self._show_noise_check.setToolTip(
+            "When unchecked, only kept points are shown. "
+            "Toggle off to see the cleaned point cloud."
+        )
+        self._show_noise_check.toggled.connect(self._on_noise_toggled)
+        mid.addWidget(self._show_noise_check)
+
         # --- Batch apply ---
         self._batch_check = QCheckBox(
             f"Apply to all {len(self._tile_ids)} selected tile(s)"
@@ -494,6 +504,10 @@ class FilterDialog(QDialog):
                     "min_samples": self._dbscan_min_samples_spin.value(),
                     "min_cluster_size": self._dbscan_min_cluster_spin.value()}
 
+    def _on_noise_toggled(self):
+        """Re-render preview when noise visibility is toggled."""
+        self._update_preview()
+
     # ── preview ────────────────────────────────────────────────────
 
     def _schedule_preview_update(self):
@@ -633,22 +647,47 @@ class FilterDialog(QDialog):
 
         n_out = int(outlier.sum())
         pct = n_out / n * 100 if n > 0 else 0
-        self._preview_status.setText(
-            f"Outliers: {n_out:,} / {n:,} ({pct:.1f}%)\n"
-            f"Kept:     {n - n_out:,} points  |  {len(self._pipeline)} step(s)"
-        )
+
+        show_noise = self._show_noise_check.isChecked()
+        if show_noise:
+            self._preview_status.setText(
+                f"Outliers: {n_out:,} / {n:,} ({pct:.1f}%)\n"
+                f"Kept:     {n - n_out:,} points  |  {len(self._pipeline)} step(s)"
+            )
+        else:
+            self._preview_status.setText(
+                f"Outliers: {n_out:,} / {n:,} ({pct:.1f}%)  [hidden]\n"
+                f"Kept:     {n - n_out:,} points  |  {len(self._pipeline)} step(s)"
+            )
 
         # Coloured preview: outliers = red, kept = class colour
-        cls_arr = pts.get("classification")
-        colors = np.zeros((n, 3), dtype=np.float64)
-        if cls_arr is not None:
-            for code in np.unique(cls_arr):
-                colors[(cls_arr == code) & keep] = get_class_color(int(code))
+        if show_noise:
+            cls_arr = pts.get("classification")
+            colors = np.zeros((n, 3), dtype=np.float64)
+            if cls_arr is not None:
+                for code in np.unique(cls_arr):
+                    colors[(cls_arr == code) & keep] = get_class_color(int(code))
+            else:
+                colors[keep] = (0.6, 0.6, 0.6)
+            colors[outlier] = (1.0, 0.15, 0.15)
+            self._preview_view.load_point_cloud_colored(pts["x"], pts["y"], pts["z"], colors)
         else:
-            colors[keep] = (0.6, 0.6, 0.6)
-        colors[outlier] = (1.0, 0.15, 0.15)
-
-        self._preview_view.load_point_cloud_colored(pts["x"], pts["y"], pts["z"], colors)
+            # Only show kept points
+            self._preview_view.load_point_cloud(
+                pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                classifications=(
+                    pts["classification"][keep] if pts.get("classification") is not None else None
+                ),
+                intensities=(
+                    pts["intensity"][keep] if pts.get("intensity") is not None else None
+                ),
+                return_numbers=(
+                    pts["return_number"][keep] if pts.get("return_number") is not None else None
+                ),
+                point_source_ids=(
+                    pts["point_source_id"][keep] if pts.get("point_source_id") is not None else None
+                ),
+            )
 
     # ── apply ──────────────────────────────────────────────────────
 
