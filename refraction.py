@@ -111,7 +111,7 @@ def read_trajectory_ascii(
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        if separator == r"\s+":
+        if separator in (r"\s+", " "):
             parts = line.split()
         else:
             parts = line.split(separator)
@@ -164,6 +164,57 @@ def interpolate_sensor_position(
     return pos0 + frac * (pos1 - pos0)
 
 
+def interpolate_sensor_positions_batch(
+    trajectory: np.ndarray,
+    gps_times: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Vectorized batch interpolation of sensor positions for many GPS times.
+
+    Replaces the per-point Python loop over :func:`interpolate_sensor_position`
+    with a single O(N log M) ``np.searchsorted`` call, which is **orders of
+    magnitude faster** for large point clouds (e.g. 10M points).
+
+    Args:
+        trajectory: ``(M, 4)`` array ``[time, x, y, z]`` sorted by time.
+        gps_times:  ``(N,)`` array of GPS times to query.
+
+    Returns:
+        ``(sx, sy, sz)`` — each a ``(N,)`` float64 array.
+    """
+    n = len(gps_times)
+    traj_times = trajectory[:, 0]
+    traj_x = trajectory[:, 1]
+    traj_y = trajectory[:, 2]
+    traj_z = trajectory[:, 3]
+
+    # Clamp query times to trajectory bounds
+    t_min, t_max = traj_times[0], traj_times[-1]
+    gps_clamped = np.clip(gps_times, t_min, t_max)
+
+    # Find left-bin indices via vectorized searchsorted
+    idx = np.searchsorted(traj_times, gps_clamped)
+    # For exact matches, searchsorted returns the index of the match.
+    # Clamp idx to [1, M-1] so idx-1 is always valid for interpolation.
+    idx = np.clip(idx, 1, len(traj_times) - 1)
+
+    t0 = traj_times[idx - 1]
+    t1 = traj_times[idx]
+    dt = t1 - t0
+    # Avoid division by zero for duplicate timestamps
+    frac = np.divide(
+        gps_clamped - t0, dt,
+        out=np.zeros_like(dt, dtype=np.float64),
+        where=dt > 1e-15,
+    )
+
+    sx = traj_x[idx - 1] + frac * (traj_x[idx] - traj_x[idx - 1])
+    sy = traj_y[idx - 1] + frac * (traj_y[idx] - traj_y[idx - 1])
+    sz = traj_z[idx - 1] + frac * (traj_z[idx] - traj_z[idx - 1])
+
+    return sx, sy, sz
+
+
 # ── Snell's law refraction correction ───────────────────────────────
 
 def apply_snells_correction(
@@ -171,7 +222,7 @@ def apply_snells_correction(
     ys: np.ndarray,
     zs: np.ndarray,
     water_surface_z: float | np.ndarray,
-    sensor_position: Tuple[float, float, float],
+    sensor_position: Tuple[float, float, float] | Tuple[np.ndarray, np.ndarray, np.ndarray],
     n_water: float = N_WATER_DEFAULT,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -193,6 +244,8 @@ def apply_snells_correction(
                           for a flat surface, or a per-point array for a
                           spatially-varying surface (e.g. from a GeoTIFF).
         sensor_position:  ``(X_s, Y_s, Z_s)`` of the scanner at pulse time.
+                          Either a scalar tuple for a single position, or
+                          three per-point arrays for moving-platform data.
         n_water:          Refractive index of water (default 1.3333).
 
     Returns:
@@ -223,24 +276,32 @@ def apply_snells_correction(
     sub_z = zs[submerged]
     sub_ws = ws_z[submerged]
 
+    # Per-point sensor positions (or broadcast scalars)
+    if isinstance(sx, np.ndarray):
+        sub_sx = sx[submerged]
+        sub_sy = sy[submerged]
+        sub_sz = sz[submerged]
+    else:
+        sub_sx, sub_sy, sub_sz = sx, sy, sz
+
     # Ray vector from sensor to apparent point
-    dx = sub_x - sx
-    dy = sub_y - sy
-    dz = sub_z - sz
+    dx = sub_x - sub_sx
+    dy = sub_y - sub_sy
+    dz = sub_z - sub_sz
 
     # Intersection with water surface plane at Z = water_surface_z (per-point)
     with np.errstate(divide="ignore", invalid="ignore"):
-        t = (sub_ws - sz) / dz
+        t = (sub_ws - sub_sz) / dz
     t = np.clip(t, 0.0, 1.0)
 
-    inter_x = sx + t * dx
-    inter_y = sy + t * dy
+    inter_x = sub_sx + t * dx
+    inter_y = sub_sy + t * dy
     inter_z = sub_ws
 
     # Air path: sensor → surface intersection
-    air_dx = inter_x - sx
-    air_dy = inter_y - sy
-    air_dz = inter_z - sz
+    air_dx = inter_x - sub_sx
+    air_dy = inter_y - sub_sy
+    air_dz = inter_z - sub_sz
     air_dist = np.sqrt(air_dx**2 + air_dy**2 + air_dz**2)
 
     # Apparent water path: surface → apparent bottom
@@ -423,9 +484,22 @@ def load_water_surface_geotiff(
         nodata = ds.nodata
         if nodata is not None:
             surface = np.where(surface == nodata, np.nan, surface)
+
+        # Extract CRS info
+        crs_wkt = str(ds.crs) if ds.crs else ""
+        epsg = None
+        if ds.crs and ds.crs.is_epsg_code:
+            epsg = ds.crs.to_epsg()
+        elif ds.crs:
+            try:
+                epsg = ds.crs.to_epsg()
+            except Exception:
+                pass
+
         georef = {
             "transform": ds.transform,
-            "crs": str(ds.crs) if ds.crs else "",
+            "crs": crs_wkt,
+            "epsg": epsg,
             "shape": ds.shape,
             "bounds": ds.bounds,
             "nodata": nodata,
@@ -469,30 +543,18 @@ def sample_geotiff_at_points(
 
     result = np.full(n, fill_value, dtype=np.float64)
 
-    for i in range(n):
-        r, c = row_f[i], col_f[i]
-        r0 = int(np.floor(r))
-        c0 = int(np.floor(c))
+    # Vectorized approach: use nearest-neighbour for speed
+    # First clamp to raster bounds for the index lookup
+    c0 = np.clip(np.floor(col_f).astype(np.int32), 0, cols - 1)
+    r0 = np.clip(np.floor(row_f).astype(np.int32), 0, rows - 1)
 
-        if 0 <= r0 < rows - 1 and 0 <= c0 < cols - 1:
-            wr = r - r0
-            wc = c - c0
-            v00 = surface[r0, c0]
-            v10 = surface[r0 + 1, c0]
-            v01 = surface[r0, c0 + 1]
-            v11 = surface[r0 + 1, c0 + 1]
+    in_bounds = (col_f >= 0) & (col_f < cols) & (row_f >= 0) & (row_f < rows)
 
-            # Only interpolate if all four corners are valid
-            if not (np.isnan(v00) or np.isnan(v10) or np.isnan(v01) or np.isnan(v11)):
-                result[i] = (
-                    v00 * (1 - wr) * (1 - wc)
-                    + v10 * wr * (1 - wc)
-                    + v01 * (1 - wr) * wc
-                    + v11 * wr * wc
-                )
-            elif not np.isnan(surface[r0, c0]):
-                # Nearest-neighbour fallback
-                result[i] = surface[r0, c0]
+    if in_bounds.any():
+        result[in_bounds] = surface[r0[in_bounds], c0[in_bounds]]
+        # Where the surface pixel is NaN, leave fill_value
+        nan_in_bounds = in_bounds & np.isnan(result)
+        result[nan_in_bounds] = fill_value
 
     n_valid = (~np.isnan(result) & (result != fill_value)).sum()
     logger.info(
@@ -514,6 +576,7 @@ def crop_to_water_surface_model(
     tolerance_above_cm: float = 0.0,
     extrapolate_m: float = 0.0,
     progress: Optional[Callable] = None,
+    data_epsg: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Crop points to the water surface model extent.
@@ -537,6 +600,9 @@ def crop_to_water_surface_model(
         extrapolate_m:     Expand the valid-data mask outward by this
                            many metres.  Useful as a safety margin.
         progress:          Optional callback.
+        data_epsg:         Optional EPSG code of the point-cloud data.
+                           If it differs from the GeoTIFF EPSG, a
+                           warning is logged.
 
     Returns:
         ``(keep_mask, outlier_mask)`` — boolean arrays.
@@ -551,6 +617,16 @@ def crop_to_water_surface_model(
 
     if progress:
         progress("Building water-surface mask…", 0.0)
+
+    # ── CRS check ─────────────────────────────────────────────────
+    geotiff_epsg = georef.get("epsg")
+    if data_epsg and geotiff_epsg and data_epsg != geotiff_epsg:
+        logger.warning(
+            "CRS MISMATCH: data EPSG:%d vs GeoTIFF EPSG:%d — "
+            "crop may produce wrong results. Consider reprojecting "
+            "the GeoTIFF to match the data CRS.",
+            data_epsg, geotiff_epsg,
+        )
 
     # ── Build valid-data binary mask ──────────────────────────────
     valid_mask = ~np.isnan(surface)  # (rows, cols)
@@ -583,7 +659,7 @@ def crop_to_water_surface_model(
     if progress:
         progress("Sampling water-surface at points…", 30.0)
 
-    # ── Determine valid extend for each point ─────────────────────
+    # ── Determine valid extent for each point ─────────────────────
     inv_transform = ~transform
     col_f = inv_transform[0] * xs + inv_transform[1] * ys + inv_transform[2]
     row_f = inv_transform[3] * xs + inv_transform[4] * ys + inv_transform[5]
@@ -615,16 +691,27 @@ def crop_to_water_surface_model(
     keep_mask = point_in_model & below_surface
     outlier_mask = ~keep_mask
 
+    # ── Diagnostic breakdown ──────────────────────────────────────
+    n_in_bounds = in_bounds.sum()
+    n_in_model = point_in_model.sum()
+    n_below = (zs <= (ws_z + tolerance_m)).sum()
+    n_above = n - n_below
+    n_removed = outlier_mask.sum()
+
     if progress:
         progress(
-            f"Water-surface crop: {outlier_mask.sum()}/{n} removed "
+            f"Water-surface crop: {n_removed}/{n} removed "
             f"(extrapolate={extrapolate_m:.1f}m, tol={tolerance_above_cm:.0f}cm)",
             100.0,
         )
 
     logger.info(
         "Water-surface crop: %d/%d removed "
-        "(extrapolate=%.1fm, tol_above=%.0fcm, raster=%dx%d)",
-        outlier_mask.sum(), n, extrapolate_m, tolerance_above_cm, cols, rows,
+        "(extrapolate=%.1fm, tol_above=%.0fcm, raster=%dx%d, "
+        "in_bounds=%d, in_model=%d, above_surface=%d, crs_data=%s, crs_geotiff=%s)",
+        n_removed, n, extrapolate_m, tolerance_above_cm, cols, rows,
+        n_in_bounds, n_in_model, n_above,
+        f"EPSG:{data_epsg}" if data_epsg else "?",
+        f"EPSG:{geotiff_epsg}" if geotiff_epsg else "?",
     )
     return keep_mask, outlier_mask

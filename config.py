@@ -51,6 +51,7 @@ DEFAULT_ROR_RADIUS: Final[float] = 1.0
 DEFAULT_ROR_MIN_POINTS: Final[int] = 5
 DEFAULT_FILTER_WORKERS: Final[int] = 4     # parallel filter threads
 DEFAULT_CLASSIFY_WORKERS: Final[int] = 1  # parallel classify processes (GPU-heavy)
+DEFAULT_BATHY_WORKERS: Final[int] = 4     # parallel bathy tiles
 
 # ── Advanced filter defaults ──────────────────────────────────────
 DEFAULT_ISOLATED_SEARCH_RADIUS: Final[float] = 0.5
@@ -133,6 +134,21 @@ class TileStatus:
     ERROR: Final[str] = "ERROR"
 
     ALL: Final[Tuple[str, ...]] = (IMPORTED, FILTERED, CLASSIFIED, EDITED, NOISE, ERROR)
+
+
+class QCStatus:
+    """Enumeration of manual QC review statuses."""
+    QC_PASSED: Final[str] = "QC_PASSED"
+    IN_REVIEW: Final[str] = "IN_REVIEW"
+    NEEDS_REWORK: Final[str] = "NEEDS_REWORK"
+
+    ALL: Final[Tuple[str, ...]] = (QC_PASSED, IN_REVIEW, NEEDS_REWORK)
+
+    LABELS: Final[Dict[str, str]] = {
+        QC_PASSED: "QC Passed",
+        IN_REVIEW: "In Review",
+        NEEDS_REWORK: "Needs Rework",
+    }
 
 # ── Project directory layout ──────────────────────────────────────────
 PROJECT_SUBDIRS: Final[Tuple[str, ...]] = ("tiles", "dtm")

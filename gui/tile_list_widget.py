@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import TileStatus, get_class_name
+from ..config import QCStatus, TileStatus, get_class_name
 
 logger = logging.getLogger("lidar_workbench.gui.tile_list")
 
@@ -37,8 +37,13 @@ _STATUS_COLORS: Dict[str, QColor] = {
     TileStatus.EDITED:     QColor("#9b59b6"),  # purple
     TileStatus.NOISE:      QColor("#e74c3c"),  # red
     TileStatus.ERROR:      QColor("#e74c3c"),  # red
-    TileStatus.EDITED:     QColor("#9b59b6"),  # purple
-    TileStatus.ERROR:      QColor("#e74c3c"),  # red
+}
+
+# QC status → colour mapping
+_QC_STATUS_COLORS: Dict[str, QColor] = {
+    QCStatus.QC_PASSED:    QColor("#27ae60"),  # dark green
+    QCStatus.IN_REVIEW:    QColor("#2980b9"),  # blue
+    QCStatus.NEEDS_REWORK: QColor("#c0392b"),  # crimson red
 }
 
 
@@ -87,6 +92,7 @@ class TileListWidget(QWidget):
     classify_requested = Signal(list)
     export_requested = Signal(list)
     delete_requested = Signal(list)
+    qc_status_changed = Signal(list, str, str)  # tile_ids, qc_status, qc_comment
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -99,8 +105,8 @@ class TileListWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self._tree = QTreeWidget()
-        self._tree.setHeaderLabels(["", "Tile", "Points", "Modified"])
-        self._tree.setColumnCount(4)
+        self._tree.setHeaderLabels(["", "Tile", "Points", "Modified", "QC"])
+        self._tree.setColumnCount(5)
         self._tree.setRootIsDecorated(True)
         self._tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._tree.setAlternatingRowColors(True)
@@ -170,7 +176,14 @@ class TileListWidget(QWidget):
             item.setText(2, f"{tile.get('point_count', 0):,}")
             item.setText(3, tile.get("last_modified", ""))
 
-            # Build tooltip with scanner info
+            # QC status column
+            qc = tile.get("qc_status")
+            if qc:
+                item.setText(4, QCStatus.LABELS.get(qc, qc))
+                item.setIcon(4, _make_status_icon(_QC_STATUS_COLORS.get(qc, QColor("#999")), 10))
+                item.setForeground(4, _QC_STATUS_COLORS.get(qc, QColor("#999")))
+
+            # Build tooltip with scanner + QC info
             tooltip_parts = [f"Tile: {tile['id']}"]
             dom_scanner = tile.get("scanner", "")
             all_raw = tile.get("all_scanners", "[]")
@@ -185,6 +198,12 @@ class TileListWidget(QWidget):
             fl = tile.get("flight_line", 0)
             if fl:
                 tooltip_parts.append(f"Flight Line: {fl}")
+            # QC info in tooltip
+            if qc:
+                tooltip_parts.append(f"QC: {QCStatus.LABELS.get(qc, qc)}")
+                qc_comment = tile.get("qc_comment")
+                if qc_comment:
+                    tooltip_parts.append(f"QC Comment: {qc_comment}")
             item.setToolTip(1, "\n".join(tooltip_parts))
 
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
@@ -224,12 +243,46 @@ class TileListWidget(QWidget):
         if tile_id in self._tiles:
             item.setText(2, f"{self._tiles[tile_id].get('point_count', 0):,}")
             item.setText(3, self._tiles[tile_id].get("last_modified", ""))
+            # QC column
+            qc = self._tiles[tile_id].get("qc_status")
+            if qc:
+                item.setText(4, QCStatus.LABELS.get(qc, qc))
+                item.setIcon(4, _make_status_icon(_QC_STATUS_COLORS.get(qc, QColor("#999")), 10))
+                item.setForeground(4, _QC_STATUS_COLORS.get(qc, QColor("#999")))
         item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
         item.setCheckState(1, Qt.Checked)
 
         # Update internal dict
         if tile_id in self._tiles:
             self._tiles[tile_id]["status"] = new_status
+
+    def update_tile_qc_status(self, tile_id: str, qc_status: Optional[str],
+                               qc_comment: Optional[str] = None) -> None:
+        """Update the QC status display for a tile in the tree."""
+        item = self._find_tile_item(tile_id)
+        if item is None:
+            return
+        # Update internal dict
+        if tile_id in self._tiles:
+            self._tiles[tile_id]["qc_status"] = qc_status
+            self._tiles[tile_id]["qc_comment"] = qc_comment
+        # Update QC column
+        if qc_status:
+            item.setText(4, QCStatus.LABELS.get(qc_status, qc_status))
+            item.setIcon(4, _make_status_icon(_QC_STATUS_COLORS.get(qc_status, QColor("#999")), 10))
+            item.setForeground(4, _QC_STATUS_COLORS.get(qc_status, QColor("#999")))
+        else:
+            item.setText(4, "")
+            item.setIcon(4, QIcon())
+            item.setData(4, Qt.ForegroundRole, None)
+        # Update tooltip
+        tile = self._tiles.get(tile_id, {})
+        parts = [f"Tile: {tile_id}"]
+        if qc_status:
+            parts.append(f"QC: {QCStatus.LABELS.get(qc_status, qc_status)}")
+            if qc_comment:
+                parts.append(f"QC Comment: {qc_comment}")
+        item.setToolTip(1, "\n".join(parts))
 
     # ── signal handlers ────────────────────────────────────────────
 
@@ -265,6 +318,38 @@ class TileListWidget(QWidget):
             open_action.triggered.connect(lambda: self.open_requested.emit(tid))
 
         menu.addSeparator()
+
+        # ── QC status submenu ────────────────────────────────────
+        if selected:
+            qc_menu = menu.addMenu("Set QC Status")
+            qc_pass = qc_menu.addAction(
+                _make_status_icon(_QC_STATUS_COLORS[QCStatus.QC_PASSED], 12),
+                QCStatus.LABELS[QCStatus.QC_PASSED],
+            )
+            qc_pass.triggered.connect(
+                lambda: self.qc_status_changed.emit(selected, QCStatus.QC_PASSED, "")
+            )
+            qc_review = qc_menu.addAction(
+                _make_status_icon(_QC_STATUS_COLORS[QCStatus.IN_REVIEW], 12),
+                QCStatus.LABELS[QCStatus.IN_REVIEW],
+            )
+            qc_review.triggered.connect(
+                lambda: self.qc_status_changed.emit(selected, QCStatus.IN_REVIEW, "")
+            )
+            qc_rework = qc_menu.addAction(
+                _make_status_icon(_QC_STATUS_COLORS[QCStatus.NEEDS_REWORK], 12),
+                f"{QCStatus.LABELS[QCStatus.NEEDS_REWORK]}…",
+            )
+            qc_rework.triggered.connect(
+                lambda: self.qc_status_changed.emit(selected, QCStatus.NEEDS_REWORK, "__PROMPT__")
+            )
+            qc_menu.addSeparator()
+            qc_clear = qc_menu.addAction("Clear QC Status")
+            qc_clear.triggered.connect(
+                lambda: self.qc_status_changed.emit(selected, None, "")
+            )
+
+            menu.addSeparator()
 
         if selected:
             filter_action = menu.addAction("Noise Filter…")

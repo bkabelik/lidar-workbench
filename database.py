@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import statistics
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -39,6 +40,8 @@ CREATE TABLE IF NOT EXISTS tiles (
     crs_wkt         TEXT,                  -- OGC WKT string for the CRS
     status          TEXT    NOT NULL DEFAULT 'IMPORTED'
                     CHECK(status IN ('IMPORTED','FILTERED','CLASSIFIED','EDITED','NOISE','ERROR')),
+    qc_status       TEXT    DEFAULT NULL,   -- QC review status: NULL, 'QC_PASSED', 'IN_REVIEW', 'NEEDS_REWORK'
+    qc_comment      TEXT    DEFAULT NULL,   -- optional comment (e.g. rework instructions)
     filter_params   TEXT,   -- JSON
     classification_model TEXT,
     last_modified   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -55,6 +58,22 @@ CREATE TABLE IF NOT EXISTS edit_history (
 CREATE INDEX IF NOT EXISTS idx_tiles_status ON tiles(status);
 CREATE INDEX IF NOT EXISTS idx_tiles_bbox  ON tiles(bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y);
 CREATE INDEX IF NOT EXISTS idx_edit_tile   ON edit_history(tile_id);
+
+CREATE TABLE IF NOT EXISTS processing_times (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tile_id         TEXT    NOT NULL,
+    step            TEXT    NOT NULL CHECK(step IN ('filter','pointcept','ground')),
+    duration_seconds REAL   NOT NULL,
+    point_count     INTEGER,
+    params          TEXT,   -- JSON with step-specific parameters
+    batch_id        TEXT,   -- groups tiles processed together in one run
+    timestamp       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (tile_id) REFERENCES tiles(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pt_tile ON processing_times(tile_id);
+CREATE INDEX IF NOT EXISTS idx_pt_step ON processing_times(step);
+CREATE INDEX IF NOT EXISTS idx_pt_batch ON processing_times(batch_id);
 """
 
 
@@ -134,6 +153,8 @@ class Database:
             ("sensor_type", "ALTER TABLE tiles ADD COLUMN sensor_type TEXT DEFAULT ''"),
             ("flightline_sensor_types", "ALTER TABLE tiles ADD COLUMN flightline_sensor_types TEXT DEFAULT '{}'"),
             ("all_scanners", "ALTER TABLE tiles ADD COLUMN all_scanners TEXT DEFAULT '[]'"),
+            ("qc_status",   "ALTER TABLE tiles ADD COLUMN qc_status TEXT DEFAULT NULL"),
+            ("qc_comment",  "ALTER TABLE tiles ADD COLUMN qc_comment TEXT DEFAULT NULL"),
         ]
         for col, sql in migrations:
             if col not in existing:
@@ -142,6 +163,41 @@ class Database:
 
         # Migrate: add NOISE to status CHECK constraint (v0.2)
         self._migrate_status_constraint(conn)
+
+        # Ensure processing_times table exists (v0.3+)
+        self._ensure_table(
+            conn, "processing_times",
+            """CREATE TABLE IF NOT EXISTS processing_times (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                tile_id         TEXT    NOT NULL,
+                step            TEXT    NOT NULL CHECK(step IN ('filter','pointcept','ground')),
+                duration_seconds REAL   NOT NULL,
+                point_count     INTEGER,
+                params          TEXT,
+                batch_id        TEXT,
+                timestamp       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (tile_id) REFERENCES tiles(id)
+            )""",
+        )
+        self._ensure_table(
+            conn, "idx_pt_tile", "CREATE INDEX IF NOT EXISTS idx_pt_tile ON processing_times(tile_id)",
+        )
+        self._ensure_table(
+            conn, "idx_pt_step", "CREATE INDEX IF NOT EXISTS idx_pt_step ON processing_times(step)",
+        )
+        self._ensure_table(
+            conn, "idx_pt_batch", "CREATE INDEX IF NOT EXISTS idx_pt_batch ON processing_times(batch_id)",
+        )
+
+    def _ensure_table(self, conn: sqlite3.Connection, name: str, sql: str) -> None:
+        """Create a table/index if it does not already exist."""
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type IN ('table','index') AND name = ?",
+            (name,),
+        ).fetchone()
+        if row is None:
+            conn.execute(sql)
+            logger.debug("Migrated: created %s", name)
 
     def _migrate_status_constraint(self, conn: sqlite3.Connection) -> None:
         """Recreate the tiles table if the status CHECK constraint lacks 'NOISE'."""
@@ -313,6 +369,25 @@ class Database:
                 (json.dumps(params), tile_id),
             )
 
+    def set_qc_status(
+        self, conn: sqlite3.Connection, tile_id: str,
+        qc_status: Optional[str], qc_comment: Optional[str] = None,
+    ) -> None:
+        """
+        Set the QC review status and optional comment for a tile.
+
+        Args:
+            conn:       Open SQLite connection.
+            tile_id:    Tile identifier.
+            qc_status:  One of 'QC_PASSED', 'IN_REVIEW', 'NEEDS_REWORK', or None to clear.
+            qc_comment: Optional free-text comment (e.g. rework instructions).
+        """
+        with Database._write_lock:
+            conn.execute(
+                "UPDATE tiles SET qc_status = ?, qc_comment = ?, last_modified = CURRENT_TIMESTAMP WHERE id = ?",
+                (qc_status, qc_comment, tile_id),
+            )
+
     def get_tile(self, tile_id: str) -> Optional[Dict[str, Any]]:
         """Return a single tile row as a dict, or ``None``."""
         with self.connect() as conn:
@@ -404,3 +479,211 @@ class Database:
         """Remove all edit history for a tile."""
         with Database._write_lock:
             conn.execute("DELETE FROM edit_history WHERE tile_id = ?", (tile_id,))
+
+    # ── processing times ───────────────────────────────────────────
+
+    def record_processing_time(
+        self,
+        conn: sqlite3.Connection,
+        tile_id: str,
+        step: str,
+        duration_seconds: float,
+        point_count: Optional[int] = None,
+        params: Optional[Dict[str, Any]] = None,
+        batch_id: Optional[str] = None,
+    ) -> int:
+        """
+        Record a processing time measurement for a tile.
+
+        Args:
+            conn:             Open SQLite connection.
+            tile_id:          Tile identifier.
+            step:             Processing step ('filter', 'pointcept', 'ground').
+            duration_seconds: Elapsed wall-clock time in seconds.
+            point_count:      Number of points processed (optional).
+            params:           Optional step-specific parameters dict.
+            batch_id:         Optional batch identifier (groups tiles from one run).
+
+        Returns:
+            The auto-generated row id.
+        """
+        with Database._write_lock:
+            cur = conn.execute(
+                """INSERT INTO processing_times
+                   (tile_id, step, duration_seconds, point_count, params, batch_id, timestamp)
+                   VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (
+                    tile_id,
+                    step,
+                    duration_seconds,
+                    point_count,
+                    json.dumps(params) if params else None,
+                    batch_id,
+                ),
+            )
+        return cur.lastrowid
+
+    def get_processing_times(
+        self,
+        tile_ids: Optional[List[str]] = None,
+        step: Optional[str] = None,
+        batch_id: Optional[str] = None,
+        since_timestamp: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Query processing time records with optional filters.
+
+        Args:
+            tile_ids:        Optional list of tile IDs to filter by.
+            step:            Optional step filter ('filter', 'pointcept', 'ground').
+            batch_id:        Optional batch filter.
+            since_timestamp: Optional ISO timestamp to filter records after.
+
+        Returns:
+            List of processing time records as dicts.
+        """
+        with self.connect() as conn:
+            query = "SELECT * FROM processing_times WHERE 1=1"
+            params: list = []
+
+            if tile_ids:
+                placeholders = ",".join("?" for _ in tile_ids)
+                query += f" AND tile_id IN ({placeholders})"
+                params.extend(tile_ids)
+
+            if step:
+                query += " AND step = ?"
+                params.append(step)
+
+            if batch_id:
+                query += " AND batch_id = ?"
+                params.append(batch_id)
+
+            if since_timestamp:
+                query += " AND timestamp >= ?"
+                params.append(since_timestamp)
+
+            query += " ORDER BY timestamp DESC"
+            rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_processing_stats(
+        self,
+        step: Optional[str] = None,
+        batch_ids: Optional[List[str]] = None,
+        tile_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compute aggregate statistics for processing times.
+
+        Args:
+            step:      Optional step filter.
+            batch_ids: Optional list of batch IDs.
+            tile_ids:  Optional list of tile IDs.
+
+        Returns:
+            Dict with keys: count, total_seconds, mean, median, min, max, std,
+            p25, p75, by_step (breakdown), by_batch (breakdown).
+        """
+        with self.connect() as conn:
+            query = "SELECT * FROM processing_times WHERE 1=1"
+            params: list = []
+
+            if step:
+                query += " AND step = ?"
+                params.append(step)
+
+            if batch_ids:
+                placeholders = ",".join("?" for _ in batch_ids)
+                query += f" AND batch_id IN ({placeholders})"
+                params.extend(batch_ids)
+
+            if tile_ids:
+                placeholders = ",".join("?" for _ in tile_ids)
+                query += f" AND tile_id IN ({placeholders})"
+                params.extend(tile_ids)
+
+            rows = conn.execute(query, params).fetchall()
+            durations = [r["duration_seconds"] for r in rows]
+
+        if not durations:
+            return {
+                "count": 0, "total_seconds": 0.0, "mean": 0.0, "median": 0.0,
+                "min": 0.0, "max": 0.0, "std": 0.0, "p25": 0.0, "p75": 0.0,
+                "by_step": {}, "by_batch": {},
+            }
+
+        # Use plain Python for statistics (no numpy)
+        sorted_d = sorted(durations)
+        n = len(sorted_d)
+
+        def _percentile(data: list, p: float) -> float:
+            """Linear-interpolation percentile (no numpy needed)."""
+            k = (len(data) - 1) * p / 100.0
+            f = int(k)
+            c = k - f
+            if f + 1 < len(data):
+                return data[f] + c * (data[f + 1] - data[f])
+            return data[f]
+
+        stats = {
+            "count": n,
+            "total_seconds": sum(durations),
+            "mean": statistics.mean(durations),
+            "median": statistics.median(durations),
+            "min": min(durations),
+            "max": max(durations),
+            "std": statistics.stdev(durations) if n >= 2 else 0.0,
+            "p25": _percentile(sorted_d, 25),
+            "p75": _percentile(sorted_d, 75),
+        }
+
+        # Breakdown by step
+        by_step: Dict[str, Dict[str, float]] = {}
+        for r in rows:
+            s = r["step"]
+            if s not in by_step:
+                by_step[s] = {"count": 0, "total_seconds": 0.0, "durations": []}
+            by_step[s]["count"] += 1
+            by_step[s]["total_seconds"] += r["duration_seconds"]
+            by_step[s]["durations"].append(r["duration_seconds"])
+        for s, v in by_step.items():
+            d = v.pop("durations")
+            v["mean"] = statistics.mean(d) if d else 0.0
+            v["median"] = statistics.median(d) if d else 0.0
+            v["min"] = min(d) if d else 0.0
+            v["max"] = max(d) if d else 0.0
+        stats["by_step"] = by_step
+
+        # Breakdown by batch
+        by_batch: Dict[str, Dict[str, float]] = {}
+        for r in rows:
+            b = r["batch_id"] or "(no batch)"
+            if b not in by_batch:
+                by_batch[b] = {"count": 0, "total_seconds": 0.0, "durations": [],
+                               "timestamp": r["timestamp"] or ""}
+            by_batch[b]["count"] += 1
+            by_batch[b]["total_seconds"] += r["duration_seconds"]
+            by_batch[b]["durations"].append(r["duration_seconds"])
+        for b, v in by_batch.items():
+            d = v.pop("durations")
+            v["mean"] = statistics.mean(d) if d else 0.0
+            v["median"] = statistics.median(d) if d else 0.0
+            v["min"] = min(d) if d else 0.0
+            v["max"] = max(d) if d else 0.0
+        stats["by_batch"] = by_batch
+
+        return stats
+
+    def get_distinct_batches(self) -> List[Dict[str, Any]]:
+        """Return a list of distinct batch IDs with their timestamps and step counts."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """SELECT batch_id, MIN(timestamp) as first_ts, MAX(timestamp) as last_ts,
+                          COUNT(*) as tile_count, GROUP_CONCAT(DISTINCT step) as steps
+                   FROM processing_times
+                   WHERE batch_id IS NOT NULL
+                   GROUP BY batch_id
+                   ORDER BY first_ts DESC"""
+            ).fetchall()
+        return [dict(r) for r in rows]

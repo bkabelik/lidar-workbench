@@ -40,14 +40,19 @@ class _GroundClassifyWorker(QThread):
     finished = Signal(np.ndarray)  # ground_mask
     error = Signal(str)
 
-    def __init__(self, xs, ys, zs, classifications, method: str, params: dict, parent=None):
+    def __init__(self, xs, ys, zs, classifications, method: str, params: dict,
+                 tile_id: str = None, db=None, parent=None):
         super().__init__(parent)
         self._xs, self._ys, self._zs = xs, ys, zs
         self._classifications = classifications
         self._method = method
         self._params = params
+        self._tile_id = tile_id
+        self._db = db
 
     def run(self):
+        import time as _time
+        t0 = _time.perf_counter()
         try:
             if self._method == "smrf":
                 mask = ground_classify_smrf(
@@ -71,9 +76,23 @@ class _GroundClassifyWorker(QThread):
                     stop_tri_when_edge=self._params.get("stop_tri_when_edge"),
                     only_upward=self._params.get("only_upward", False),
                     follow_surface_trend=self._params.get("follow_surface_trend", True),
-                    cell_size=None,  # auto-computed from point density
+                    cell_size=None,
                     progress=lambda msg, pct: self.progress.emit(msg, pct),
                 )
+            duration = _time.perf_counter() - t0
+            # Record processing time
+            if self._tile_id and self._db:
+                try:
+                    with self._db.connect() as conn:
+                        self._db.record_processing_time(
+                            conn, self._tile_id, "ground",
+                            duration_seconds=duration,
+                            point_count=len(self._xs),
+                            params={**self._params, "method": self._method},
+                            batch_id=None,
+                        )
+                except Exception:
+                    pass
             self.finished.emit(mask)
         except Exception as exc:
             self.error.emit(str(exc))
@@ -84,9 +103,11 @@ class GroundClassifyDialog(QDialog):
 
     ground_applied = Signal(np.ndarray, int)  # ground_mask, source_class
 
-    def __init__(self, tile_data: dict, parent=None):
+    def __init__(self, tile_data: dict, tile_id: str = None, db=None, parent=None):
         super().__init__(parent)
         self._data = tile_data
+        self._tile_id = tile_id
+        self._db = db
         self._worker: Optional[_GroundClassifyWorker] = None
         self._ground_mask: Optional[np.ndarray] = None
         self._source_class: int = 2  # default: class 2 (ground) from Pointcept
@@ -322,7 +343,9 @@ class GroundClassifyDialog(QDialog):
         self._worker = _GroundClassifyWorker(
             self._data["x"], self._data["y"], self._data["z"],
             self._data["classification"],
-            method=method, params=params, parent=self,
+            method=method, params=params,
+            tile_id=self._tile_id, db=self._db,
+            parent=self,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.finished.connect(self._on_finished)

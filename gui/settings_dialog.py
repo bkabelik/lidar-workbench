@@ -35,11 +35,12 @@ _SHORTCUTS_FILE = ".settings.json"
 def load_general_settings() -> dict:
     """Load general settings, falling back to defaults."""
     from ..config import (
-        DEFAULT_FILTER_WORKERS, DEFAULT_CLASSIFY_WORKERS,
+        DEFAULT_FILTER_WORKERS, DEFAULT_CLASSIFY_WORKERS, DEFAULT_BATHY_WORKERS,
         DEFAULT_BRUSH_RADIUS_M, DEFAULT_RECT_WIDTH_M, DEFAULT_RECT_HEIGHT_M,
     )
     defaults = {"filter_workers": DEFAULT_FILTER_WORKERS,
                 "classify_workers": DEFAULT_CLASSIFY_WORKERS,
+                "bathy_workers": DEFAULT_BATHY_WORKERS,
                 "brush_radius": DEFAULT_BRUSH_RADIUS_M,
                 "rect_width": DEFAULT_RECT_WIDTH_M,
                 "rect_height": DEFAULT_RECT_HEIGHT_M}
@@ -220,6 +221,16 @@ class SettingsDialog(QDialog):
         gen2_layout.addStretch()
         layout.addLayout(gen2_layout)
 
+        gen3_layout = QHBoxLayout()
+        gen3_layout.addWidget(QLabel("Bathy parallel workers:"))
+        self._bathy_workers_spin = QSpinBox()
+        self._bathy_workers_spin.setRange(1, 16)
+        self._bathy_workers_spin.setValue(self._settings.get("bathy_workers", 4))
+        self._bathy_workers_spin.setToolTip("Number of tiles to process in parallel for bathymetry")
+        gen3_layout.addWidget(self._bathy_workers_spin)
+        gen3_layout.addStretch()
+        layout.addLayout(gen3_layout)
+
         # ── Manual edit tool sizes ─────────────────────────────────
         layout.addWidget(QLabel("<b>Manual Edit Tools</b>"))
         
@@ -287,6 +298,7 @@ class SettingsDialog(QDialog):
         save_shortcuts(self._shortcuts)
         self._settings["filter_workers"] = self._filter_workers_spin.value()
         self._settings["classify_workers"] = self._classify_workers_spin.value()
+        self._settings["bathy_workers"] = self._bathy_workers_spin.value()
         self._settings["brush_radius"] = self._brush_radius_spin.value()
         self._settings["rect_width"] = self._rect_width_spin.value()
         self._settings["rect_height"] = self._rect_height_spin.value()

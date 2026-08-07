@@ -15,18 +15,20 @@ import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
+    QComboBox,
     QDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from ..config import ASPRS_CLASS_NAMES, get_class_color
+from ..config import ASPRS_CLASS_NAMES, QCStatus, get_class_color
 from .settings_dialog import load_shortcuts
 
 try:
@@ -85,6 +87,7 @@ class PropertiesPanel(QWidget):
     undo_requested = Signal()
     redo_requested = Signal()
     point_info_toggled = Signal(bool)  # emitted when Point Info tool is toggled on/off
+    qc_status_changed = Signal(str, str)  # qc_status, qc_comment
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -164,6 +167,30 @@ class PropertiesPanel(QWidget):
         meta_form.addRow("CRS:", self._crs_label)
 
         layout.addWidget(meta_group)
+
+        # ── QC review ──────────────────────────────────────────────
+        qc_group = QGroupBox("QC Review")
+        qc_form = QFormLayout(qc_group)
+
+        self._qc_combo = QComboBox()
+        self._qc_combo.addItem("(Not reviewed)", None)
+        for qc_val in QCStatus.ALL:
+            color_name = {
+                QCStatus.QC_PASSED: "green",
+                QCStatus.IN_REVIEW: "blue",
+                QCStatus.NEEDS_REWORK: "red",
+            }.get(qc_val, "black")
+            self._qc_combo.addItem(f"{QCStatus.LABELS[qc_val]}", qc_val)
+        self._qc_combo.currentIndexChanged.connect(self._on_qc_combo_changed)
+        qc_form.addRow("Status:", self._qc_combo)
+
+        self._qc_comment = QLineEdit()
+        self._qc_comment.setPlaceholderText("Optional rework notes…")
+        self._qc_comment.setEnabled(False)
+        self._qc_comment.editingFinished.connect(self._on_qc_comment_changed)
+        qc_form.addRow("Comment:", self._qc_comment)
+
+        layout.addWidget(qc_group)
 
         # ── Quick classify ─────────────────────────────────────────
         classify_group = QGroupBox("Quick Classify")
@@ -489,3 +516,42 @@ class PropertiesPanel(QWidget):
         self._filename_label.setText(filename if filename else "—")
         self._modified_label.setText(modified if modified else "—")
         self._crs_label.setText(crs if crs else "—")
+
+    # ── QC review ──────────────────────────────────────────────────
+
+    def set_tile_qc_info(self, qc_status: Optional[str] = None,
+                         qc_comment: Optional[str] = None) -> None:
+        """
+        Update the QC review section without emitting signals.
+
+        Args:
+            qc_status:  One of QCStatus values, or None.
+            qc_comment: Optional free-text comment.
+        """
+        self._qc_combo.blockSignals(True)
+        self._qc_comment.blockSignals(True)
+        try:
+            # Find the matching combo index
+            idx = self._qc_combo.findData(qc_status)
+            if idx >= 0:
+                self._qc_combo.setCurrentIndex(idx)
+            else:
+                self._qc_combo.setCurrentIndex(0)  # "(Not reviewed)"
+            self._qc_comment.setText(qc_comment or "")
+            self._qc_comment.setEnabled(qc_status == QCStatus.NEEDS_REWORK)
+        finally:
+            self._qc_combo.blockSignals(False)
+            self._qc_comment.blockSignals(False)
+
+    def _on_qc_combo_changed(self) -> None:
+        """Emit QC status change when the user picks a new status."""
+        qc_status = self._qc_combo.currentData()
+        self._qc_comment.setEnabled(qc_status == QCStatus.NEEDS_REWORK)
+        comment = self._qc_comment.text().strip() if qc_status == QCStatus.NEEDS_REWORK else ""
+        self.qc_status_changed.emit(qc_status or "", comment)
+
+    def _on_qc_comment_changed(self) -> None:
+        """Emit QC status change when the user edits the comment."""
+        qc_status = self._qc_combo.currentData()
+        comment = self._qc_comment.text().strip()
+        self.qc_status_changed.emit(qc_status or "", comment)

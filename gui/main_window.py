@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 
 from ..config import (
     APP_NAME, APP_VERSION, ASPRS_CLASS_COLORS, ASPRS_CLASS_NAMES,
-    DEFAULT_PROFILE_WIDTH_M, TileStatus,
+    DEFAULT_PROFILE_WIDTH_M, QCStatus, TileStatus,
 )
 from ..database import Database
 from ..import_wizard import ImportWizard
@@ -51,6 +51,7 @@ from .filter_dialog import FilterDialog
 from .ground_control_dialog import GroundControlDialog
 from .multi_view_widget import MultiViewWidget
 from .preview_dialog import PreviewDialog
+from .processing_analysis_dialog import ProcessingAnalysisDialog
 from .properties_panel import PropertiesPanel
 from .settings_dialog import SettingsDialog, load_shortcuts
 from .tile_list_widget import TileListWidget
@@ -126,8 +127,22 @@ class MainWindow(QMainWindow):
         logger.info("MainWindow initialised")
 
     def closeEvent(self, event) -> None:
-        """Handle window close — skip Open3D cleanup to avoid C++ destructor
-        crashes during Python shutdown (Filament resources already freed)."""
+        """Handle window close — prompt to save if tiles have been edited."""
+        try:
+            edited = self._db.get_tiles_by_status(TileStatus.EDITED)
+            if edited:
+                reply = QMessageBox.question(
+                    self, "Unsaved Changes",
+                    f"You have {len(edited)} tile(s) with unsaved edits.\n"
+                    "Close anyway?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply == QMessageBox.No:
+                    event.ignore()
+                    return
+        except Exception:
+            pass
         super().closeEvent(event)
 
     # ── menu bar ───────────────────────────────────────────────────
@@ -228,6 +243,13 @@ class MainWindow(QMainWindow):
         crs_action.setObjectName("crs_projection")
         crs_action.triggered.connect(self._on_crs)
         tools_menu.addAction(crs_action)
+
+        tools_menu.addSeparator()
+
+        analysis_action = QAction("&Processing Time Analysis…", self)
+        analysis_action.setObjectName("processing_analysis")
+        analysis_action.triggered.connect(self._on_processing_analysis)
+        tools_menu.addAction(analysis_action)
 
         tools_menu.addSeparator()
 
@@ -357,6 +379,7 @@ class MainWindow(QMainWindow):
         self._tile_list_widget.classify_requested.connect(self._on_tiles_classify)
         self._tile_list_widget.export_requested.connect(self._on_tiles_export)
         self._tile_list_widget.delete_requested.connect(self._on_tiles_delete)
+        self._tile_list_widget.qc_status_changed.connect(self._on_qc_status_changed_batch)
         splitter.addWidget(self._tile_list_widget)
 
         # Center panel: multi-view widget
@@ -389,6 +412,7 @@ class MainWindow(QMainWindow):
         self._properties_panel.redo_requested.connect(self._on_redo)
         # Wire Point Info toggle → views
         self._properties_panel.point_info_toggled.connect(self._on_point_info_toggled)
+        self._properties_panel.qc_status_changed.connect(self._on_properties_qc_changed)
         splitter.addWidget(self._properties_panel)
 
         # Proportions: 1 : 3 : 1
@@ -604,21 +628,20 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _on_filter_applied(self, tile_ids: list, pipeline: list) -> None:
-        """Apply a filter pipeline to the selected tiles in parallel."""
+        """Apply a filter pipeline to the selected tiles in parallel
+        with batch loading to avoid exhausting RAM on large projects."""
         from ..noise_filter import FilterWorker
         from ..gui.settings_dialog import load_general_settings
+        import time as _time
 
-        # Load tile data (must happen on main thread for laspy thread-safety)
-        self.set_status(f"Loading {len(tile_ids)} tile(s)…", timeout=0)
-        tile_data = []
-        for tid in tile_ids:
-            data = self._tm.load_tile_points_full(tid)
-            if data is not None:
-                tile_data.append((tid, data))
+        # Generate a batch ID for this processing run
+        self._filter_batch_id = f"filter_{_time.strftime('%Y%m%d_%H%M%S')}"
 
-        if not tile_data:
-            self.set_status("No tiles could be loaded", timeout=3000)
-            return
+        # Capture tile manager for thread-safe loading in worker
+        tm = self._tm
+
+        def _loader(tile_id: str):
+            return tm.load_tile_points_full(tile_id)
 
         settings = load_general_settings()
         workers = settings.get("filter_workers", 4)
@@ -626,14 +649,14 @@ class MainWindow(QMainWindow):
         # Progress dialog
         from PySide6.QtWidgets import QProgressDialog
         self._filter_progress = QProgressDialog(
-            f"Filtering {len(tile_data)} tile(s) with {workers} workers…",
-            "Cancel", 0, len(tile_data), self,
+            f"Filtering {len(tile_ids)} tile(s) with {workers} workers…",
+            "Cancel", 0, len(tile_ids), self,
         )
         self._filter_progress.setWindowModality(Qt.WindowModal)
         self._filter_progress.setMinimumDuration(500)
         self._filter_progress.canceled.connect(self._on_filter_canceled)
 
-        self._filter_worker = FilterWorker(tile_data, pipeline, workers, self)
+        self._filter_worker = FilterWorker(tile_ids, pipeline, _loader, workers, self)
         self._filter_worker.progress.connect(self._on_filter_progress)
         self._filter_worker.tile_done.connect(self._on_filter_tile_done)
         self._filter_worker.finished_all.connect(self._on_filter_finished)
@@ -642,15 +665,16 @@ class MainWindow(QMainWindow):
 
     def _on_filter_canceled(self):
         if hasattr(self, '_filter_worker') and self._filter_worker.isRunning():
-            self._filter_worker.terminate()
-            self._filter_worker.wait(2000)
+            # Graceful: stop loading new tiles, finish in-flight ones.
+            # _on_filter_finished will close the progress dialog.
+            self._filter_worker.cancel()
 
     def _on_filter_progress(self, msg: str, pct: float):
         if hasattr(self, '_filter_progress'):
             self._filter_progress.setLabelText(msg)
             self._filter_progress.setValue(int(pct))
 
-    def _on_filter_tile_done(self, tile_id: str):
+    def _on_filter_tile_done(self, tile_id: str, duration: float = 0.0, point_count: int = 0):
         """Write filtered tile: extract noise to tiles/noise/, keep clean points in tile."""
         if not hasattr(self, '_filter_worker'):
             return
@@ -680,6 +704,19 @@ class MainWindow(QMainWindow):
             logger.info("Filter on %s: no noise points found", tile_id)
             self._tm.update_tile_status(tile_id, TileStatus.FILTERED)
             self._tile_list_widget.update_tile_status(tile_id, TileStatus.FILTERED)
+            # Record processing time even for zero-noise results
+            if duration > 0:
+                try:
+                    with self._db.connect() as conn:
+                        self._db.record_processing_time(
+                            conn, tile_id, "filter",
+                            duration_seconds=duration,
+                            point_count=n_total,
+                            params={"kept": n_kept, "noise": 0, "pipeline": self._filter_worker._pipeline},
+                            batch_id=getattr(self, '_filter_batch_id', None),
+                        )
+                except Exception as exc:
+                    logger.warning("Failed to record filter timing for %s: %s", tile_id, exc)
             return
 
         # Snapshot header template from original file
@@ -783,6 +820,20 @@ class MainWindow(QMainWindow):
         self._tile_list_widget.update_tile_status(tile_id, TileStatus.FILTERED)
         logger.info("Filtered %s: %d kept, %d noise → %s", tile_id, n_kept, n_noise, noise_name)
 
+        # Record processing time
+        if duration > 0:
+            try:
+                with self._db.connect() as conn:
+                    self._db.record_processing_time(
+                        conn, tile_id, "filter",
+                        duration_seconds=duration,
+                        point_count=n_total,
+                        params={"kept": n_kept, "noise": n_noise, "pipeline": self._filter_worker._pipeline},
+                        batch_id=getattr(self, '_filter_batch_id', None),
+                    )
+            except Exception as exc:
+                logger.warning("Failed to record filter timing for %s: %s", tile_id, exc)
+
     def _on_filter_finished(self, tile_ids: list, keep_masks: list):
         self._refresh_tile_list()
         n = len(tile_ids)
@@ -839,7 +890,7 @@ class MainWindow(QMainWindow):
             return
 
         from .ground_classify_dialog import GroundClassifyDialog
-        dlg = GroundClassifyDialog(data, parent=self)
+        dlg = GroundClassifyDialog(data, tile_id=self._editor.tile_id, db=self._db, parent=self)
         dlg.ground_applied.connect(lambda mask, sc: self._apply_ground_mask(mask, sc))
         dlg.exec()
 
@@ -926,37 +977,105 @@ class MainWindow(QMainWindow):
         )
 
     def _on_bathy_process(self) -> None:
-        """Open the bathymetry processing dialog for the currently open tile."""
-        if self._editor.tile_id is None:
-            QMessageBox.information(self, "No Tile Open",
-                                    "Please open a tile first (double-click in tile list).")
+        """Open the bathymetry processing dialog for selected tiles."""
+        selected = self._tile_list_widget.get_selected_tile_ids()
+        if not selected:
+            QMessageBox.information(
+                self, "No Tiles Selected",
+                "Select one or more tiles in the tile list first."
+            )
             return
 
-        tile_info = self._db.get_tile(self._editor.tile_id)
+        tile_info = self._db.get_tile(selected[0])
         scanner = tile_info.get("scanner", '') if tile_info else ''
         sensor_type = tile_info.get("sensor_type", '') if tile_info else ''
-
-        data = self._tm.load_tile_points_full(self._editor.tile_id)
-        if data is None:
-            return
+        data_epsg = tile_info.get("crs_epsg") if tile_info else None
 
         from .bathy_dialog import BathyDialog
-        dlg = BathyDialog(data, scanner=scanner, sensor_type=sensor_type, parent=self)
-        dlg.bathy_applied.connect(lambda r: self._apply_bathy_result(r))
+        dlg = BathyDialog(tile_ids=selected,
+                          scanner=scanner, sensor_type=sensor_type,
+                          parent=self, data_epsg=data_epsg)
+        dlg.tile_save_requested.connect(self._save_bathy_tile)
+        dlg.bathy_applied.connect(self._on_bathy_all_saved)
         dlg.exec()
 
-    def _apply_bathy_result(self, result: dict) -> None:
-        """Apply bathymetry processing results to the current tile."""
-        if self._editor.tile_id is None:
-            return
-        self._editor.open_tile(self._editor.tile_id)
-        self._multi_load_for_edit(result)
-        self._tile_list_widget.update_tile_status(self._editor.tile_id, TileStatus.EDITED)
+    def _on_bathy_all_saved(self) -> None:
+        """Called when all bathy tiles have been saved."""
+        if self._editor.tile_id:
+            reload_data = self._tm.load_tile_points_full(self._editor.tile_id)
+            if reload_data:
+                self._multi_load_for_edit(reload_data)
+        self._refresh_tile_list()
         self._regenerate_dtm()
-        self.set_status(
-            f"Bathymetry done: {len(result['x']):,} points",
-            timeout=8000,
+
+    def _save_bathy_tile(self, tile_id: str, result: dict) -> None:
+        """Write bathy-processed data back to a tile's LAS file."""
+        tile_info = self._db.get_tile(tile_id)
+        if tile_info is None:
+            return
+
+        tiles_dir = self._pm.tiles_dir
+        if tiles_dir is None:
+            return
+
+        las_path = tiles_dir / tile_info["filename"]
+        if not las_path.is_file():
+            return
+
+        import laspy
+        import shutil
+
+        # Backup original
+        backup_path = las_path.with_suffix(las_path.suffix + ".bak")
+        if not backup_path.exists():
+            shutil.copy2(las_path, backup_path)
+
+        # Read original file to get header template
+        with laspy.open(las_path) as reader:
+            extra_dims = []
+            try:
+                extra_dims = list(reader.header.extra_dimensions)
+            except AttributeError:
+                pass
+            header_template = {
+                "version": reader.header.version,
+                "point_format_id": reader.header.point_format.id,
+                "vlrs": list(reader.header.vlrs),
+                "extra_dimensions": extra_dims,
+                "x_scale": reader.header.x_scale,
+                "y_scale": reader.header.y_scale,
+                "z_scale": reader.header.z_scale,
+            }
+
+        from ..tile_manager import _write_las_file
+        _write_las_file(
+            las_path,
+            result["x"], result["y"], result["z"],
+            classes=result.get("classification"),
+            intensities=result.get("intensity"),
+            return_numbers=result.get("return_number"),
+            num_returns=result.get("num_returns"),
+            point_source_ids=result.get("point_source_id"),
+            gps_times=result.get("gps_time"),
+            scan_angle_ranks=result.get("scan_angle_rank"),
+            scan_direction_flags=result.get("scan_direction_flag"),
+            edge_of_flight_lines=result.get("edge_of_flight_line"),
+            user_data_array=result.get("user_data"),
+            reds=result.get("red"),
+            greens=result.get("green"),
+            blues=result.get("blue"),
+            key_points=result.get("key_point"),
+            synthetics=result.get("synthetic"),
+            withhelds=result.get("withheld"),
+            overlaps=result.get("overlap"),
+            header_template=header_template,
         )
+
+        new_count = len(result["x"])
+        with self._db.connect() as conn:
+            self._db.update_point_count(conn, tile_id, new_count)
+
+        self._tile_list_widget.update_tile_status(tile_id, TileStatus.EDITED)
 
     def _on_ground_control(self) -> None:
         """Open the Ground Control dialog for the currently open tile."""
@@ -969,7 +1088,11 @@ class MainWindow(QMainWindow):
         if data is None:
             return
 
-        dlg = GroundControlDialog(data, parent=self)
+        # Get CRS info for the tile
+        tile_info = self._db.get_tile(self._editor.tile_id)
+        data_epsg = tile_info.get("crs_epsg") if tile_info else None
+
+        dlg = GroundControlDialog(data, parent=self, data_epsg=data_epsg)
         dlg.shift_applied.connect(self._apply_ground_control_shift)
         dlg.visualize_point.connect(self._on_visualize_control_point)
         dlg.exec()
@@ -1123,6 +1246,66 @@ class MainWindow(QMainWindow):
         dlg.transform_applied.connect(self._on_crs_transform)
         dlg.match_transform_applied.connect(self._on_match_transform_applied)
         dlg.exec()
+
+    def _on_processing_analysis(self) -> None:
+        """Open the processing time analysis dialog."""
+        dlg = ProcessingAnalysisDialog(self._db, parent=self)
+        dlg.exec()
+
+    # ── QC status handlers ──────────────────────────────────────
+
+    def _on_qc_status_changed_batch(self, tile_ids: list, qc_status: str,
+                                     qc_comment: str) -> None:
+        """Handle QC status change from tile list context menu."""
+        # If NEEDS_REWORK with __PROMPT__, ask for comment
+        if qc_status == QCStatus.NEEDS_REWORK and qc_comment == "__PROMPT__":
+            qc_comment, ok = self._prompt_qc_comment(tile_ids)
+            if not ok:
+                return  # user cancelled
+        elif qc_status is None:
+            qc_comment = ""
+
+        self._apply_qc_status(tile_ids, qc_status, qc_comment)
+
+    def _on_properties_qc_changed(self, qc_status: str, qc_comment: str) -> None:
+        """Handle QC status change from properties panel (single tile)."""
+        tile_id = self._editor.tile_id
+        if tile_id is None:
+            return
+        qc_status_val = qc_status if qc_status else None
+        self._apply_qc_status([tile_id], qc_status_val, qc_comment)
+
+    def _apply_qc_status(self, tile_ids: list, qc_status, qc_comment: str) -> None:
+        """Persist QC status to DB and update the tree."""
+        for tid in tile_ids:
+            try:
+                with self._db.connect() as conn:
+                    self._db.set_qc_status(conn, tid, qc_status, qc_comment)
+            except Exception as exc:
+                logger.warning("Failed to set QC status for %s: %s", tid, exc)
+                continue
+            self._tile_list_widget.update_tile_qc_status(tid, qc_status, qc_comment)
+
+        # Refresh QC info in properties panel if the open tile was affected
+        if self._editor.tile_id and self._editor.tile_id in tile_ids:
+            self._properties_panel.set_tile_qc_info(qc_status, qc_comment)
+
+        label = QCStatus.LABELS.get(qc_status, "Cleared") if qc_status else "Cleared"
+        self.set_status(f"QC: {label} → {len(tile_ids)} tile(s)", timeout=5000)
+
+    def _prompt_qc_comment(self, tile_ids: list) -> tuple:
+        """Show a dialog asking for rework comment. Returns (comment, ok)."""
+        from PySide6.QtWidgets import QInputDialog
+        tiles_str = ", ".join(tile_ids[:3])
+        if len(tile_ids) > 3:
+            tiles_str += f" (+{len(tile_ids) - 3} more)"
+
+        comment, ok = QInputDialog.getMultiLineText(
+            self, "Rework Required",
+            f"What needs to be reworked for:\n{tiles_str}",
+            "",
+        )
+        return comment.strip(), ok
 
     def _on_crs_assigned(self, wkt: str, epsg: int) -> None:
         """Handle CRS assignment from the dialog."""
@@ -1428,6 +1611,10 @@ class MainWindow(QMainWindow):
                 crs=crs_db,
                 filename=tile_info.get("filename", ""),
                 modified=self._file_modified(tile_info),
+            )
+            self._properties_panel.set_tile_qc_info(
+                tile_info.get("qc_status"),
+                tile_info.get("qc_comment"),
             )
             self._populate_las_header(tile_id)
 

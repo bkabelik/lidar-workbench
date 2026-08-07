@@ -49,6 +49,13 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import ASPRS_CLASS_NAMES
+from ..crs import transform_coordinates
+
+try:
+    from pyproj import CRS
+    HAS_PYPROJ = True
+except ImportError:
+    HAS_PYPROJ = False
 
 logger = logging.getLogger("lidar_workbench.gui.ground_control_dialog")
 
@@ -314,15 +321,17 @@ class GroundControlDialog(QDialog):
         "Space": " ",
     }
 
-    def __init__(self, tile_data: dict, parent=None):
+    def __init__(self, tile_data: dict, parent=None, data_epsg: Optional[int] = None):
         super().__init__(parent)
         self._data = tile_data
+        self._data_epsg = data_epsg  # EPSG code of the point cloud data
         self._worker: Optional[_GroundControlWorker] = None
 
         # GCP state
         self._gcp_points: List[Tuple[str, float, float, float]] = []
         self._gcp_results: list = []
         self._gcp_shift: Optional[float] = None
+        self._gcp_source_epsg: Optional[int] = None  # EPSG of the GCP CSV
 
         # Roof state
         self._roof_surfaces: List[Tuple[str, List[Tuple[float, float, float]]]] = []
@@ -431,6 +440,11 @@ class GroundControlDialog(QDialog):
         sep_row.addStretch()
         cf.addRow("", sep_row)
 
+        self._gcp_has_header = QCheckBox("First row contains column names")
+        self._gcp_has_header.setChecked(True)
+        self._gcp_has_header.toggled.connect(self._on_gcp_has_header_toggled)
+        cf.addRow("", self._gcp_has_header)
+
         self._gcp_preview = QTextEdit()
         self._gcp_preview.setReadOnly(True)
         self._gcp_preview.setMaximumHeight(80)
@@ -438,6 +452,27 @@ class GroundControlDialog(QDialog):
         cf.addRow("Preview:", self._gcp_preview)
 
         layout.addWidget(csv_group)
+
+        # ── GCP CRS ──
+        crs_group = QGroupBox("Coordinate System")
+        crs_f = QFormLayout(crs_group)
+        crs_row = QHBoxLayout()
+        crs_row.addWidget(QLabel("GCP EPSG:"))
+        self._gcp_epsg_spin = QSpinBox()
+        self._gcp_epsg_spin.setRange(1000, 99999)
+        self._gcp_epsg_spin.setSpecialValueText("Auto (same as data)")
+        self._gcp_epsg_spin.setValue(0)
+        self._gcp_epsg_spin.setToolTip(
+            "EPSG code of the GCP coordinates. Set to 0 to use the same as data. "
+            "If different from the data CRS, coordinates will be automatically transformed."
+        )
+        crs_row.addWidget(self._gcp_epsg_spin)
+        crs_row.addStretch()
+        crs_f.addRow("", crs_row)
+        self._gcp_crs_info = QLabel("")
+        self._gcp_crs_info.setWordWrap(True)
+        crs_f.addRow(self._gcp_crs_info)
+        layout.addWidget(crs_group)
 
         # ── Column mapping ──
         map_group = QGroupBox("2. Column Mapping")
@@ -706,6 +741,32 @@ class GroundControlDialog(QDialog):
         self._gcp_csv_edit.setText(path)
         self._parse_gcp_csv(path)
 
+    def _split_csv_line(self, line: str, sep: str) -> List[str]:
+        """Split a CSV line by separator, collapsing multiple spaces."""
+        if sep == " ":
+            # Treat any whitespace as a single separator
+            return line.split()
+        # Use csv module for proper quote handling with other separators
+        reader = csv.reader([line], delimiter=sep)
+        try:
+            return next(reader)
+        except StopIteration:
+            return []
+
+    def _line_looks_like_data(self, fields: List[str]) -> bool:
+        """Check if a parsed line looks like data (mostly numeric) rather than a header."""
+        if not fields:
+            return False
+        numeric_count = 0
+        for f in fields:
+            try:
+                float(f.strip().replace(",", "."))
+                numeric_count += 1
+            except ValueError:
+                pass
+        # If >= 75% of fields are numeric, treat as data row
+        return numeric_count >= max(2, len(fields) * 0.75)
+
     def _parse_gcp_csv(self, path: str):
         sep = self._get_separator(self._gcp_sep_combo, self._gcp_custom_sep)
         try:
@@ -716,19 +777,46 @@ class GroundControlDialog(QDialog):
             return
 
         # Preview
-        lines = content.splitlines()
-        preview = "\n".join(lines[:10])
-        if len(lines) > 10:
-            preview += f"\n… ({len(lines)} total lines)"
+        raw_lines = content.splitlines()
+        preview = "\n".join(raw_lines[:10])
+        if len(raw_lines) > 10:
+            preview += f"\n… ({len(raw_lines)} total lines)"
         self._gcp_preview.setText(preview)
 
-        # Parse
-        reader = csv.reader(io.StringIO(content), delimiter=sep)
-        try:
-            header = next(reader)
-        except StopIteration:
+        # Parse lines into fields (handle spaces properly)
+        parsed_lines = []
+        for line in raw_lines:
+            if line.strip() == "":
+                continue
+            fields = self._split_csv_line(line, sep)
+            if fields:
+                parsed_lines.append(fields)
+
+        if not parsed_lines:
             self._gcp_preview.setText("Empty file")
             return
+
+        # ── Auto-detect header vs data ──
+        # If the first line looks like numeric data, it's probably NOT a header
+        first_line_is_data = self._line_looks_like_data(parsed_lines[0])
+        if first_line_is_data and self._gcp_has_header.isChecked():
+            self._gcp_has_header.setChecked(False)
+            self._status.setText(
+                "Auto-detected: no header row (first line looks like data)"
+            )
+            has_header = False
+        else:
+            has_header = self._gcp_has_header.isChecked()
+
+        # ── Header handling ──
+        if has_header:
+            header = parsed_lines[0]
+            data_lines = parsed_lines[1:]
+        else:
+            # Generate synthetic header: "Col 0", "Col 1", ...
+            n_cols = max(len(fl) for fl in parsed_lines)
+            header = [f"Col {i}" for i in range(n_cols)]
+            data_lines = parsed_lines  # all lines are data
 
         self._populate_column_combos(
             header,
@@ -736,11 +824,25 @@ class GroundControlDialog(QDialog):
             self._gcp_y_col, self._gcp_z_col,
         )
 
+        # If auto-detection failed (no X/Y/Z columns matched), use positional defaults
+        if self._gcp_x_col.currentData() is None or self._gcp_x_col.currentData() < 0:
+            n_cols = len(header)
+            if n_cols >= 4:
+                # Standard layout: Name, X, Y, Z
+                self._gcp_name_col.setCurrentIndex(1)  # Col 0 → Name
+                self._gcp_x_col.setCurrentIndex(2)     # Col 1 → X
+                self._gcp_y_col.setCurrentIndex(3)     # Col 2 → Y
+                self._gcp_z_col.setCurrentIndex(4)     # Col 3 → Z
+            elif n_cols == 3:
+                # X, Y, Z only — name will be auto-numbered
+                self._gcp_x_col.setCurrentIndex(1)     # Col 0 → X
+                self._gcp_y_col.setCurrentIndex(2)     # Col 1 → Y
+                self._gcp_z_col.setCurrentIndex(3)     # Col 2 → Z
+
         # Read points (store in memory for later use)
         self._gcp_points = []
-        rows = list(reader)
         auto_name = 0
-        for row in rows:
+        for row in data_lines:
             if not row or all(c.strip() == "" for c in row):
                 continue
             name_idx = self._gcp_name_col.currentData()
@@ -769,12 +871,81 @@ class GroundControlDialog(QDialog):
         self._gcp_run_btn.setEnabled(len(self._gcp_points) > 0)
         self._status.setText(f"Loaded {len(self._gcp_points)} GCPs from CSV")
 
+        # Update CRS info label
+        self._update_gcp_crs_info()
+
     def _on_gcp_sep_changed(self):
         self._gcp_custom_sep.setVisible(
             self._gcp_sep_combo.currentText() not in self.SEPARATORS
         )
         if self._gcp_csv_edit.text():
             self._parse_gcp_csv(self._gcp_csv_edit.text())
+
+    def _on_gcp_has_header_toggled(self):
+        """Re-parse when the header checkbox changes."""
+        if self._gcp_csv_edit.text():
+            self._parse_gcp_csv(self._gcp_csv_edit.text())
+
+    def _update_gcp_crs_info(self):
+        """Update the CRS info label showing transform status."""
+        gcp_epsg = self._gcp_epsg_spin.value()
+        data_epsg = self._data_epsg
+
+        if not data_epsg:
+            self._gcp_crs_info.setText(
+                "⚠ Data CRS unknown — cannot auto-transform. "
+                "Assign a CRS to the tile first (Tools → Coordinate Systems)."
+            )
+            self._gcp_crs_info.setStyleSheet("color: #c09853;")
+        elif gcp_epsg == 0:
+            self._gcp_crs_info.setText(
+                f"GCP coords will be used as-is (same as data EPSG:{data_epsg})."
+            )
+            self._gcp_crs_info.setStyleSheet("color: #888;")
+        elif gcp_epsg == data_epsg:
+            self._gcp_crs_info.setText(
+                f"GCP EPSG:{gcp_epsg} matches data EPSG:{data_epsg} — no transform needed."
+            )
+            self._gcp_crs_info.setStyleSheet("color: #5cb85c;")
+        else:
+            self._gcp_crs_info.setText(
+                f"GCP EPSG:{gcp_epsg} → will auto-transform to data EPSG:{data_epsg}."
+            )
+            self._gcp_crs_info.setStyleSheet("color: #5cb85c; font-weight: bold;")
+
+    def _get_gcp_coords_to_use(self) -> List[Tuple[str, float, float, float]]:
+        """Return GCP points, transformed to data CRS if needed."""
+        gcp_epsg = self._gcp_epsg_spin.value()
+        data_epsg = self._data_epsg
+
+        if (not data_epsg or gcp_epsg == 0
+                or gcp_epsg == data_epsg
+                or not HAS_PYPROJ):
+            return list(self._gcp_points)
+
+        # Transform from GCP EPSG to data EPSG
+        import numpy as np
+        gcp_xs = np.array([p[1] for p in self._gcp_points], dtype=np.float64)
+        gcp_ys = np.array([p[2] for p in self._gcp_points], dtype=np.float64)
+        gcp_zs = np.array([p[3] for p in self._gcp_points], dtype=np.float64)
+
+        try:
+            tx, ty, tz = transform_coordinates(
+                gcp_xs, gcp_ys, gcp_zs,
+                source_crs=f"EPSG:{gcp_epsg}",
+                target_crs=f"EPSG:{data_epsg}",
+            )
+        except Exception as exc:
+            logger.warning("GCP CRS transform failed: %s", exc)
+            self._status.setText(f"⚠ CRS transform failed: {exc}")
+            return list(self._gcp_points)
+
+        transformed = []
+        for i, (name, _, _, _) in enumerate(self._gcp_points):
+            tz_val = float(tz[i]) if tz is not None else self._gcp_points[i][3]
+            transformed.append((name, float(tx[i]), float(ty[i]), tz_val))
+
+        return transformed
 
     # ── Browse Roofs CSV ─────────────────────────────────────────────
 
@@ -874,6 +1045,9 @@ class GroundControlDialog(QDialog):
         # Re-parse column mapping from current combo state
         self._reparse_current_gcp()
 
+        # Get GCP points with CRS transform if needed
+        gcp_points = self._get_gcp_coords_to_use()
+
         classes = set()
         for i in range(self._gcp_class_list.count()):
             item = self._gcp_class_list.item(i)
@@ -891,7 +1065,7 @@ class GroundControlDialog(QDialog):
         self._progress.setValue(0)
 
         params = {
-            "points": self._gcp_points,
+            "points": gcp_points,
             "classes": classes,
             "radius": self._gcp_radius_spin.value(),
         }
@@ -912,14 +1086,30 @@ class GroundControlDialog(QDialog):
                 content = f.read()
         except Exception:
             return
-        reader = csv.reader(io.StringIO(content), delimiter=sep)
-        try:
-            next(reader)  # skip header
-        except StopIteration:
+
+        # Parse lines into fields (handle spaces properly)
+        raw_lines = content.splitlines()
+        parsed_lines = []
+        for line in raw_lines:
+            if line.strip() == "":
+                continue
+            fields = self._split_csv_line(line, sep)
+            if fields:
+                parsed_lines.append(fields)
+
+        if not parsed_lines:
             return
+
+        # ── Header handling ──
+        has_header = self._gcp_has_header.isChecked()
+        if has_header:
+            data_lines = parsed_lines[1:]
+        else:
+            data_lines = parsed_lines  # all lines are data
+
         self._gcp_points = []
         auto_name = 0
-        for row in reader:
+        for row in data_lines:
             name_idx = self._gcp_name_col.currentData()
             x_idx = self._gcp_x_col.currentData()
             y_idx = self._gcp_y_col.currentData()

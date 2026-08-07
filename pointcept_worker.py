@@ -114,9 +114,13 @@ class PointceptWorker(QThread):
 
     def run(self) -> None:
         """Execute the classification pipeline (runs in the worker thread)."""
+        import time as _time
         total = len(self._tile_ids)
         completed: List[str] = []
         completed_lock = None
+
+        # Generate a batch ID for this processing run
+        batch_id = f"pointcept_{_time.strftime('%Y%m%d_%H%M%S')}"
 
         # Validate prerequisites
         if not self._model_path.is_file():
@@ -139,10 +143,28 @@ class PointceptWorker(QThread):
         def classify_one(tile_id: str) -> None:
             if self._cancelled:
                 return
+            import time as _time2
+            t0 = _time2.perf_counter()
             try:
                 self._classify_tile(tile_id, tiles_dir, intensity_scale)
+                duration = _time2.perf_counter() - t0
                 with self._db.connect() as conn:
                     self._db.update_status(conn, tile_id, TileStatus.CLASSIFIED)
+                    # Record processing time
+                    tile_info = self._db.get_tile(tile_id)
+                    pt_count = tile_info.get("point_count") if tile_info else None
+                    self._db.record_processing_time(
+                        conn, tile_id, "pointcept",
+                        duration_seconds=duration,
+                        point_count=pt_count,
+                        params={
+                            "model": str(self._model_path),
+                            "voxel_size": self._voxel_size,
+                            "smoothing": self._smoothing,
+                            "intensity_scale": intensity_scale,
+                        },
+                        batch_id=batch_id,
+                    )
                 self.tile_done.emit(tile_id)
                 with completed_lock:
                     completed.append(tile_id)

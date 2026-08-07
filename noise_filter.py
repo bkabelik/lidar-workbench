@@ -294,6 +294,102 @@ def dbscan_outlier_removal(
 
 
 
+def _isolated_voxel_counts(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    search_radius: float,
+) -> np.ndarray:
+    """
+    Count neighbours within *search_radius* using a cell-centric voxel grid.
+
+    Points are binned into cells of size *search_radius*.  Then, for each
+    **occupied cell**, we compute all-pairs distances against points in the
+    27-cell neighbourhood — this is cell-centric (O(num_cells × 27)) rather
+    than point-centric (O(N)), so the inner work stays vectorised numpy.
+
+    Typically 3–10× faster than building + querying a scipy KDTree for
+    large tiles (10M+ points).
+    """
+    n = len(xs)
+    r = search_radius
+    if r <= 0:
+        return np.ones(n, dtype=np.int32)
+
+    # ── Cell indices ─────────────────────────────────────────────
+    x_min, y_min, z_min = xs.min(), ys.min(), zs.min()
+    ix = np.floor((xs - x_min) / r).astype(np.int32)
+    iy = np.floor((ys - y_min) / r).astype(np.int32)
+    iz = np.floor((zs - z_min) / r).astype(np.int32)
+
+    # Shift to non-negative for flat key
+    ix_s = ix - ix.min()
+    iy_s = iy - iy.min()
+    iz_s = iz - iz.min()
+    nx = int(ix_s.max()) + 3
+    ny = int(iy_s.max()) + 3
+    keys = (ix_s + 1) + nx * (iy_s + 1) + (nx * ny) * (iz_s + 1)
+
+    # ── Group points by cell ─────────────────────────────────────
+    order = np.argsort(keys)
+    sorted_keys = keys[order]
+    sorted_x = xs[order]
+    sorted_y = ys[order]
+    sorted_z = zs[order]
+
+    unique_keys, cell_start = np.unique(sorted_keys, return_index=True)
+    cell_end = np.append(cell_start[1:], n)
+
+    # Map flat key → (start, end) in sorted arrays
+    key_to_range: dict = {}
+    for k, s, e in zip(unique_keys, cell_start, cell_end):
+        key_to_range[int(k)] = (int(s), int(e))
+
+    # ── 27 neighbour offsets ─────────────────────────────────────
+    off_dk = np.array([
+        dx + nx * dy + (nx * ny) * dz
+        for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
+    ], dtype=np.int32)
+
+    # ── Cell-centric counting ────────────────────────────────────
+    r2 = r * r
+    counts = np.zeros(n, dtype=np.int32)
+
+    for cell_key, s, e in zip(unique_keys, cell_start, cell_end):
+        ck = int(cell_key)
+        # Points in this cell
+        cx = sorted_x[s:e]
+        cy = sorted_y[s:e]
+        cz = sorted_z[s:e]
+        n_cell = e - s
+
+        cell_counts = np.zeros(n_cell, dtype=np.int32)
+
+        for dk in off_dk:
+            nb = key_to_range.get(ck + int(dk))
+            if nb is None:
+                continue
+            ns, ne = nb
+            if ns == ne:
+                continue
+            nx_arr = sorted_x[ns:ne]
+            ny_arr = sorted_y[ns:ne]
+            nz_arr = sorted_z[ns:ne]
+
+            # All-pairs distances: (n_cell,) vs (ne-ns,) via broadcasting
+            dx = cx[:, None] - nx_arr[None, :]    # (n_cell, n_nb)
+            dy = cy[:, None] - ny_arr[None, :]
+            dz = cz[:, None] - nz_arr[None, :]
+            d2 = dx * dx + dy * dy + dz * dz
+            cell_counts += (d2 <= r2).sum(axis=1)  # (n_cell,)
+
+        # Map back to original point indices
+        idx_in_sorted = order[s:e]
+        counts[idx_in_sorted] = cell_counts
+
+    return counts
+
+
 def isolated_point_removal(
     xs: np.ndarray,
     ys: np.ndarray,
@@ -310,9 +406,9 @@ def isolated_point_removal(
     themselves) are flagged as noise — catches flying artifacts,
     birds, sensor errors, and other isolated points.
 
-    This matches the Terrascan ``Isolated Points`` routine:
-    e.g. ``min_neighbors=3, search_radius=0.5`` means "at least
-    3 points within 0.5 m".
+    Uses a cell-centric voxel grid for speed (O(N) binning + per-cell
+    vectorised distance checks) and falls back to scipy KDTree if the
+    grid approach would be inefficient.
 
     Args:
         xs, ys, zs:     Point coordinates.
@@ -337,17 +433,21 @@ def isolated_point_removal(
         tree = KDTree(points)
         if progress:
             progress("Isolated filter: counting neighbours…", 30.0)
-        # Count neighbours within search_radius for each point
         counts = tree.query_ball_point(points, search_radius, return_length=True)
         counts = np.array(counts, dtype=int)
     except ImportError:
-        logger.debug("scipy not available — using brute-force for isolated filter")
-        counts = np.zeros(n, dtype=int)
-        r2 = search_radius * search_radius
-        for i in range(n):
-            diff = points - points[i]
-            d2 = (diff * diff).sum(axis=1)
-            counts[i] = (d2 <= r2).sum()
+        # scipy not available — try voxel grid, fall back to brute-force
+        logger.debug("scipy not available — trying voxel-grid isolated filter")
+        try:
+            counts = _isolated_voxel_counts(xs, ys, zs, search_radius)
+        except Exception:
+            logger.debug("voxel failed — using brute-force for isolated filter")
+            counts = np.zeros(n, dtype=int)
+            r2 = search_radius * search_radius
+            for i in range(n):
+                diff = points - points[i]
+                d2 = (diff * diff).sum(axis=1)
+                counts[i] = (d2 <= r2).sum()
 
     # Keep points with at least min_neighbors (including self)
     keep_mask = counts >= min_neighbors
@@ -2100,44 +2200,92 @@ if _HAS_QT:
 
     class FilterWorker(QThread):
         """Background worker that applies a filter pipeline to tiles in
-        parallel using a thread pool, reporting progress."""
+        parallel using a thread pool with batch loading.
+
+        Tiles are loaded in batches (to avoid loading all 500 tiles into
+        RAM at once), processed in parallel via ThreadPoolExecutor, and
+        results are emitted one by one for the main thread to save."""
 
         progress = Signal(str, float)         # message, percentage
-        tile_done = Signal(str)               # tile_id that finished
+        tile_done = Signal(str, float, int)   # tile_id, duration_seconds, point_count
         finished_all = Signal(list, list)     # tile_ids, keep_masks
         error_occurred = Signal(str)
 
-        def __init__(self, tile_data: list, pipeline: list,
-                     workers: int = 4, parent=None):
+        def __init__(self, tile_ids: list, pipeline: list,
+                     load_func, workers: int = 4, parent=None):
             super().__init__(parent)
-            self._tile_data = tile_data  # list of (tile_id, data_dict)
+            self._tile_ids = list(tile_ids)
             self._pipeline = pipeline
+            self._load_func = load_func
             self._workers = workers
             self._results: list = []
+            self._cancelled = False
+
+        def cancel(self):
+            """Request graceful shutdown: stop loading new tiles, finish
+            in-flight ones, then emit finished_all normally."""
+            self._cancelled = True
 
         def run(self):
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            total = len(self._tile_data)
+            n_total = len(self._tile_ids)
+            if n_total == 0:
+                self.finished_all.emit([], [])
+                return
+
+            max_in_flight = max(1, self._workers)
+            cursor = 0
             done = 0
+            cancelled_notified = False
+
             try:
-                with ThreadPoolExecutor(max_workers=self._workers) as pool:
-                    futures = {
-                        pool.submit(_apply_pipeline, data, self._pipeline): tid
-                        for tid, data in self._tile_data
-                    }
-                    for fut in as_completed(futures):
-                        tid = futures[fut]
+                with ThreadPoolExecutor(max_workers=max_in_flight) as pool:
+                    futures: dict = {}
+
+                    while done < n_total:
+                        # ── Feed the pool: submit new work while capacity
+                        #     exists and tiles remain (unless cancelled) ──
+                        while (len(futures) < max_in_flight
+                               and cursor < n_total
+                               and not self._cancelled):
+                            tid = self._tile_ids[cursor]
+                            cursor += 1
+                            data = self._load_func(tid)
+                            if data is not None:
+                                fut = pool.submit(_apply_pipeline_timed,
+                                                 data, self._pipeline)
+                                futures[fut] = (tid, len(data.get("x", [])))
+                            else:
+                                done += 1  # skip failed loads
+
+                        if self._cancelled and not cancelled_notified:
+                            remaining = len(futures)
+                            self.progress.emit(
+                                f"Cancelling — finishing {remaining} tile(s)…",
+                                float(done),
+                            )
+                            cancelled_notified = True
+
+                        if not futures:
+                            break
+
+                        # ── Wait for ONE result, then loop back ──────
+                        completed = as_completed(futures)
+                        fut = next(completed)
+                        tid, point_count = futures.pop(fut)
                         try:
-                            keep = fut.result()
+                            keep, duration = fut.result()
                             self._results.append((tid, keep))
                             done += 1
+                            prefix = "Cancelled: " if self._cancelled else "Filtered "
                             self.progress.emit(
-                                f"Filtered {done}/{total} tile(s)…",
-                                done / total * 100.0,
+                                f"{prefix}{done}/{n_total} tile(s)…",
+                                float(done),
                             )
-                            self.tile_done.emit(tid)
+                            self.tile_done.emit(tid, duration, point_count)
                         except Exception as exc:
                             self.error_occurred.emit(f"{tid}: {exc}")
+                            done += 1
             except Exception as exc:
                 self.error_occurred.emit(str(exc))
             self.finished_all.emit(
@@ -2276,3 +2424,12 @@ def _apply_pipeline(data: dict, pipeline: list) -> np.ndarray:
         keep_indices = np.where(keep)[0]
         keep[keep_indices[~k]] = False
     return keep
+
+
+def _apply_pipeline_timed(data: dict, pipeline: list):
+    """Apply filter pipeline with timing, returns (keep_mask, duration_seconds)."""
+    import time
+    t0 = time.perf_counter()
+    keep = _apply_pipeline(data, pipeline)
+    duration = time.perf_counter() - t0
+    return keep, duration

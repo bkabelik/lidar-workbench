@@ -48,6 +48,7 @@ from ..refraction import (
     crop_to_water_surface_model,
     detect_water_surface_ransac,
     interpolate_sensor_position,
+    interpolate_sensor_positions_batch,
     load_water_surface_geotiff,
     read_trajectory_ascii,
     sample_geotiff_at_points,
@@ -58,225 +59,304 @@ logger = logging.getLogger("lidar_workbench.gui.bathy_dialog")
 
 class _BathyWorker(QThread):
     progress = Signal(str, float)
-    step_done = Signal(str, np.ndarray)
-    finished_all = Signal(dict)
+    tile_done = Signal(str, dict)     # (tile_id, result_dict) — save immediately
+    finished_all = Signal(int)        # number of tiles processed
     error = Signal(str)
 
-    def __init__(self, data: dict, steps: list[dict], parent=None):
+    def __init__(self, tile_ids: list, steps: list[dict],
+                 load_func, max_workers: int = 4, parent=None):
+        """
+        Args:
+            tile_ids: List of tile ID strings to process.
+            steps: Pipeline step configurations.
+            load_func: Callable ``(tile_id) -> dict | None`` that loads tile data.
+            max_workers: Number of tiles to process in parallel.
+        """
         super().__init__(parent)
-        self._data = {k: v.copy() if isinstance(v, np.ndarray) else v
-                      for k, v in data.items()}
+        self._tile_ids = list(tile_ids)
         self._steps = steps
+        self._load_func = load_func
+        self._max_workers = max_workers
 
     def run(self):
-        result = dict(self._data)
-        water_surface_z: Optional[float] = None
+        """Process tiles in parallel batches: load N, process N in pool,
+        save results, load next batch.  Loading is sequential (laspy safety);
+        processing is parallel via ThreadPoolExecutor."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+
+        n_total = len(self._tile_ids)
+        if n_total == 0:
+            self.finished_all.emit(0)
+            return
+
+        t_start = time.time()
+        processed = 0
+        max_in_flight = max(1, self._max_workers)
+        cursor = 0  # index into self._tile_ids
+
         try:
-            for i, step in enumerate(self._steps):
-                name = step["name"]
-                pct_base = i / len(self._steps) * 100
-                if name == "ws_crop":
-                    self.progress.emit("Cropping to water surface model…", pct_base)
-                    surface = step["surface"]
-                    georef = step["georef"]
-                    k, _ = crop_to_water_surface_model(
-                        result["x"], result["y"], result["z"],
-                        surface=surface,
-                        georef=georef,
-                        tolerance_above_cm=step.get("tolerance_above_cm", 0.0),
-                        extrapolate_m=step.get("extrapolate_m", 0.0),
-                        progress=lambda m, p: self.progress.emit(
-                            m, pct_base + p * 0.8 / len(self._steps)
-                        ),
-                    )
-                    result["x"], result["y"], result["z"] = (
-                        result["x"][k], result["y"][k], result["z"][k],
-                    )
-                    for key in ("classification", "intensity", "return_number",
-                                "point_source_id", "sensor_type", "gps_time"):
-                        if key in result and result[key] is not None:
-                            result[key] = result[key][k]
-                    self.step_done.emit("ws_crop_mask", k)
+            with ThreadPoolExecutor(max_workers=max_in_flight) as pool:
+                futures: dict = {}
 
-                elif name == "snells":
-                    self.progress.emit("Snell's law correction...", pct_base)
-                    n_water = step.get("n_water", 1.3333)
+                while processed < n_total:
+                    # ── Feed the pool: submit new work while capacity
+                    #     exists and tiles remain to load ──────────
+                    while len(futures) < max_in_flight and cursor < n_total:
+                        tid = self._tile_ids[cursor]
+                        cursor += 1
+                        data = self._load_func(tid)
+                        if data is not None:
+                            fut = pool.submit(self._process_one, data,
+                                             cursor, n_total)
+                            futures[fut] = tid
+                        else:
+                            processed += 1  # skip failed loads
 
-                    # Determine water surface: per-point array or scalar
-                    ws_input = step["water_surface_z"]
-                    if isinstance(ws_input, np.ndarray):
-                        ws_z = ws_input
-                        water_surface_z = float(np.median(ws_z))
-                    else:
-                        ws_z = float(ws_input)
-                        water_surface_z = ws_z
+                    if not futures:
+                        break
 
-                    if step.get("use_trajectory"):
-                        traj = read_trajectory_ascii(
-                            step["trajectory_path"],
-                            separator=step.get("separator"),
-                            skip_rows=step.get("skip_rows", 0),
-                            has_header=step.get("has_header", False),
-                            time_col=step.get("time_col", 0),
-                            x_col=step.get("x_col", 1),
-                            y_col=step.get("y_col", 2),
-                            z_col=step.get("z_col", 3),
+                    # ── Wait for ONE result, then loop back to
+                    #     immediately refill the pool ─────────────
+                    completed = as_completed(futures)
+                    fut = next(completed)
+                    tid = futures.pop(fut)
+                    try:
+                        result = fut.result()
+                        self.tile_done.emit(tid, result)
+                        processed += 1
+                        self.progress.emit(
+                            f"Done {processed}/{n_total} tiles",
+                            processed / n_total * 100,
                         )
-                        # Per-point sensor position via interpolation
-                        gps_times = result.get("gps_time")
-                        if gps_times is not None and len(gps_times) == len(result["x"]):
-                            self.progress.emit(
-                                "Snell's: interpolating sensor per-point...",
-                                pct_base + 2.0,
-                            )
-                            n_pts = len(result["x"])
-                            sx_arr = np.empty(n_pts, dtype=np.float64)
-                            sy_arr = np.empty(n_pts, dtype=np.float64)
-                            sz_arr = np.empty(n_pts, dtype=np.float64)
-                            for j in range(n_pts):
-                                pos = interpolate_sensor_position(traj, float(gps_times[j]))
-                                sx_arr[j] = pos[0]
-                                sy_arr[j] = pos[1]
-                                sz_arr[j] = pos[2]
-                            # Use the per-point approach: iterate in batches for speed
-                            # For now, pass median sensor position but with
-                            # correct per-point water surface
-                            sx_m = float(np.median(sx_arr))
-                            sy_m = float(np.median(sy_arr))
-                            sz_m = float(np.median(sz_arr))
-                            xc, yc, zc = apply_snells_correction(
-                                result["x"], result["y"], result["z"],
-                                water_surface_z=ws_z,
-                                sensor_position=(sx_m, sy_m, sz_m),
-                                n_water=n_water,
-                            )
-                        else:
-                            # No gps_time — use median sensor position
-                            sx, sy, sz = (
-                                float(np.median(traj[:, 1])),
-                                float(np.median(traj[:, 2])),
-                                float(np.median(traj[:, 3])),
-                            )
-                            xc, yc, zc = apply_snells_correction(
-                                result["x"], result["y"], result["z"],
-                                water_surface_z=ws_z,
-                                sensor_position=(sx, sy, sz),
-                                n_water=n_water,
-                            )
-                    else:
-                        # Nadir approximation (no trajectory)
-                        if isinstance(ws_z, np.ndarray):
-                            # Per-point water surface with nadir
-                            ws_scalar = float(np.median(ws_z))
-                            xc, yc, zc = apply_snells_correction_nadir(
-                                result["x"], result["y"], result["z"],
-                                water_surface_z=ws_scalar,
-                                n_water=n_water,
-                            )
-                        else:
-                            xc, yc, zc = apply_snells_correction_nadir(
-                                result["x"], result["y"], result["z"],
-                                water_surface_z=ws_z,
-                                n_water=n_water,
-                            )
-                    result["x"], result["y"], result["z"] = xc, yc, zc
-                    self.step_done.emit("snells_zs", zc)
+                    except Exception as exc:
+                        logger.error("Bathy error on %s: %s", tid, exc)
+                        processed += 1
 
-                elif name == "water_surface":
-                    self.progress.emit("Water surface + ghost removal...", pct_base)
-                    k, _ = water_surface_ghost_removal(
-                        result["x"], result["y"], result["z"],
-                        tile_length=step.get("tile_length", 40.0),
-                        progress=lambda m, p: self.progress.emit(
-                            m, pct_base + p * 0.8 / len(self._steps)
-                        ),
-                    )
-                    result["x"], result["y"], result["z"] = (
-                        result["x"][k], result["y"][k], result["z"][k],
-                    )
-                    for key in ("classification", "intensity", "return_number",
-                                "point_source_id", "sensor_type", "gps_time"):
-                        if key in result and result[key] is not None:
-                            result[key] = result[key][k]
-                    self.step_done.emit("water_surface_mask", k)
-
-                elif name == "river_crop":
-                    self.progress.emit("River corridor crop...", pct_base)
-                    k, _ = river_corridor_mask(
-                        result["x"], result["y"], result["z"],
-                        result.get("intensity", np.zeros(len(result["x"]), dtype=np.uint16)),
-                        result.get("return_number", np.ones(len(result["x"]), dtype=np.uint8)),
-                        water_surface_z=water_surface_z,
-                        progress=lambda m, p: self.progress.emit(
-                            m, pct_base + p * 0.8 / len(self._steps)
-                        ),
-                    )
-                    st = result.get("sensor_type")
-                    if st is not None:
-                        k = k | (st == 1)
-                    result["x"], result["y"], result["z"] = (
-                        result["x"][k], result["y"][k], result["z"][k],
-                    )
-                    for key in ("classification", "intensity", "return_number",
-                                "point_source_id", "sensor_type", "gps_time"):
-                        if key in result and result[key] is not None:
-                            result[key] = result[key][k]
-                    self.step_done.emit("river_crop_mask", k)
-
-                elif name == "benthic":
-                    self.progress.emit("Benthic continuity filter...", pct_base)
-                    certain = np.ones(len(result["x"]), dtype=bool)
-                    k = benthic_continuity_filter(
-                        result["x"], result["y"], result["z"],
-                        certain_bed_mask=certain,
-                        search_radius=step.get("search_radius", 0.3),
-                        max_slope=step.get("max_slope", 0.35),
-                        progress=lambda m, p: self.progress.emit(
-                            m, pct_base + p * 0.8 / len(self._steps)
-                        ),
-                    )
-                    result["x"], result["y"], result["z"] = (
-                        result["x"][k], result["y"][k], result["z"][k],
-                    )
-                    for key in ("classification", "intensity", "return_number",
-                                "point_source_id", "sensor_type", "gps_time"):
-                        if key in result and result[key] is not None:
-                            result[key] = result[key][k]
-                    self.step_done.emit("benthic_mask", k)
-
-            self.progress.emit("Done", 100.0)
-            self.finished_all.emit(result)
+            elapsed = time.time() - t_start
+            summary = f"Done: {processed}/{n_total} tiles in {elapsed:.1f}s"
+            self.progress.emit(summary, 100.0)
+            self.finished_all.emit(processed)
         except Exception as exc:
             logger.exception("Bathy processing failed")
             self.error.emit(str(exc))
+
+    def _process_one(self, data: dict, tile_idx: int, n_tiles: int) -> dict:
+        """Run the pipeline on a single tile's data, return result dict."""
+        result = {k: v.copy() if isinstance(v, np.ndarray) else v
+                  for k, v in data.items()}
+        water_surface_z: Optional[float] = None
+
+        # ── Early skip: tile with zero bathy points ─────────────────
+        st = result.get("sensor_type")
+        has_bathy = (st is not None and (st == 2).any()) if st is not None else False
+        bathy_step_names = {"snells", "water_surface", "river_crop", "benthic", "ws_crop"}
+        has_non_bathy_steps = any(s["name"] not in bathy_step_names
+                                  for s in self._steps)
+        if not has_bathy and not has_non_bathy_steps and len(result["x"]) > 0:
+            logger.info("Tile %s: no bathy points, skipping pipeline", tile_idx)
+            return result
+
+        for i, step in enumerate(self._steps):
+            name = step["name"]
+            pct_base = i / len(self._steps) * 100
+            # Scale progress into this tile's slice of overall progress
+            tile_pct_base = (tile_idx / n_tiles) * 100
+            tile_pct_range = 100.0 / n_tiles
+
+            if name == "ws_crop":
+                label = f"Crop WSM…" if n_tiles == 1 else f"Tile {tile_idx+1}/{n_tiles}: Crop WSM…"
+                self.progress.emit(label, tile_pct_base + pct_base * tile_pct_range / 100)
+                surface = step["surface"]
+                georef = step["georef"]
+                keep_mask, _ = crop_to_water_surface_model(
+                    result["x"], result["y"], result["z"],
+                    surface=surface, georef=georef,
+                    tolerance_above_cm=step.get("tolerance_above_cm", 0.0),
+                    extrapolate_m=step.get("extrapolate_m", 0.0),
+                    data_epsg=step.get("data_epsg"),
+                )
+                is_bathy = (result.get("sensor_type") is not None
+                            and (result["sensor_type"] == 2).any())
+                if is_bathy:
+                    k = keep_mask | (result["sensor_type"] != 2)
+                else:
+                    k = keep_mask
+                result["x"], result["y"], result["z"] = result["x"][k], result["y"][k], result["z"][k]
+                for key in ("classification", "intensity", "return_number",
+                            "point_source_id", "sensor_type", "gps_time"):
+                    if key in result and result[key] is not None:
+                        result[key] = result[key][k]
+
+            elif name == "snells":
+                label = f"Snell's…" if n_tiles == 1 else f"Tile {tile_idx+1}/{n_tiles}: Snell's…"
+                self.progress.emit(label, tile_pct_base + pct_base * tile_pct_range / 100)
+                n_water = step.get("n_water", 1.3333)
+
+                # Water surface: GeoTIFF (sampled on-demand) or scalar
+                ws_input = step["water_surface_z"]
+                if ws_input is None and step.get("geotiff_surface") is not None:
+                    # Sample GeoTIFF at this tile's points
+                    ws_z = sample_geotiff_at_points(
+                        step["geotiff_surface"], step["geotiff_georef"],
+                        result["x"], result["y"],
+                        fill_value=step.get("ws_fallback", 0.0),
+                    )
+                    water_surface_z = float(np.nanmedian(ws_z))
+                elif isinstance(ws_input, np.ndarray):
+                    ws_z = ws_input
+                    water_surface_z = float(np.median(ws_z))
+                else:
+                    ws_z = float(ws_input)
+                    water_surface_z = ws_z
+
+                orig_x, orig_y, orig_z = result["x"].copy(), result["y"].copy(), result["z"].copy()
+
+                if step.get("use_trajectory"):
+                    traj = read_trajectory_ascii(
+                        step["trajectory_path"],
+                        separator=step.get("separator"),
+                        skip_rows=step.get("skip_rows", 0),
+                        has_header=step.get("has_header", False),
+                        time_col=step.get("time_col", 0),
+                        x_col=step.get("x_col", 1),
+                        y_col=step.get("y_col", 2),
+                        z_col=step.get("z_col", 3),
+                    )
+                    gps_times = result.get("gps_time")
+                    if gps_times is not None and len(gps_times) == len(result["x"]):
+                        # Vectorized batch interpolation — O(N log M) instead of
+                        # per-point Python loop (was the #1 bottleneck on large tiles)
+                        sx_arr, sy_arr, sz_arr = interpolate_sensor_positions_batch(
+                            traj, gps_times.astype(np.float64),
+                        )
+                        xc, yc, zc = apply_snells_correction(
+                            result["x"], result["y"], result["z"],
+                            water_surface_z=ws_z,
+                            sensor_position=(sx_arr, sy_arr, sz_arr),
+                            n_water=n_water,
+                        )
+                    else:
+                        sx = float(np.median(traj[:, 1]))
+                        sy = float(np.median(traj[:, 2]))
+                        sz = float(np.median(traj[:, 3]))
+                        xc, yc, zc = apply_snells_correction(
+                            result["x"], result["y"], result["z"],
+                            water_surface_z=ws_z,
+                            sensor_position=(sx, sy, sz),
+                            n_water=n_water,
+                        )
+                else:
+                    if isinstance(ws_z, np.ndarray):
+                        ws_scalar = float(np.median(ws_z))
+                    else:
+                        ws_scalar = ws_z
+                    xc, yc, zc = apply_snells_correction_nadir(
+                        result["x"], result["y"], result["z"],
+                        water_surface_z=ws_scalar,
+                        n_water=n_water,
+                    )
+
+                is_bathy = (result.get("sensor_type") is not None
+                            and (result["sensor_type"] == 2).any())
+                if is_bathy:
+                    bathy_mask = result["sensor_type"] == 2
+                    result["x"] = np.where(bathy_mask, xc, orig_x)
+                    result["y"] = np.where(bathy_mask, yc, orig_y)
+                    result["z"] = np.where(bathy_mask, zc, orig_z)
+                else:
+                    result["x"], result["y"], result["z"] = xc, yc, zc
+
+            elif name == "water_surface":
+                label = f"Ghost removal…" if n_tiles == 1 else f"Tile {tile_idx+1}/{n_tiles}: Ghost removal…"
+                self.progress.emit(label, tile_pct_base + pct_base * tile_pct_range / 100)
+                k, _ = water_surface_ghost_removal(
+                    result["x"], result["y"], result["z"],
+                    tile_length=step.get("tile_length", 40.0),
+                )
+                is_bathy = (result.get("sensor_type") is not None
+                            and (result["sensor_type"] == 2).any())
+                if is_bathy:
+                    k = k | (result["sensor_type"] != 2)
+                result["x"], result["y"], result["z"] = result["x"][k], result["y"][k], result["z"][k]
+                for key in ("classification", "intensity", "return_number",
+                            "point_source_id", "sensor_type", "gps_time"):
+                    if key in result and result[key] is not None:
+                        result[key] = result[key][k]
+
+            elif name == "river_crop":
+                label = f"River crop…" if n_tiles == 1 else f"Tile {tile_idx+1}/{n_tiles}: River crop…"
+                self.progress.emit(label, tile_pct_base + pct_base * tile_pct_range / 100)
+                k, _ = river_corridor_mask(
+                    result["x"], result["y"], result["z"],
+                    result.get("intensity", np.zeros(len(result["x"]), dtype=np.uint16)),
+                    result.get("return_number", np.ones(len(result["x"]), dtype=np.uint8)),
+                    water_surface_z=water_surface_z,
+                )
+                st = result.get("sensor_type")
+                if st is not None and (st == 2).any():
+                    k = k | (st != 2)
+                result["x"], result["y"], result["z"] = result["x"][k], result["y"][k], result["z"][k]
+                for key in ("classification", "intensity", "return_number",
+                            "point_source_id", "sensor_type", "gps_time"):
+                    if key in result and result[key] is not None:
+                        result[key] = result[key][k]
+
+            elif name == "benthic":
+                label = f"Benthic filter…" if n_tiles == 1 else f"Tile {tile_idx+1}/{n_tiles}: Benthic filter…"
+                self.progress.emit(label, tile_pct_base + pct_base * tile_pct_range / 100)
+                certain = np.ones(len(result["x"]), dtype=bool)
+                k = benthic_continuity_filter(
+                    result["x"], result["y"], result["z"],
+                    certain_bed_mask=certain,
+                    search_radius=step.get("search_radius", 0.3),
+                    max_slope=step.get("max_slope", 0.35),
+                )
+                is_bathy = (result.get("sensor_type") is not None
+                            and (result["sensor_type"] == 2).any())
+                if is_bathy:
+                    k = k | (result["sensor_type"] != 2)
+                result["x"], result["y"], result["z"] = result["x"][k], result["y"][k], result["z"][k]
+                for key in ("classification", "intensity", "return_number",
+                            "point_source_id", "sensor_type", "gps_time"):
+                    if key in result and result[key] is not None:
+                        result[key] = result[key][k]
+
+        return result
 
 
 class BathyDialog(QDialog):
     """Dialog for bathymetric processing pipeline."""
 
-    bathy_applied = Signal(dict)
+    bathy_applied = Signal()                     # all tiles saved, dialog can close
+    tile_save_requested = Signal(str, dict)      # (tile_id, result) — save to disk now
 
-    def __init__(self, tile_data: dict, scanner: str = '',
-                 sensor_type: str = '', parent=None):
+    def __init__(self, tile_ids: list,
+                 scanner: str = '', sensor_type: str = '',
+                 parent=None, data_epsg: Optional[int] = None):
+        """
+        Args:
+            tile_ids: Tile IDs to process.
+        """
         super().__init__(parent)
-        self._data = tile_data
+        self._tile_ids = tile_ids
         self._scanner = scanner
         self._sensor_type = sensor_type
+        self._data_epsg = data_epsg
         self._worker: Optional[_BathyWorker] = None
-        self._result: Optional[dict] = None
         self._water_surface_z: float = 0.0
         self._geotiff_surface: Optional[np.ndarray] = None
         self._geotiff_georef: Optional[dict] = None
-        self._per_point_ws: Optional[np.ndarray] = None
         self._crop_surface: Optional[np.ndarray] = None
         self._crop_georef: Optional[dict] = None
 
-        self.setWindowTitle("Bathymetry Processing")
+        n_tiles = len(tile_ids)
+        title = "Bathymetry Processing"
+        if n_tiles > 1:
+            title += f" ({n_tiles} tiles selected)"
+        self.setWindowTitle(title)
         self.setMinimumWidth(560)
         self._setup_ui()
-
-        if sensor_type == 'bathy' and len(tile_data.get("x", [])) > 0:
-            self._auto_detect_surface()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -427,19 +507,53 @@ class BathyDialog(QDialog):
         traj_layout.addWidget(traj_browse)
         sf.addRow("Trajectory:", traj_layout)
 
-        traj_cfg_layout = QHBoxLayout()
-        self._traj_sep_edit = QLineEdit()
-        self._traj_sep_edit.setPlaceholderText("sep (auto)")
-        self._traj_sep_edit.setMaximumWidth(60)
-        traj_cfg_layout.addWidget(QLabel("Sep:"))
-        traj_cfg_layout.addWidget(self._traj_sep_edit)
+        # Separator
+        traj_sep_row = QHBoxLayout()
+        self._traj_sep_combo = QComboBox()
+        self._traj_sep_combo.addItems(["Auto", "Comma (,)", "Semicolon (;)", "Tab", "Space", "Custom"])
+        self._traj_sep_combo.setCurrentText("Auto")
+        traj_sep_row.addWidget(QLabel("Separator:"))
+        traj_sep_row.addWidget(self._traj_sep_combo)
+        self._traj_custom_sep = QLineEdit()
+        self._traj_custom_sep.setPlaceholderText("custom")
+        self._traj_custom_sep.setMaximumWidth(60)
+        self._traj_custom_sep.setVisible(False)
+        self._traj_sep_combo.currentTextChanged.connect(self._on_traj_sep_changed)
+        traj_sep_row.addWidget(self._traj_custom_sep)
+        self._traj_has_header = QCheckBox("Header row")
+        traj_sep_row.addWidget(self._traj_has_header)
         self._traj_skip_spin = QSpinBox()
         self._traj_skip_spin.setRange(0, 1000)
         self._traj_skip_spin.setValue(0)
-        traj_cfg_layout.addWidget(QLabel("Skip:"))
-        traj_cfg_layout.addWidget(self._traj_skip_spin)
-        traj_cfg_layout.addStretch()
-        sf.addRow("Options:", traj_cfg_layout)
+        self._traj_skip_spin.setToolTip("Skip first N rows")
+        traj_sep_row.addWidget(QLabel("Skip:"))
+        traj_sep_row.addWidget(self._traj_skip_spin)
+        traj_sep_row.addStretch()
+        sf.addRow("", traj_sep_row)
+
+        # Column mapping
+        traj_col_row = QHBoxLayout()
+        self._traj_time_col = QComboBox()
+        self._traj_time_col.setMinimumWidth(60)
+        traj_col_row.addWidget(QLabel("Time:"))
+        traj_col_row.addWidget(self._traj_time_col)
+        self._traj_x_col = QComboBox()
+        traj_col_row.addWidget(QLabel("X:"))
+        traj_col_row.addWidget(self._traj_x_col)
+        self._traj_y_col = QComboBox()
+        traj_col_row.addWidget(QLabel("Y:"))
+        traj_col_row.addWidget(self._traj_y_col)
+        self._traj_z_col = QComboBox()
+        traj_col_row.addWidget(QLabel("Z:"))
+        traj_col_row.addWidget(self._traj_z_col)
+        traj_col_row.addStretch()
+        sf.addRow("Columns:", traj_col_row)
+
+        # Preview
+        self._traj_preview = QLabel("")
+        self._traj_preview.setWordWrap(True)
+        self._traj_preview.setMaximumHeight(50)
+        sf.addRow("Preview:", self._traj_preview)
 
         layout.addWidget(snells_group)
 
@@ -451,7 +565,7 @@ class BathyDialog(QDialog):
         self._ws_enabled = QCheckBox(
             "Remove water surface and near-surface ghost returns"
         )
-        self._ws_enabled.setChecked(True)
+        self._ws_enabled.setChecked(False)
         wf.addRow(self._ws_enabled)
         self._ws_tile_spin = QDoubleSpinBox()
         self._ws_tile_spin.setRange(10.0, 200.0)
@@ -470,7 +584,7 @@ class BathyDialog(QDialog):
         river_group = QGroupBox("3. River Corridor Crop")
         rf = QFormLayout(river_group)
         self._river_enabled = QCheckBox("Auto-crop to river corridor only")
-        self._river_enabled.setChecked(True)
+        self._river_enabled.setChecked(False)
         self._river_enabled.setToolTip(
             "Uses local Z roughness and intensity to distinguish "
             "water from land."
@@ -523,25 +637,108 @@ class BathyDialog(QDialog):
         btn_layout.addWidget(btn_box)
         layout.addLayout(btn_layout)
 
-    # ── Auto-detect water surface ──────────────────────────────────
-
-    def _auto_detect_surface(self):
-        """Auto-detect water surface Z from the point data."""
-        try:
-            _, _, _, z_mean = detect_water_surface_ransac(
-                self._data["x"], self._data["y"], self._data["z"],
-                percentile=90.0,
-            )
-            if z_mean != 0.0:
-                self._water_surface_z = z_mean
-                self._ws_z_spin.setValue(z_mean)
-                self._status.setText(
-                    f"Auto-detected water surface at Z={z_mean:.2f} m"
-                )
-        except Exception:
-            pass
-
     # ── Browse handlers ────────────────────────────────────────────
+
+    def _get_traj_separator(self) -> Optional[str]:
+        """Get the active trajectory separator. Returns None for auto-detect."""
+        label = self._traj_sep_combo.currentText()
+        if label == "Auto":
+            return None
+        if label == "Comma (,)":
+            return ","
+        if label == "Semicolon (;)":
+            return ";"
+        if label == "Tab":
+            return "\t"
+        if label == "Space":
+            return r"\s+"
+        return self._traj_custom_sep.text() or None
+
+    def _on_traj_sep_changed(self):
+        self._traj_custom_sep.setVisible(
+            self._traj_sep_combo.currentText() == "Custom"
+        )
+        if self._traj_path_edit.text():
+            self._parse_traj_preview(self._traj_path_edit.text())
+
+    def _parse_traj_preview(self, path: str):
+        """Parse first few lines of trajectory to populate column combos."""
+        sep = self._get_traj_separator()
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                lines = [l.rstrip("\n\r") for l in f.readlines()]
+        except Exception:
+            return
+
+        if not lines:
+            return
+
+        # Handle header
+        has_header = self._traj_has_header.isChecked()
+        first_line = lines[0]
+        if has_header and len(lines) > 1:
+            data_line = lines[1]
+        else:
+            data_line = first_line
+
+        # Split
+        if sep == " ":
+            parts = data_line.split()
+        elif sep is not None:
+            parts = data_line.split(sep)
+        else:
+            # Auto-detect
+            for s in [",", ";", "\t"]:
+                parts = data_line.split(s)
+                if len(parts) >= 4:
+                    break
+            else:
+                parts = data_line.split()
+
+        n_cols = len(parts)
+
+        # Populate column combos
+        for cb in (self._traj_time_col, self._traj_x_col,
+                    self._traj_y_col, self._traj_z_col):
+            cb.clear()
+        for i in range(n_cols):
+            label = f"Col {i}" if has_header else f"Col {i}: {parts[i][:12]}"
+            for cb in (self._traj_time_col, self._traj_x_col,
+                        self._traj_y_col, self._traj_z_col):
+                cb.addItem(label, i)
+
+        # Auto-detect from header names
+        if has_header:
+            header_parts = first_line.split() if sep in (None, " ") else first_line.split(sep if sep else None)
+            if sep == " ":
+                header_parts = first_line.split()
+            elif sep is not None:
+                header_parts = first_line.split(sep)
+            else:
+                header_parts = first_line.split()
+            for i, h in enumerate(header_parts):
+                low = h.strip().lower().strip('"').strip("'")
+                if low in ("time", "t", "gps_time", "gpstime", "timestamp"):
+                    self._traj_time_col.setCurrentIndex(i)
+                elif low in ("x", "easting", "east", "lon", "longitude"):
+                    self._traj_x_col.setCurrentIndex(i)
+                elif low in ("y", "northing", "north", "lat", "latitude"):
+                    self._traj_y_col.setCurrentIndex(i)
+                elif low in ("z", "elev", "elevation", "height", "alt", "altitude"):
+                    self._traj_z_col.setCurrentIndex(i)
+        else:
+            # Default: Col 0=time, Col 1=X, Col 2=Y, Col 3=Z
+            if n_cols >= 4:
+                self._traj_time_col.setCurrentIndex(0)
+                self._traj_x_col.setCurrentIndex(1)
+                self._traj_y_col.setCurrentIndex(2)
+                self._traj_z_col.setCurrentIndex(3)
+
+        # Preview
+        preview = "\n".join(lines[:3])
+        if len(lines) > 3:
+            preview += f"\n… ({len(lines)} lines)"
+        self._traj_preview.setText(preview)
 
     def _on_browse_trajectory(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -550,6 +747,7 @@ class BathyDialog(QDialog):
         )
         if path:
             self._traj_path_edit.setText(path)
+            self._parse_traj_preview(path)
 
     def _on_browse_geotiff(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -564,30 +762,18 @@ class BathyDialog(QDialog):
             self._geotiff_georef = georef
             self._geotiff_path_edit.setText(path)
 
-            # Sample at point locations for info display
-            ws_samples = sample_geotiff_at_points(
-                surface, georef,
-                self._data["x"], self._data["y"],
-                fill_value=np.nan,
+            geotiff_epsg = georef.get("epsg")
+            info = (
+                f"Loaded: {surface.shape[1]}×{surface.shape[0]} px, "
+                f"range [{np.nanmin(surface):.2f}, {np.nanmax(surface):.2f}] m"
             )
-            valid = ~np.isnan(ws_samples)
-            if valid.any():
-                self._geotiff_info.setText(
-                    f"Loaded: {surface.shape[1]}×{surface.shape[0]} px, "
-                    f"CRS: {georef['crs'][:60]}…\n"
-                    f"Water surface range: [{np.nanmin(surface):.2f}, "
-                    f"{np.nanmax(surface):.2f}] m\n"
-                    f"Points in raster: {valid.sum():,} / {len(ws_samples):,} "
-                    f"({valid.sum()/max(len(ws_samples),1)*100:.0f}%)"
-                )
-                self._geotiff_info.setVisible(True)
-                self._ws_geotiff_radio.setChecked(True)
-            else:
-                self._geotiff_info.setText(
-                    "⚠ No points fall within the GeoTIFF extent. "
-                    "Check CRS match."
-                )
-                self._geotiff_info.setVisible(True)
+            if geotiff_epsg:
+                info += f", EPSG:{geotiff_epsg}"
+            if self._data_epsg and geotiff_epsg and self._data_epsg != geotiff_epsg:
+                info += f"\n⚠ CRS mismatch: GeoTIFF EPSG:{geotiff_epsg} vs data EPSG:{self._data_epsg}"
+            self._geotiff_info.setText(info)
+            self._geotiff_info.setVisible(True)
+            self._ws_geotiff_radio.setChecked(True)
         except Exception as exc:
             self._geotiff_info.setText(f"⚠ Error loading GeoTIFF: {exc}")
             self._geotiff_info.setVisible(True)
@@ -607,17 +793,39 @@ class BathyDialog(QDialog):
             self._crop_surface = surface
             self._crop_georef = georef
             self._crop_geotiff_edit.setText(path)
-            self._crop_geotiff_info.setText(
-                f"Loaded: {surface.shape[1]}×{surface.shape[0]} px, "
-                f"range [{np.nanmin(surface):.2f}, {np.nanmax(surface):.2f}] m, "
-                f"CRS: {georef['crs'][:50]}…"
-            )
+
+            # CRS comparison
+            geotiff_epsg = georef.get("epsg")
+            crs_info = f"Loaded: {surface.shape[1]}×{surface.shape[0]} px, "
+            crs_info += f"range [{np.nanmin(surface):.2f}, {np.nanmax(surface):.2f}] m, "
+            crs_info += f"CRS: {georef['crs'][:60]}"
+            if geotiff_epsg:
+                crs_info += f" (EPSG:{geotiff_epsg})"
+            if self._data_epsg and geotiff_epsg and self._data_epsg != geotiff_epsg:
+                crs_info += (
+                    f"\n⚠ WARNING: GeoTIFF EPSG:{geotiff_epsg} differs from "
+                    f"data EPSG:{self._data_epsg} — crop will likely fail! "
+                    "Reproject the GeoTIFF to match the data CRS."
+                )
+            elif self._data_epsg and geotiff_epsg:
+                crs_info += " ✓ CRS matches data"
+            elif not geotiff_epsg:
+                crs_info += "\n⚠ Could not determine GeoTIFF EPSG"
+            self._crop_geotiff_info.setText(crs_info)
             self._crop_geotiff_info.setVisible(True)
         except Exception as exc:
             self._crop_geotiff_info.setText(f"⚠ Error: {exc}")
             self._crop_geotiff_info.setVisible(True)
 
     # ── Run ────────────────────────────────────────────────────────
+
+    def _load_tile_for_batch(self, tile_id: str):
+        """Load tile data for batch processing. Called from worker thread."""
+        # We need access to the tile manager — get it from the parent
+        parent = self.parent()
+        if parent and hasattr(parent, '_tm'):
+            return parent._tm.load_tile_points_full(tile_id)
+        return None
 
     def _on_run(self):
         steps = []
@@ -631,6 +839,7 @@ class BathyDialog(QDialog):
                 "georef": self._crop_georef,
                 "tolerance_above_cm": self._crop_tol_spin.value(),
                 "extrapolate_m": self._crop_extrap_spin.value(),
+                "data_epsg": self._data_epsg,
             })
         # Step 1: Snell's refraction
         if self._snells_enabled.isChecked():
@@ -638,28 +847,33 @@ class BathyDialog(QDialog):
             if (self._ws_geotiff_radio.isChecked()
                     and self._geotiff_surface is not None
                     and self._geotiff_georef is not None):
-                # Sample GeoTIFF at point locations
-                self._status.setText("Sampling water surface GeoTIFF…")
-                ws_z = sample_geotiff_at_points(
-                    self._geotiff_surface,
-                    self._geotiff_georef,
-                    self._data["x"],
-                    self._data["y"],
-                    fill_value=self._ws_z_spin.value(),  # fallback
-                )
+                # Pass GeoTIFF for on-demand per-tile sampling
+                ws_z = None  # sampled per-tile during processing
+                ws_geotiff_surface = self._geotiff_surface
+                ws_geotiff_georef = self._geotiff_georef
+                ws_fallback = self._ws_z_spin.value()
             else:
                 ws_z = self._ws_z_spin.value()
+                ws_geotiff_surface = None
+                ws_geotiff_georef = None
+                ws_fallback = 0.0
 
             steps.append({
                 "name": "snells",
                 "water_surface_z": ws_z,
+                "geotiff_surface": ws_geotiff_surface,
+                "geotiff_georef": ws_geotiff_georef,
+                "ws_fallback": ws_fallback,
                 "n_water": self._n_water_spin.value(),
                 "use_trajectory": bool(self._traj_path_edit.text().strip()),
                 "trajectory_path": self._traj_path_edit.text().strip(),
-                "separator": self._traj_sep_edit.text().strip() or None,
+                "separator": self._get_traj_separator(),
                 "skip_rows": self._traj_skip_spin.value(),
-                "has_header": False,
-                "time_col": 0, "x_col": 1, "y_col": 2, "z_col": 3,
+                "has_header": self._traj_has_header.isChecked(),
+                "time_col": self._traj_time_col.currentData() or 0,
+                "x_col": self._traj_x_col.currentData() or 1,
+                "y_col": self._traj_y_col.currentData() or 2,
+                "z_col": self._traj_z_col.currentData() or 3,
             })
         if self._ws_enabled.isChecked():
             steps.append({
@@ -680,36 +894,54 @@ class BathyDialog(QDialog):
             return
 
         self._run_btn.setEnabled(False)
-        self._status.setText("Processing...")
-        self._progress.setValue(0)
+        self._ok_btn.setEnabled(False)
 
-        self._worker = _BathyWorker(self._data, steps, parent=self)
-        self._worker.progress.connect(self._on_progress)
-        self._worker.finished_all.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
-        self._worker.start()
+        # ── Get workers setting ────────────────────────────────────
+        from ..gui.settings_dialog import load_general_settings
+        settings = load_general_settings()
+        workers = settings.get("bathy_workers", 4)
 
-    def _on_progress(self, msg: str, pct: float):
+        # ── Capture tile manager reference for thread-safe loading ─
+        parent = self.parent()
+        tm = parent._tm if parent and hasattr(parent, '_tm') else None
+        if tm is None:
+            self._status.setText("No tile manager available")
+            self._run_btn.setEnabled(True)
+            self._ok_btn.setEnabled(True)
+            return
+
+        def _loader(tile_id: str):
+            return tm.load_tile_points_full(tile_id)
+
+        # ── Launch parallel worker ─────────────────────────────────
+        self._bathy_worker = _BathyWorker(
+            self._tile_ids, steps, _loader, max_workers=workers, parent=self,
+        )
+        self._bathy_worker.progress.connect(self._on_bathy_progress)
+        self._bathy_worker.tile_done.connect(self.tile_save_requested.emit)
+        self._bathy_worker.finished_all.connect(self._on_bathy_finished)
+        self._bathy_worker.error.connect(self._on_bathy_error)
+        self._bathy_worker.start()
+
+    def _on_bathy_progress(self, msg: str, pct: float):
         self._status.setText(msg)
         self._progress.setValue(int(pct))
 
-    def _on_finished(self, result: dict):
-        self._result = result
-        n = len(result["x"])
-        self._status.setText(f"Done: {n:,} points remaining")
+    def _on_bathy_finished(self, n_processed: int):
+        self._status.setText(f"Done: {n_processed}/{len(self._tile_ids)} tiles")
         self._progress.setValue(100)
         self._run_btn.setEnabled(True)
         self._ok_btn.setEnabled(True)
+        self.bathy_applied.emit()
 
-    def _on_error(self, msg: str):
+    def _on_bathy_error(self, msg: str):
         self._status.setText(f"Error: {msg}")
         self._run_btn.setEnabled(True)
+        self._ok_btn.setEnabled(True)
 
     def _on_accept(self):
-        if self._result is not None:
-            self.bathy_applied.emit(self._result)
         self.accept()
 
     @property
-    def result(self) -> Optional[dict]:
-        return self._result
+    def results(self) -> list:
+        return []
