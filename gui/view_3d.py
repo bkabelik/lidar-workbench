@@ -182,6 +182,10 @@ class View3D(QWidget):
         self._picked_pt: Optional[np.ndarray] = None  # (3,) xyz
         self._picked_geom: Optional[str] = None
 
+        # Focus/GCP marker (placed by focus_on_point, distinct from pick marker)
+        self._marker_pt: Optional[np.ndarray] = None  # (3,) local xyz
+        self._marker_geom: Optional[str] = None
+
         # Point Info tool state (controlled externally)
         self._point_info_active: bool = False
 
@@ -299,6 +303,35 @@ class View3D(QWidget):
         self._fit_camera(xs_local, ys_local, zs_local)
         self._build_and_render(xs_local, ys_local, zs_local, np.asarray(colors, dtype=np.float64))
 
+    def focus_on_point(self, world_x: float, world_y: float, world_z: float) -> None:
+        """
+        Centre the camera on a world-space point and mark it with a sphere.
+
+        The point is converted to the local (offset) frame of the currently
+        loaded cloud, so it must be called after the cloud containing the
+        point has been loaded.  A no-op when no scene/geometry is present.
+        """
+        if self._point_data is None or self._scene is None:
+            return
+        if self._world_offset is not None:
+            local = np.array([
+                world_x - self._world_offset[0],
+                world_y - self._world_offset[1],
+                world_z - self._world_offset[2],
+            ])
+        else:
+            local = np.array([world_x, world_y, world_z])
+
+        # Move the orbit centre onto the point, keeping the current viewing
+        # direction and distance.
+        offset = self._cam_eye - self._cam_center
+        self._cam_center = local
+        self._cam_eye = local + offset
+
+        self._marker_pt = local
+        self._show_focus_marker()
+        self._render()
+
     def set_colour_mode(self, mode: str):
         if mode not in self.COLOUR_MODES and mode != "_custom":
             return
@@ -388,6 +421,8 @@ class View3D(QWidget):
         self._picked_pt = None
         self._picked_geom = None
         self._highlight_geom = None
+        self._marker_pt = None
+        self._marker_geom = None
         self._world_offset = None
         # Don't touch the Open3D scene — clear_geometry can segfault if
         # the renderer is in an inconsistent state. _build_and_render
@@ -398,6 +433,33 @@ class View3D(QWidget):
     @property
     def has_geometry(self) -> bool:
         return self._has_geometry
+
+    def world_bounds(self) -> Optional[Tuple[float, float, float, float, float, float]]:
+        """Return ``(min_x, min_y, min_z, max_x, max_y, max_z)`` in world
+        coordinates, or ``None`` when no point cloud is loaded."""
+        if self._point_data is None or self._world_offset is None:
+            return None
+        d = self._point_data
+        ox, oy, oz = self._world_offset
+        return (
+            float(d["x"].min()) + ox,
+            float(d["y"].min()) + oy,
+            float(d["z"].min()) + oz,
+            float(d["x"].max()) + ox,
+            float(d["y"].max()) + oy,
+            float(d["z"].max()) + oz,
+        )
+
+    def contains_world_xy(self, world_x: float, world_y: float,
+                          margin: float = 0.0) -> bool:
+        """Whether ``(world_x, world_y)`` lies inside the loaded cloud's
+        horizontal bounds (optionally expanded by *margin* metres)."""
+        b = self.world_bounds()
+        if b is None:
+            return False
+        min_x, min_y, _min_z, max_x, max_y, _max_z = b
+        return (min_x - margin) <= world_x <= (max_x + margin) and \
+               (min_y - margin) <= world_y <= (max_y + margin)
 
     # ── internals ──────────────────────────────────────────────────
 
@@ -481,6 +543,7 @@ class View3D(QWidget):
         self._safe_clear_scene()
         self._highlight_geom = None
         self._picked_geom = None
+        self._marker_geom = None
 
         pts = np.column_stack((xs, ys, zs))
         pcd = o3d.geometry.PointCloud()
@@ -762,3 +825,28 @@ class View3D(QWidget):
         mat.base_color = [1.0, 0.15, 0.15, 1.0]
         self._picked_geom = "_picked_marker"
         self._scene.add_geometry(self._picked_geom, sphere, mat)
+
+    def _show_focus_marker(self):
+        """Add a bright sphere at the focus/GCP point location."""
+        if self._scene is None:
+            return
+        # Remove old focus marker
+        if self._marker_geom is not None:
+            self._scene.remove_geometry(self._marker_geom)
+            self._marker_geom = None
+        if self._marker_pt is None:
+            return
+
+        # Size the marker relative to the camera distance so it stays clearly
+        # visible at any zoom level (min 0.2 m for very close zooms).
+        cam_dist = float(np.linalg.norm(self._cam_eye - self._cam_center))
+        radius = max(cam_dist * 0.008, 0.2)
+
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+        sphere.translate(self._marker_pt)
+        sphere.paint_uniform_color([1.0, 0.8, 0.0])  # bright yellow
+        mat = o3d_render.MaterialRecord()
+        mat.shader = "defaultUnlit"
+        mat.base_color = [1.0, 0.8, 0.0, 1.0]
+        self._marker_geom = "_focus_marker"
+        self._scene.add_geometry(self._marker_geom, sphere, mat)

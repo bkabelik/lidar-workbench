@@ -21,6 +21,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 
 from PySide6.QtCore import Qt, Signal, QThread
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -117,11 +118,13 @@ class _GroundControlWorker(QThread):
             class_mask = np.ones(n_pts, dtype=bool)
 
         if not class_mask.any():
+            checked = ", ".join(str(c) for c in sorted(classes))
             for name, gx, gy, gz in points:
                 results.append({
                     "name": name, "x": gx, "y": gy, "z_in": gz,
                     "z_cloud": None, "dz": None,
-                    "n_nearby": 0, "warning": "No points of selected classes",
+                    "n_nearby": 0,
+                    "warning": f"No points of classes {checked} in loaded tiles",
                 })
             self.finished_gcp.emit(results)
             return
@@ -239,6 +242,7 @@ class _GroundControlWorker(QThread):
                 "shift_mag": float(np.sqrt(dx*dx + dy*dy + dz*dz)),
                 "centroid_x": float(centroid[0]),
                 "centroid_y": float(centroid[1]),
+                "centroid_z": float(centroid[2]),
             })
 
         self.finished_roofs.emit(results)
@@ -306,13 +310,15 @@ class GroundControlDialog(QDialog):
         Emitted when the user clicks *Apply Shift*, carrying the
         signed (dx, dy, dz) shift in metres to add to the point cloud.
         For GCP (Z-only), dx=0, dy=0.
-    visualize_point(float, float, str):
+    visualize_point(float, float, float, str):
         Emitted when the user clicks *Go To* in the visual-check
-        section: *(x, y, label)*.
+        section: *(x, y, z, label)*.  ``z`` is the control element's
+        elevation (GCP input Z or surface centroid Z) used to place the
+        marker in the 3-D view.
     """
 
     shift_applied = Signal(float, float, float)
-    visualize_point = Signal(float, float, str)
+    visualize_point = Signal(float, float, float, str)
 
     SEPARATORS = {
         "Comma (,)": ",",
@@ -321,11 +327,18 @@ class GroundControlDialog(QDialog):
         "Space": " ",
     }
 
-    def __init__(self, tile_data: dict, parent=None, data_epsg: Optional[int] = None):
+    def __init__(self, tile_data: dict, parent=None, data_epsg: Optional[int] = None,
+                 tile_ids: Optional[list] = None,
+                 tile_manager=None, database=None):
         super().__init__(parent)
         self._data = tile_data
         self._data_epsg = data_epsg  # EPSG code of the point cloud data
         self._worker: Optional[_GroundControlWorker] = None
+
+        # Multi-tile support
+        self._tile_ids: list = tile_ids or []
+        self._tm = tile_manager       # TileManager for loading tile data
+        self._db = database           # Database for bbox queries
 
         # GCP state
         self._gcp_points: List[Tuple[str, float, float, float]] = []
@@ -346,6 +359,10 @@ class GroundControlDialog(QDialog):
         self.setMinimumWidth(700)
         self.setMinimumHeight(600)
         self._setup_ui()
+
+        # Show tile info if multi-tile mode
+        if self._tile_ids:
+            self._status.setText(f"Selected tiles: {len(self._tile_ids)}")
 
     # ── UI construction ──────────────────────────────────────────────
 
@@ -459,7 +476,7 @@ class GroundControlDialog(QDialog):
         crs_row = QHBoxLayout()
         crs_row.addWidget(QLabel("GCP EPSG:"))
         self._gcp_epsg_spin = QSpinBox()
-        self._gcp_epsg_spin.setRange(1000, 99999)
+        self._gcp_epsg_spin.setRange(0, 99999)
         self._gcp_epsg_spin.setSpecialValueText("Auto (same as data)")
         self._gcp_epsg_spin.setValue(0)
         self._gcp_epsg_spin.setToolTip(
@@ -508,12 +525,16 @@ class GroundControlDialog(QDialog):
             item.setData(Qt.UserRole, code)
             item.setCheckState(Qt.Unchecked)
             self._gcp_class_list.addItem(item)
-        # Default: check Ground (2) and Building (6)
+        # Default: check Ground (2), Unclassified (1), Created (0), Building (6)
         for i in range(self._gcp_class_list.count()):
             code = self._gcp_class_list.item(i).data(Qt.UserRole)
-            if code in (2, 6):
+            if code in (0, 1, 2, 6):
                 self._gcp_class_list.item(i).setCheckState(Qt.Checked)
         cls_layout.addWidget(self._gcp_class_list)
+        cls_layout.addWidget(QLabel(
+            "<i>Only points matching checked classes are compared against GCPs. "
+            "If your data is unclassified, check class 0 or 1.</i>"
+        ))
         layout.addWidget(cls_group)
 
         # ── Parameters ──
@@ -1039,11 +1060,14 @@ class GroundControlDialog(QDialog):
     # ── Run GCP ──────────────────────────────────────────────────────
 
     def _on_run_gcp(self):
-        if not self._gcp_points:
-            return
-
         # Re-parse column mapping from current combo state
         self._reparse_current_gcp()
+
+        if not self._gcp_points:
+            QMessageBox.warning(self, "No GCP Points",
+                                "No valid GCP points could be parsed from the CSV.\n"
+                                "Check the file, separator, and column mapping.")
+            return
 
         # Get GCP points with CRS transform if needed
         gcp_points = self._get_gcp_coords_to_use()
@@ -1059,6 +1083,19 @@ class GroundControlDialog(QDialog):
                                 "Please select at least one ASPRS class to compare against.")
             return
 
+        # ── Load data: multi-tile or single-tile ──
+        data = self._load_data_for_gcps(gcp_points)
+
+        # Validate that we actually have point data to work with
+        if not data or "x" not in data or len(data.get("x", [])) == 0:
+            QMessageBox.warning(
+                self, "No Point Data",
+                "No point cloud data could be loaded for the selected GCP locations.\n"
+                "Check that the GCP coordinates are in the same CRS as the tiles,\n"
+                "and that the selected tiles actually contain points.",
+            )
+            return
+
         self._gcp_run_btn.setEnabled(False)
         self._status.setText("Calculating elevation differences…")
         self._progress.setVisible(True)
@@ -1070,11 +1107,63 @@ class GroundControlDialog(QDialog):
             "radius": self._gcp_radius_spin.value(),
         }
 
-        self._worker = _GroundControlWorker(self._data, "gcp", params, parent=self)
+        self._worker = _GroundControlWorker(data, "gcp", params, parent=self)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_gcp.connect(self._on_gcp_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
+
+    def _load_data_for_gcps(self, gcp_points: list) -> dict:
+        """Load point data from tiles that contain any of the given GCPs.
+
+        Queries the database for ALL tiles whose bbox overlaps any GCP
+        point — not limited to the tiles currently selected in the tile
+        list.  Returns an empty dict when no tile data could be loaded;
+        the caller is responsible for showing an appropriate message.
+        """
+        if not self._db or not self._tm:
+            return self._data  # fallback to whatever was passed at construction
+
+        if not gcp_points:
+            return {}
+
+        # ── Query DB for all tiles covering any GCP ──
+        tiles_with_gcps: set = set()
+        for _name, gx, gy, _gz in gcp_points:
+            matches = self._db.get_tiles_in_bbox(gx, gy, gx, gy)
+            for info in matches:
+                tid = info.get("id")
+                if tid:
+                    tiles_with_gcps.add(tid)
+
+        if not tiles_with_gcps:
+            return {}  # caller validates and shows appropriate message
+
+        # ── Load and merge data ──
+        self._status.setText(
+            f"Loading {len(tiles_with_gcps)} tile(s) containing GCPs…"
+        )
+
+        xs_list, ys_list, zs_list, cls_list = [], [], [], []
+        for tid in sorted(tiles_with_gcps):
+            td = self._tm.load_tile_points_full(tid)
+            if td is None:
+                continue
+            xs_list.append(np.asarray(td["x"], dtype=np.float64))
+            ys_list.append(np.asarray(td["y"], dtype=np.float64))
+            zs_list.append(np.asarray(td["z"], dtype=np.float64))
+            if "classification" in td:
+                cls_list.append(np.asarray(td["classification"], dtype=np.int32))
+
+        if not xs_list:
+            return {}  # caller validates and shows appropriate message
+
+        return {
+            "x": np.concatenate(xs_list),
+            "y": np.concatenate(ys_list),
+            "z": np.concatenate(zs_list),
+            "classification": np.concatenate(cls_list) if cls_list else None,
+        }
 
     def _reparse_current_gcp(self):
         """Re-read points using current column mapping (in case user changed)."""
@@ -1100,16 +1189,48 @@ class GroundControlDialog(QDialog):
         if not parsed_lines:
             return
 
+        # ── Auto-detect header vs data (same logic as _parse_gcp_csv) ──
+        first_line_is_data = self._line_looks_like_data(parsed_lines[0])
+        if first_line_is_data and self._gcp_has_header.isChecked():
+            self._gcp_has_header.setChecked(False)
+            has_header = False
+        else:
+            has_header = self._gcp_has_header.isChecked()
+
         # ── Header handling ──
-        has_header = self._gcp_has_header.isChecked()
         if has_header:
+            header = parsed_lines[0]
             data_lines = parsed_lines[1:]
         else:
-            data_lines = parsed_lines  # all lines are data
+            n_cols = max(len(fl) for fl in parsed_lines)
+            header = [f"Col {i}" for i in range(n_cols)]
+            data_lines = parsed_lines
+
+        # Re-populate column combos so indices stay valid for this file
+        self._populate_column_combos(
+            header,
+            self._gcp_name_col, self._gcp_x_col,
+            self._gcp_y_col, self._gcp_z_col,
+        )
+
+        # If auto-detection failed (no X/Y/Z columns matched), use positional defaults
+        if self._gcp_x_col.currentData() is None or self._gcp_x_col.currentData() < 0:
+            n_cols = len(header)
+            if n_cols >= 4:
+                self._gcp_name_col.setCurrentIndex(1)  # Col 0 → Name
+                self._gcp_x_col.setCurrentIndex(2)     # Col 1 → X
+                self._gcp_y_col.setCurrentIndex(3)     # Col 2 → Y
+                self._gcp_z_col.setCurrentIndex(4)     # Col 3 → Z
+            elif n_cols == 3:
+                self._gcp_x_col.setCurrentIndex(1)     # Col 0 → X
+                self._gcp_y_col.setCurrentIndex(2)     # Col 1 → Y
+                self._gcp_z_col.setCurrentIndex(3)     # Col 2 → Z
 
         self._gcp_points = []
         auto_name = 0
         for row in data_lines:
+            if not row or all(c.strip() == "" for c in row):
+                continue
             name_idx = self._gcp_name_col.currentData()
             x_idx = self._gcp_x_col.currentData()
             y_idx = self._gcp_y_col.currentData()
@@ -1144,9 +1265,25 @@ class GroundControlDialog(QDialog):
             self._gcp_table.setItem(row, 3, QTableWidgetItem(f"{r['z_in']:.3f}"))
             if r["z_cloud"] is not None:
                 self._gcp_table.setItem(row, 4, QTableWidgetItem(f"{r['z_cloud']:.3f}"))
-                dz_str = f"{r['dz']:+.3f}"
-                self._gcp_table.setItem(row, 5, QTableWidgetItem(dz_str))
-                dzs.append(r["dz"])
+                dz = r["dz"]
+                dz_str = f"{dz:+.3f}"
+                dz_item = QTableWidgetItem(dz_str)
+                if abs(dz) > 20.0:
+                    dz_item.setForeground(QColor("#c0392b"))  # red
+                    dz_item.setText(f"{dz_str} ⚠ CRS/datum?")
+                    dz_item.setToolTip(
+                        "ΔZ is implausibly large — the GCP's X/Y or Z is "
+                        "likely in a different CRS/vertical datum than the "
+                        "point cloud. Check the GCP EPSG and the Z column."
+                    )
+                elif abs(dz) > 5.0:
+                    dz_item.setForeground(QColor("#c09853"))  # amber
+                    dz_item.setToolTip(
+                        "ΔZ is larger than expected — verify the GCP position "
+                        "and elevation against the point cloud."
+                    )
+                self._gcp_table.setItem(row, 5, dz_item)
+                dzs.append(dz)
             else:
                 self._gcp_table.setItem(row, 4, QTableWidgetItem("N/A"))
                 self._gcp_table.setItem(row, 5, QTableWidgetItem(r.get("warning", "N/A")))
@@ -1160,14 +1297,27 @@ class GroundControlDialog(QDialog):
             mean_dz = float(np.mean(dz_arr))
             std_dz = float(np.std(dz_arr))
             rms_dz = float(np.sqrt(np.mean(dz_arr ** 2)))
-            self._gcp_stats.setText(
+            stats_txt = (
                 f"<b>Statistics ({len(dzs)} points):</b>  "
                 f"Median shift = {median_dz:+.3f} m  |  "
                 f"Average shift = {mean_dz:+.3f} m  |  "
                 f"StdDev = {std_dz:.3f} m  |  "
                 f"RMS = {rms_dz:.3f} m"
             )
-            self._gcp_shift = -mean_dz  # shift = opposite of mean difference
+            max_abs_dz = float(np.max(np.abs(dz_arr)))
+            if max_abs_dz > 20.0:
+                stats_txt += (
+                    f"<br><span style='color:#c09853;'>"
+                    f"⚠ Max |ΔZ| = {max_abs_dz:.1f} m — check that the GCP "
+                    f"CRS/datum matches the point cloud.</span>"
+                )
+            self._gcp_stats.setText(stats_txt)
+
+            # The shift to apply equals the median ΔZ (GCP elevation minus
+            # point-cloud elevation). Median is used (not mean) so that the
+            # occasional wildly-off GCP — e.g. a CRS/datum mismatch — cannot
+            # drag the applied shift by hundreds of metres.
+            self._gcp_shift = median_dz
             self._gcp_apply_btn.setEnabled(True)
             self._gcp_apply_btn.setText(
                 f"⬆ Apply Z Shift ({self._gcp_shift:+.3f} m) to Current Tile"
@@ -1184,9 +1334,34 @@ class GroundControlDialog(QDialog):
     # ── Run Roofs ────────────────────────────────────────────────────
 
     def _on_run_roofs(self):
-        if not self._roof_surfaces:
-            return
         self._reparse_current_roofs()
+
+        if not self._roof_surfaces:
+            QMessageBox.warning(self, "No Roof Surfaces",
+                                "No valid roof surfaces could be parsed from the CSV.\n"
+                                "Check the file, separator, and column mapping.")
+            return
+
+        # Load point data — roofs pass centroid of each surface
+        centroids = []
+        for sid, verts in self._roof_surfaces:
+            if not verts:
+                continue
+            xs = [v[0] for v in verts]
+            ys = [v[1] for v in verts]
+            zs = [v[2] for v in verts]
+            centroids.append((sid, sum(xs)/len(xs), sum(ys)/len(ys), sum(zs)/len(zs)))
+
+        data = self._load_data_for_gcps(centroids)
+
+        if not data or "x" not in data or len(data.get("x", [])) == 0:
+            QMessageBox.warning(
+                self, "No Point Data",
+                "No point cloud data could be loaded for the selected roof locations.\n"
+                "Check that the coordinates are in the same CRS as the tiles,\n"
+                "and that the selected tiles actually contain points.",
+            )
+            return
 
         self._roof_run_btn.setEnabled(False)
         self._status.setText("Calculating surface offsets…")
@@ -1197,7 +1372,7 @@ class GroundControlDialog(QDialog):
             "surfaces": self._roof_surfaces,
             "radius": self._roof_radius_spin.value(),
         }
-        self._worker = _GroundControlWorker(self._data, "roofs", params, parent=self)
+        self._worker = _GroundControlWorker(data, "roofs", params, parent=self)
         self._worker.progress.connect(self._on_progress)
         self._worker.finished_roofs.connect(self._on_roofs_finished)
         self._worker.error.connect(self._on_error)
@@ -1397,11 +1572,16 @@ class GroundControlDialog(QDialog):
         item = items[self._vis_index]
         if self._vis_mode == "gcp":
             x, y = item.get("x", 0), item.get("y", 0)
-            self.visualize_point.emit(x, y, item.get("name", "GCP"))
+            z = item.get("z_in")
+            if z is None:
+                z = item.get("z_cloud")
+            self.visualize_point.emit(x, y, z if z is not None else 0.0,
+                                      item.get("name", "GCP"))
         else:
             x = item.get("centroid_x", 0)
             y = item.get("centroid_y", 0)
-            self.visualize_point.emit(x, y, item.get("name", "Surface"))
+            z = item.get("centroid_z", 0)
+            self.visualize_point.emit(x, y, z, item.get("name", "Surface"))
 
     # ── Progress / error slots ───────────────────────────────────────
 

@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMenu,
@@ -37,7 +38,8 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import (
-    APP_NAME, APP_VERSION, ASPRS_CLASS_COLORS, ASPRS_CLASS_NAMES,
+    APP_DESCRIPTION, APP_NAME, APP_ORG, APP_VERSION, APP_WEBSITE,
+    ASPRS_CLASS_COLORS, ASPRS_CLASS_NAMES,
     DEFAULT_PROFILE_WIDTH_M, QCStatus, TileStatus,
 )
 from ..database import Database
@@ -106,6 +108,9 @@ class MainWindow(QMainWindow):
 
         # Keep preview dialog alive (prevent GC of Python wrapper)
         self._preview_dlg: Optional[PreviewDialog] = None
+
+        # Keep ground-control dialog alive (non-modal, prevent GC of wrapper)
+        self._ground_control_dlg: Optional[GroundControlDialog] = None
 
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.setMinimumSize(1200, 700)
@@ -259,6 +264,17 @@ class MainWindow(QMainWindow):
 
         # ----- Help menu -----
         help_menu = menu_bar.addMenu("&Help")
+
+        docs_action = QAction("&Documentation…", self)
+        docs_action.setShortcut(QKeySequence("F1"))
+        docs_action.triggered.connect(self._on_documentation)
+        help_menu.addAction(docs_action)
+
+        help_menu.addSeparator()
+
+        website_action = QAction("Kabelik &Website", self)
+        website_action.triggered.connect(self._on_website)
+        help_menu.addAction(website_action)
 
         about_action = QAction("&About", self)
         about_action.triggered.connect(self._on_about)
@@ -522,13 +538,26 @@ class MainWindow(QMainWindow):
         )
         if not directory:
             return
+
+        # Ask for project name
+        name, ok = QInputDialog.getText(
+            self, "Project Name",
+            "Enter a name for the project:",
+            text="New Project",
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        # Sanitise: replace path separators with dashes
+        safe_name = name.replace("/", "-").replace("\\", "-")
         try:
-            proj_dir = Path(directory) / "lidar_project"
-            self._pm.create(proj_dir, name="New Project")
+            proj_dir = Path(directory) / safe_name
+            self._pm.create(proj_dir, name=name)
             self._sync_db()
             self._refresh_tile_list()
             self._add_recent_project(str(proj_dir))
-            self.set_status(f"Created project in {directory}")
+            self.set_status(f"Created project '{name}' in {directory}")
         except Exception as exc:
             logger.error("Failed to create project: %s", exc, exc_info=True)
             traceback.print_exc()
@@ -731,6 +760,16 @@ class MainWindow(QMainWindow):
         def _subset(d: dict, mask: np.ndarray) -> dict:
             return {k: v[mask] for k, v in d.items() if isinstance(v, np.ndarray) and len(v) == n_total}
 
+        def _subset_extra_dims(d: dict, mask: np.ndarray) -> Optional[dict]:
+            ed = d.get("extra_dims")
+            if not ed:
+                return None
+            return {
+                k: v[mask]
+                for k, v in ed.items()
+                if isinstance(v, np.ndarray) and len(v) == n_total
+            }
+
         # ── Save noise points to tiles/noise/{tile_id}_noise.las ─────
         noise_dir = tiles_dir / "noise"
         noise_dir.mkdir(parents=True, exist_ok=True)
@@ -759,6 +798,7 @@ class MainWindow(QMainWindow):
             withhelds=noise_data.get("withheld"),
             overlaps=noise_data.get("overlap"),
             header_template=header_template,
+            extra_dims=_subset_extra_dims(data, ~keep),
         )
         logger.info("Noise file saved: %s (%d points)", noise_path, n_noise)
 
@@ -813,6 +853,7 @@ class MainWindow(QMainWindow):
             withhelds=keep_data.get("withheld"),
             overlaps=keep_data.get("overlap"),
             header_template=header_template,
+            extra_dims=_subset_extra_dims(data, keep),
         )
 
         # Update tile status
@@ -963,6 +1004,7 @@ class MainWindow(QMainWindow):
                 withhelds=full_data.get("withheld"),
                 overlaps=full_data.get("overlap"),
                 header_template=header_tmpl,
+                extra_dims=full_data.get("extra_dims"),
             )
             self._tm.update_tile_status(self._editor.tile_id, TileStatus.EDITED)
 
@@ -1034,7 +1076,7 @@ class MainWindow(QMainWindow):
         with laspy.open(las_path) as reader:
             extra_dims = []
             try:
-                extra_dims = list(reader.header.extra_dimensions)
+                extra_dims = list(reader.header.point_format.extra_dimensions)
             except AttributeError:
                 pass
             header_template = {
@@ -1069,6 +1111,7 @@ class MainWindow(QMainWindow):
             withhelds=result.get("withheld"),
             overlaps=result.get("overlap"),
             header_template=header_template,
+            extra_dims=result.get("extra_dims"),
         )
 
         new_count = len(result["x"])
@@ -1078,24 +1121,43 @@ class MainWindow(QMainWindow):
         self._tile_list_widget.update_tile_status(tile_id, TileStatus.EDITED)
 
     def _on_ground_control(self) -> None:
-        """Open the Ground Control dialog for the currently open tile."""
-        if self._editor.tile_id is None:
-            QMessageBox.information(self, "No Tile Open",
-                                    "Please open a tile first (double-click in tile list).")
+        """Open the Ground Control dialog for selected tiles."""
+        tile_ids = self._tile_list_widget.get_selected_tile_ids()
+        if not tile_ids:
+            tile_ids = [self._editor.tile_id] if self._editor.tile_id else []
+
+        if not tile_ids:
+            QMessageBox.information(self, "No Tiles",
+                                    "Please select tiles in the tile list or open a tile first.")
             return
 
-        data = self._tm.load_tile_points_full(self._editor.tile_id)
-        if data is None:
-            return
+        # Determine a representative EPSG from the first tile with CRS info
+        data_epsg = None
+        for tid in tile_ids:
+            info = self._db.get_tile(tid)
+            if info and info.get("crs_epsg"):
+                data_epsg = info.get("crs_epsg")
+                break
 
-        # Get CRS info for the tile
-        tile_info = self._db.get_tile(self._editor.tile_id)
-        data_epsg = tile_info.get("crs_epsg") if tile_info else None
-
-        dlg = GroundControlDialog(data, parent=self, data_epsg=data_epsg)
+        dlg = GroundControlDialog(
+            {}, parent=self, data_epsg=data_epsg,
+            tile_ids=tile_ids,
+            tile_manager=self._tm,
+            database=self._db,
+        )
         dlg.shift_applied.connect(self._apply_ground_control_shift)
         dlg.visualize_point.connect(self._on_visualize_control_point)
-        dlg.exec()
+
+        # Non-modal so the user can interact with the 3-D view while the
+        # dialog is open (essential for the "Go To in 3-D View" check).
+        if self._ground_control_dlg is not None:
+            self._ground_control_dlg.close()
+            self._ground_control_dlg = None
+        self._ground_control_dlg = dlg
+        dlg.destroyed.connect(
+            lambda: setattr(self, "_ground_control_dlg", None)
+        )
+        dlg.show()
 
     def _apply_ground_control_shift(self, dx: float, dy: float, dz: float) -> None:
         """Apply an XYZ shift to the current tile based on ground control results."""
@@ -1163,69 +1225,68 @@ class MainWindow(QMainWindow):
             logger.exception("Failed to apply ground control shift")
             QMessageBox.critical(self, "Shift Failed", str(exc))
 
-    def _on_visualize_control_point(self, x: float, y: float, label: str) -> None:
+    def _on_visualize_control_point(self, x: float, y: float, z: float,
+                                    label: str) -> None:
         """
-        Navigate the 3-D view to a specific control point location.
-        Loads a snapshot of ~500k points around the location if the tile
-        data is available.
+        Navigate the 3-D view to a control point and mark it.
+
+        Non-destructive: if the point is already inside the loaded point
+        cloud, the camera simply pans/zooms to it and a marker sphere is
+        dropped at ``z``.  Only when the point lies outside the current
+        view is the containing tile loaded into the 3-D view first.
         """
-        if self._editor.tile_id is None:
+        if self._db is None or self._tm is None:
             return
 
-        data = self._tm.load_tile_points_full(self._editor.tile_id)
-        if data is None:
-            return
+        view_3d = self._multi_view._view_3d
 
-        xs = data["x"]
-        ys = data["y"]
-        zs = data["z"]
-
-        # Find points within a 50 m radius of the target
-        radius = 50.0
-        dists = np.sqrt((xs - x) ** 2 + (ys - y) ** 2)
-        nearby = dists < radius
-
-        if nearby.sum() == 0:
+        # Fast path — the point is already visible; just move the camera.
+        if view_3d.has_geometry and view_3d.contains_world_xy(x, y):
+            view_3d.focus_on_point(x, y, z)
             self.set_status(
-                f"No points found within {radius:.0f} m of ({x:.2f}, {y:.2f})",
+                f"Visual check: \"{label}\" @ ({x:.2f}, {y:.2f})",
+                timeout=5000,
+            )
+            return
+
+        # The point is outside the current view — load the tile that covers it.
+        tile_ids = [
+            info.get("id") for info in self._db.get_tiles_in_bbox(x, y, x, y)
+            if info.get("id")
+        ]
+        if not tile_ids and self._editor.tile_id:
+            tile_ids = [self._editor.tile_id]
+        if not tile_ids:
+            self.set_status(
+                f"Visual check: no tile covers ({x:.2f}, {y:.2f})",
                 timeout=3000,
             )
             return
 
-        # Limit to ~500k points
-        n_nearby = int(nearby.sum())
-        if n_nearby > 500_000:
-            idx = np.where(nearby)[0]
-            step = max(1, n_nearby // 500_000)
-            subset = np.zeros(len(xs), dtype=bool)
-            subset[idx[::step]] = True
-        else:
-            subset = nearby
+        data = None
+        loaded_tid = None
+        for tid in tile_ids:
+            td = self._tm.load_tile_points_full(tid)
+            if td is not None and len(td.get("x", [])) > 0:
+                data, loaded_tid = td, tid
+                break
 
-        n_show = int(subset.sum())
+        if data is None:
+            self.set_status(
+                f"Visual check: no points loaded for ({x:.2f}, {y:.2f})",
+                timeout=3000,
+            )
+            return
 
-        # Push the subset to the 3-D view
-        self._multi_view._view_3d.load_point_cloud(
-            data["x"][subset], data["y"][subset], data["z"][subset],
-            data.get("classification")[subset] if data.get("classification") is not None else None,
-            data.get("intensity")[subset] if data.get("intensity") is not None else None,
-            data.get("return_number")[subset] if data.get("return_number") is not None else None,
-            data.get("point_source_id")[subset] if data.get("point_source_id") is not None else None,
+        view_3d.load_point_cloud(
+            data["x"], data["y"], data["z"],
+            data.get("classification"), data.get("intensity"),
+            data.get("return_number"), data.get("point_source_id"),
         )
-
-        # Add a highlight sphere at the control point location
-        try:
-            import open3d as o3d
-            sphere = o3d.geometry.TriangleMesh.create_sphere(radius=1.0)
-            sphere.translate([x, y, float(np.median(data["z"][subset]))])
-            sphere.paint_uniform_color([1.0, 0.0, 0.0])
-            # We can't easily add to the offscreen renderer from here,
-            # but the 3-D view is now centered on the region.
-        except Exception:
-            pass
+        view_3d.focus_on_point(x, y, z)
 
         self.set_status(
-            f"Visual check: \"{label}\" — {n_show:,} points within {radius:.0f} m",
+            f"Visual check: \"{label}\" — opened {loaded_tid}",
             timeout=5000,
         )
 
@@ -1295,7 +1356,6 @@ class MainWindow(QMainWindow):
 
     def _prompt_qc_comment(self, tile_ids: list) -> tuple:
         """Show a dialog asking for rework comment. Returns (comment, ok)."""
-        from PySide6.QtWidgets import QInputDialog
         tiles_str = ", ".join(tile_ids[:3])
         if len(tile_ids) > 3:
             tiles_str += f" (+{len(tile_ids) - 3} more)"
@@ -1493,15 +1553,341 @@ class MainWindow(QMainWindow):
         # Re-register global shortcuts
         self._register_shortcuts()
 
+    def _on_website(self) -> None:
+        from PySide6.QtGui import QDesktopServices
+        from PySide6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl(APP_WEBSITE))
+
     def _on_about(self) -> None:
-        QMessageBox.about(
-            self,
-            f"About {APP_NAME}",
-            f"<h3>{APP_NAME} v{APP_VERSION}</h3>"
-            f"<p>Interactive airborne LiDAR point cloud analysis and "
-            f"classification tool.</p>"
-            f"<p>Built with PySide6, Open3D, laspy, and Pointcept.</p>",
+        from pathlib import Path
+        logo_path = Path(__file__).parent / "assets" / "logo.png"
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"About {APP_NAME}")
+        dlg.setMinimumWidth(480)
+
+        layout = QVBoxLayout(dlg)
+        layout.setSpacing(12)
+
+        # Logo
+        if logo_path.is_file():
+            logo_lbl = QLabel()
+            pix = QPixmap(str(logo_path))
+            pix = pix.scaledToWidth(360, Qt.SmoothTransformation)
+            logo_lbl.setPixmap(pix)
+            logo_lbl.setAlignment(Qt.AlignCenter)
+            layout.addWidget(logo_lbl)
+
+        # Title
+        title = QLabel(f"<h2>{APP_NAME} v{APP_VERSION}</h2>")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        # Description
+        desc = QLabel(f"<p>{APP_DESCRIPTION}</p>")
+        desc.setWordWrap(True)
+        desc.setAlignment(Qt.AlignCenter)
+        layout.addWidget(desc)
+
+        # Organisation + website
+        org = QLabel(
+            f"<p><b>{APP_ORG}</b><br>"
+            f"<a href='{APP_WEBSITE}'>{APP_WEBSITE}</a></p>"
         )
+        org.setAlignment(Qt.AlignCenter)
+        org.setOpenExternalLinks(True)
+        layout.addWidget(org)
+
+        # Tech stack
+        tech = QLabel(
+            "<p><small>Built with PySide6, Open3D, laspy, "
+            "Pointcept, NumPy, SciPy<br>"
+            "Licensed under GPLv3</small></p>"
+        )
+        tech.setAlignment(Qt.AlignCenter)
+        layout.addWidget(tech)
+
+        # Close button
+        btn = QPushButton("Close")
+        btn.clicked.connect(dlg.accept)
+        layout.addWidget(btn, alignment=Qt.AlignCenter)
+
+        dlg.exec()
+
+    def _on_documentation(self) -> None:
+        self._show_help_dialog()
+
+    def _show_help_dialog(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"{APP_NAME} — Documentation")
+        dlg.resize(700, 550)
+        dlg.setMinimumWidth(500)
+
+        layout = QVBoxLayout(dlg)
+
+        from PySide6.QtWidgets import QTabWidget, QTextEdit, QVBoxLayout as VBox
+        tabs = QTabWidget()
+
+        def _add_tab(title: str, text: str) -> None:
+            te = QTextEdit()
+            te.setReadOnly(True)
+            te.setHtml(text)
+            tabs.addTab(te, title)
+
+        # ── Overview ────────────────────────────────────────────────
+        _add_tab("Overview", f"""
+<h2>{APP_NAME} v{APP_VERSION}</h2>
+<p>{APP_DESCRIPTION}</p>
+<p>Developed by <a href='{APP_WEBSITE}'>{APP_ORG}</a> — Remote Sensing,
+Geomatics &amp; IT Services.</p>
+
+<h3>Quick Start</h3>
+<ol>
+<li><b>New Project</b> (Ctrl+N) — create or open a project folder.</li>
+<li><b>Import LAS/LAZ</b> (Ctrl+I) — add point cloud tiles to the project.
+   Files are copied into <code>tiles/</code>, indexed in the database,
+   and auto-classified by sensor type (topo / bathy).</li>
+<li><b>Noise Filter</b> (Ctrl+F) — apply SOR, isolated-point removal,
+   DBSCAN, bilateral smoothing, and more.  Build multi-step filter
+   pipelines and preview results in 3D before batch-applying.</li>
+<li><b>Manual Edit</b> — use selection tools (brush, rectangle, line)
+   and quick-classify buttons to manually correct points.</li>
+<li><b>Classify (Pointcept)</b> — run the Pointcept deep-learning model
+   for automatic ASPRS classification on GPU.</li>
+<li><b>Bathymetry Processing</b> — Snell's-law refraction correction,
+   water-surface ghost removal, river-corridor cropping, and benthic
+   continuity filtering for bathymetric LiDAR.</li>
+<li><b>Export Raster</b> — generate DTM and DSM GeoTIFF rasters.</li>
+</ol>
+
+<h3>Keyboard Shortcuts</h3>
+<p>See <b>Settings → Keyboard Shortcuts</b> for the full list (F1).</p>
+""")
+
+        # ── Filter Pipeline ─────────────────────────────────────────
+        _add_tab("Noise Filters", """
+<h2>Noise Filter Pipeline</h2>
+<p>Open via <b>Tools → Noise Filter…</b> (Ctrl+F).  Build a multi-step
+pipeline by adding filter stages.  Preview results in 3D on a single tile
+before batch-applying to many tiles.</p>
+
+<h3>Filter Types</h3>
+<table border='1' cellpadding='4' cellspacing='0'>
+<tr><th>Filter</th><th>Description</th><th>Key Parameters</th></tr>
+<tr><td><b>SOR</b></td><td>Statistical Outlier Removal — removes points
+whose mean KNN distance exceeds the global mean + std_ratio × std.</td>
+<td>Neighbors (6–100), Std Ratio (0.5–5.0)</td></tr>
+<tr><td><b>ROR</b></td><td>Radius Outlier Removal — removes points with
+too few neighbours within a search radius.</td>
+<td>Radius (m), Min Points</td></tr>
+<tr><td><b>Isolated</b></td><td>Isolated-point filter — same as Terrascan
+"Isolated Points". Counts neighbours within search_radius; removes those
+below min_neighbors.</td>
+<td>Search Radius (m), Min Neighbors (incl. self)</td></tr>
+<tr><td><b>DBSCAN Above</b></td><td>Clusters points above the local surface
+(aerial noise: birds, dust). Removes small clusters.</td>
+<td>Epsilon (m), Min Samples, Min Cluster Size</td></tr>
+<tr><td><b>DBSCAN Below</b></td><td>Clusters points below the local surface
+(sub-surface noise: multi-path, sensor artefacts).</td>
+<td>Epsilon (m), Min Samples, Min Cluster Size</td></tr>
+<tr><td><b>Low Points</b></td><td>Finds points that are much lower than
+nearby points — classic low-point / multipath filter.</td>
+<td>Search Radius (m), Max Below/Above Neighbours</td></tr>
+<tr><td><b>Surface Noise</b></td><td>Removes points far from a coarse
+local surface model (grid-based).</td>
+<td>Grid Size (m), Tolerance (m)</td></tr>
+<tr><td><b>Multipath</b></td><td>Removes ghost points caused by laser
+multi-path reflections below the ground surface.</td>
+<td>Depth Threshold (m)</td></tr>
+<tr><td><b>Bilateral</b></td><td>Edge-preserving bilateral smoothing —
+denoises point positions without blurring edges.</td>
+<td>Spatial Sigma, Range Sigma, KNN</td></tr>
+<tr><td><b>Thin Average</b></td><td>Grid-based point thinning by averaging
+— reduces point density uniformly.</td>
+<td>Grid Size (m)</td></tr>
+</table>
+
+<h3>Pipeline Features</h3>
+<ul>
+<li><b>Add / Remove / Reorder</b> steps with drag-and-drop.</li>
+<li><b>Save / Load Presets</b> — reuse filter configurations (JSON).</li>
+<li><b>Live 3D Preview</b> — toggle noise visibility in the viewer.</li>
+<li><b>Tile navigation</b> — browse tiles with the arrow buttons.</li>
+<li><b>Batch Apply</b> — run the pipeline on all selected tiles using
+configurable parallel workers (Settings → General).</li>
+</ul>
+""")
+
+        # ── Bathymetry ──────────────────────────────────────────────
+        _add_tab("Bathymetry", """
+<h2>Bathymetry Processing Pipeline</h2>
+<p>Open via <b>Tools → Bathymetry Processing…</b>.  A dedicated pipeline
+for bathymetric (green-wavelength) LiDAR data.</p>
+
+<h3>Pipeline Steps (in order)</h3>
+<ol>
+<li><b>Water Surface Crop (WSM)</b> — crop points to a water-surface
+model GeoTIFF.  Points outside the model or above the water surface
+plus tolerance are removed.
+<br><i>Parameters:</i> GeoTIFF path, tolerance above surface (cm),
+extrapolation distance (m).</li>
+
+<li><b>Snell's Law Refraction Correction</b> — corrects the apparent
+3-D position of submerged points for the bending and slowing of the
+laser beam at the air-water interface.
+<br><i>Water surface:</i> scalar Z, per-point array, or GeoTIFF.
+<br><i>Refractive index:</i> n_water (default 1.3333).
+<br><i>Trajectory:</i> optional ASCII file with per-pulse sensor
+positions (GPS time, X, Y, Z).</li>
+
+<li><b>Water Surface Ghost Removal</b> — detects the water surface
+plane via RANSAC and removes points in a narrow band around it
+(mirror ghosts / surface reflections).
+<br><i>Parameters:</i> along-track tile length (m).</li>
+
+<li><b>River Corridor Crop</b> — uses local roughness and intensity
+characteristics to distinguish river-bed points from land points.</li>
+
+<li><b>Benthic Continuity Filter</b> — region-growing flood-fill from
+high-confidence bed points to classify connected benthic surfaces.
+<br><i>Parameters:</i> search radius (m), max slope.</li>
+</ol>
+
+<h3>Parallelism</h3>
+<p>Configure workers in <b>Settings → General → Bathy parallel workers</b>.
+Each worker processes one tile at a time from disk.</p>
+""")
+
+        # ── Classification ──────────────────────────────────────────
+        _add_tab("Classification", """
+<h2>Pointcept Deep-Learning Classification</h2>
+<p>Open via <b>Tools → Classify (Pointcept)…</b>.  Runs the Pointcept
+semantic segmentation model on GPU to assign ASPRS classes.</p>
+
+<h3>Configuration</h3>
+<ul>
+<li><b>Pointcept Root</b> — path to the bundled Pointcept directory.</li>
+<li><b>Model Path</b> — trained checkpoint (.pth).</li>
+<li><b>Config File</b> — model configuration (.py).</li>
+<li><b>Voxel Size</b> — density normalisation voxel size (default 0.15 m).</li>
+<li><b>Smoothing</b> — k-NN label smoothing (yes/no).</li>
+</ul>
+
+<h3>How It Works</h3>
+<p>Each tile is processed in a separate subprocess.  The model is
+loaded from disk to GPU, the LAS file is voxelised, inference runs on
+overlapping 50 m blocks with 25 m stride, and output labels are remapped
+to ASPRS classes.  Results replace the original LAS file.</p>
+
+<h3>Parallelism</h3>
+<p>Configure workers in <b>Settings → General → Classify parallel workers</b>.
+<em>Note:</em> on a single GPU, set workers to 1 — each subprocess loads
+its own model copy, so parallel workers compete for GPU memory.</p>
+""")
+
+        # ── Selection & Edit Tools ──────────────────────────────────
+        _add_tab("Selection &amp; Edit", """
+<h2>Selection &amp; Manual Edit Tools</h2>
+
+<h3>Selection Modes</h3>
+<table border='1' cellpadding='4' cellspacing='0'>
+<tr><th>Tool</th><th>Shortcut</th><th>How to Use</th></tr>
+<tr><td><b>Select Above</b></td><td>A</td><td>Draw a line; points above
+the line are selected.</td></tr>
+<tr><td><b>Select Below</b></td><td>L</td><td>Draw a line; points below
+the line are selected.</td></tr>
+<tr><td><b>Select Rectangle</b></td><td>R</td><td>Drag a rectangle;
+points inside are selected.</td></tr>
+<tr><td><b>Brush</b></td><td>B</td><td>Circular brush; drag to select
+points within the brush radius.</td></tr>
+<tr><td><b>Rect Brush</b></td><td>Shift+R</td><td>Rectangular brush with
+configurable width/height.</td></tr>
+<tr><td><b>Point Info</b></td><td>—</td><td>Click a point to see its
+coordinates, classification, and attributes in the properties panel.</td></tr>
+</table>
+
+<h3>Quick-Classify Buttons</h3>
+<p>Assign the selected points to an ASPRS class using the buttons
+in the <b>Properties Panel</b> (right sidebar).  Hotkeys Ctrl+0 through
+Ctrl+9, Ctrl+Shift+0–5.  All edits are undoable (Ctrl+Z) via the
+SQLite-backed command history.</p>
+
+<h3>Tile Navigation</h3>
+<ul>
+<li><b>Next Tile:</b> Tab</li>
+<li><b>Previous Tile:</b> Shift+Tab</li>
+</ul>
+""")
+
+        # ── Settings ────────────────────────────────────────────────
+        _add_tab("Settings", """
+<h2>Settings Dialog</h2>
+<p>Open via <b>Tools → Settings…</b></p>
+
+<h3>Keyboard Shortcuts</h3>
+<p>27 configurable shortcuts for file operations, tool activation,
+selection modes, and quick-classify actions.  Double-click a shortcut
+to reassign it.</p>
+
+<h3>General</h3>
+<table border='1' cellpadding='4' cellspacing='0'>
+<tr><th>Setting</th><th>Range</th><th>Default</th><th>Description</th></tr>
+<tr><td><b>Filter parallel workers</b></td><td>1–16</td><td>4</td>
+<td>Number of tiles to filter in parallel via ThreadPoolExecutor.</td></tr>
+<tr><td><b>Classify parallel workers</b></td><td>1–8</td><td>1</td>
+<td>Number of Pointcept subprocesses.  Set to 1 for single GPU.</td></tr>
+<tr><td><b>Bathy parallel workers</b></td><td>1–16</td><td>4</td>
+<td>Number of tiles to process in parallel for bathymetry.</td></tr>
+</table>
+
+<h3>Manual Edit Tools</h3>
+<table border='1' cellpadding='4' cellspacing='0'>
+<tr><th>Setting</th><th>Range</th><th>Default</th></tr>
+<tr><td><b>Brush Radius</b></td><td>0.1–50 m</td><td>2.0 m</td></tr>
+<tr><td><b>Rectangle Width</b></td><td>0.1–100 m</td><td>5.0 m</td></tr>
+<tr><td><b>Rectangle Height</b></td><td>0.1–100 m</td><td>3.0 m</td></tr>
+</table>
+""")
+
+        # ── Other Tools ─────────────────────────────────────────────
+        _add_tab("Other Tools", """
+<h2>Other Tools &amp; Dialogs</h2>
+
+<h3>Ground Classification</h3>
+<p><b>Tools → Ground Classification…</b> — classify ground points using
+SMRF (Simple Morphological Filter) or TIN (Triangulated Irregular Network)
+densification.  SMRF builds a minimum surface with progressive window
+sizes; TIN iteratively densifies a ground surface from seed points.</p>
+
+<h3>Ground Control</h3>
+<p><b>Tools → Ground Control…</b> — import ground control points (GCPs)
+for accuracy assessment and georeferencing validation.</p>
+
+<h3>Export Raster (DTM / DSM)</h3>
+<p><b>Tools → Export Raster…</b> — generate Digital Terrain Model and
+Digital Surface Model GeoTIFF rasters from the classified point cloud.
+Choose resolution, interpolation method, and output CRS.</p>
+
+<h3>CRS / Projection</h3>
+<p><b>Tools → CRS / Projection…</b> — view and change the coordinate
+reference system of the project.</p>
+
+<h3>Processing Time Analysis</h3>
+<p><b>Tools → Processing Time Analysis…</b> — review per-tile processing
+durations for filter, classify, and bathy operations, grouped by batch.</p>
+
+<h3>Preview LAS/LAZ</h3>
+<p><b>File → Preview LAS/LAZ</b> — quick-look at LAS/LAZ files before
+importing.  Shows point count, extent, CRS, and attribute summary.</p>
+""")
+
+        layout.addWidget(tabs)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dlg.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignRight)
+
+        dlg.exec()
 
     # ── slot: tile list signals ────────────────────────────────────
 

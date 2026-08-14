@@ -15,7 +15,12 @@ from typing import Dict, Final, Tuple
 # ── Application metadata ──────────────────────────────────────────────
 APP_NAME: Final[str] = "LiDAR Workbench"
 APP_VERSION: Final[str] = "0.1.0"
-APP_ORG: Final[str] = "LiDAR-Workbench"
+APP_ORG: Final[str] = "Kabelik GmbH"
+APP_WEBSITE: Final[str] = "https://kabelik.at"
+APP_DESCRIPTION: Final[str] = (
+    "Interactive airborne LiDAR point cloud analysis and "
+    "classification tool for bathymetric and topographic data."
+)
 
 # ── Default paths ─────────────────────────────────────────────────────
 # Pointcept is bundled inside the project (see Pointcept/prediction.py)

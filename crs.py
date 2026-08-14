@@ -312,8 +312,16 @@ def transform_coordinates(
     if not HAS_PYPROJ:
         raise RuntimeError("pyproj is required for coordinate transformation")
 
-    src = CRS.from_epsg(source_crs) if isinstance(source_crs, int) else CRS.from_wkt(source_crs)
-    dst = CRS.from_epsg(target_crs) if isinstance(target_crs, int) else CRS.from_wkt(target_crs)
+    def _resolve_crs(crs_arg):
+        if isinstance(crs_arg, int):
+            return CRS.from_epsg(crs_arg)
+        # Handle "EPSG:XXXXX" authority strings
+        if isinstance(crs_arg, str) and crs_arg.upper().startswith("EPSG:"):
+            return CRS.from_epsg(int(crs_arg.split(":")[1]))
+        return CRS.from_wkt(crs_arg)
+
+    src = _resolve_crs(source_crs)
+    dst = _resolve_crs(target_crs)
 
     transformer = Transformer.from_crs(src, dst, always_xy=True)
     if zs is not None and len(zs) > 0:

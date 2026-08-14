@@ -1,7 +1,7 @@
 {
   "filter_workers": 16,
   "classify_workers": 1,
-  "bathy_workers": 4,
+  "bathy_workers": 16,
   "brush_radius": 2.0,
   "rect_width": 4.0,
   "rect_height": 2.0

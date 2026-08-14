@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ..noise_filter import ground_classify_smrf, ground_classify_tin
+from ..ground import ground_classify_smrf, ground_classify_tin
 
 logger = logging.getLogger("lidar_workbench.gui.ground_classify_dialog")
 
@@ -41,7 +41,8 @@ class _GroundClassifyWorker(QThread):
     error = Signal(str)
 
     def __init__(self, xs, ys, zs, classifications, method: str, params: dict,
-                 tile_id: str = None, db=None, parent=None):
+                 tile_id: str = None, db=None, return_numbers=None, num_returns=None,
+                 sensor_type=None, parent=None):
         super().__init__(parent)
         self._xs, self._ys, self._zs = xs, ys, zs
         self._classifications = classifications
@@ -49,6 +50,9 @@ class _GroundClassifyWorker(QThread):
         self._params = params
         self._tile_id = tile_id
         self._db = db
+        self._return_numbers = return_numbers
+        self._num_returns = num_returns
+        self._sensor_type = sensor_type
 
     def run(self):
         import time as _time
@@ -70,13 +74,19 @@ class _GroundClassifyWorker(QThread):
                     self._xs, self._ys, self._zs,
                     max_distance=self._params["max_distance"],
                     max_angle=self._params["max_angle"],
-                    max_distance_above=self._params.get("max_distance_above", 0.15),
                     max_terrain_angle=self._params.get("max_terrain_angle", 88.0),
                     reduce_iter_angle_when_edge=self._params.get("reduce_iter_angle_when_edge"),
                     stop_tri_when_edge=self._params.get("stop_tri_when_edge"),
                     only_upward=self._params.get("only_upward", False),
                     follow_surface_trend=self._params.get("follow_surface_trend", True),
+                    remove_low_outliers=self._params.get("remove_low_outliers", False),
+                    low_outlier_neighbors=self._params.get("low_outlier_neighbors", 8),
+                    low_outlier_threshold=self._params.get("low_outlier_threshold", 1.0),
+                    exclude_single_returns_in_water=self._params.get("exclude_single_returns_in_water", False),
+                    sensor_type=self._sensor_type,
                     cell_size=None,
+                    return_numbers=self._return_numbers,
+                    num_returns=self._num_returns,
                     progress=lambda msg, pct: self.progress.emit(msg, pct),
                 )
             duration = _time.perf_counter() - t0
@@ -111,10 +121,18 @@ class GroundClassifyDialog(QDialog):
         self._worker: Optional[_GroundClassifyWorker] = None
         self._ground_mask: Optional[np.ndarray] = None
         self._source_class: int = 2  # default: class 2 (ground) from Pointcept
+        self._source_mask: Optional[np.ndarray] = None  # set in _on_run
 
         self.setWindowTitle("Ground Classification")
         self.setMinimumWidth(480)
         self._setup_ui()
+
+    def reject(self):
+        """Cancel: wait for worker thread before closing."""
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.quit()
+            self._worker.wait(3000)  # 3 s timeout
+        super().reject()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -185,16 +203,6 @@ class GroundClassifyDialog(QDialog):
         self._tin_angle.setSuffix("°")
         self._tin_angle.setToolTip("Max angle between point and TIN vertices")
         tf.addRow("Max Angle:", self._tin_angle)
-        self._tin_above = QDoubleSpinBox()
-        self._tin_above.setRange(0.01, 2.0)
-        self._tin_above.setDecimals(2)
-        self._tin_above.setValue(0.15)
-        self._tin_above.setSuffix(" m")
-        self._tin_above.setToolTip(
-            "Max height ABOVE TIN for a point to be ground. "
-            "Very tight (0.10–0.20 m) to reject water surface."
-        )
-        tf.addRow("Max Above TIN:", self._tin_above)
 
         # Terrain angle
         self._tin_terrain_angle = QDoubleSpinBox()
@@ -204,9 +212,8 @@ class GroundClassifyDialog(QDialog):
         self._tin_terrain_angle.setSuffix("°")
         self._tin_terrain_angle.setToolTip(
             "Max allowed slope of TIN triangles. "
-            "Lower values (45-60°) for natural terrain prevent "
-            "classification on steep riverbanks, cliffs. "
-            "Use 88-90° for man-made structures."
+            "Keep 88-90° to classify steep natural embankments and riverbanks; "
+            "lower it only to exclude man-made vertical walls."
         )
         tf.addRow("Max Terrain Angle:", self._tin_terrain_angle)
 
@@ -259,6 +266,40 @@ class GroundClassifyDialog(QDialog):
         )
         tf.addRow(self._tin_follow_trend)
 
+        # Low-outlier removal (lidR-style)
+        low_outlier_row = QHBoxLayout()
+        self._tin_remove_low_outliers = QCheckBox("Remove low outliers")
+        self._tin_remove_low_outliers.setToolTip(
+            "Post-densification cleanup that drops ground points sitting far "
+            "below their local neighbourhood (low outliers that become seeds "
+            "and spike the DTM). Mirrors lidR's internal outlier removal."
+        )
+        low_outlier_row.addWidget(self._tin_remove_low_outliers)
+        self._tin_low_outlier_threshold = QDoubleSpinBox()
+        self._tin_low_outlier_threshold.setRange(0.1, 20.0)
+        self._tin_low_outlier_threshold.setDecimals(2)
+        self._tin_low_outlier_threshold.setValue(1.0)
+        self._tin_low_outlier_threshold.setSuffix(" m")
+        self._tin_low_outlier_threshold.setToolTip(
+            "A point is a low outlier when it is more than this far below the "
+            "median Z of its 8 nearest ground neighbours."
+        )
+        low_outlier_row.addWidget(self._tin_low_outlier_threshold)
+        low_outlier_row.addStretch()
+        tf.addRow(low_outlier_row)
+
+        # Exclude single returns in water (bathy bed-only)
+        self._tin_exclude_single_returns_water = QCheckBox(
+            "Exclude single returns in water (bathy bed-only)"
+        )
+        self._tin_exclude_single_returns_water.setToolTip(
+            "In bathymetry, single returns (num_returns == 1) are usually the "
+            "water surface, not the riverbed.  When checked, they are excluded "
+            "so the shallow-water surface isn't classified as ground alongside "
+            "the bed.  Land points are unaffected."
+        )
+        tf.addRow(self._tin_exclude_single_returns_water)
+
         self._tin_group.setVisible(False)
         layout.addWidget(self._tin_group)
 
@@ -266,14 +307,15 @@ class GroundClassifyDialog(QDialog):
         info = QLabel(
             "<b>SMRF</b> (PDAL): fast, good for most terrain. "
             "Uses progressive morphological opening.\n\n"
-            "<b>TIN Densification</b>: iterative, "
+            "<b>TIN Densification</b> (Axelsson): iterative, "
             "preserves sharp terrain breaks (cliffs, riverbanks). "
             "Slower but more precise on complex terrain.\n\n"
-            "<b>TIN tips:</b> lower <i>Max Terrain Angle</i> to 45-60° "
-            "for natural terrain with steep riverbanks. "
+            "<b>TIN tips:</b> keep <i>Max Terrain Angle</i> at 88-90° to "
+            "classify steep embankments and riverbanks. "
             "Enable <i>Only Upward</i> if low-error points "
-            "are pulling the surface down. Edge controls "
-            "are optional — leave off for faster processing."
+            "are pulling the surface down. "
+            "<i>Follow surface trend</i> helps climb slopes. "
+            "Edge controls are optional — leave off for faster processing."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -306,6 +348,32 @@ class GroundClassifyDialog(QDialog):
 
     def _on_run(self):
         method = self._method_combo.currentData()
+        source_class = self._source_class_combo.currentData()
+
+        # ── Filter to source class(es) ────────────────────────────
+        cls_all = self._data["classification"]
+        if source_class == -2:
+            source_mask = (cls_all == 1) | (cls_all == 2)
+        elif source_class >= 0:
+            source_mask = (cls_all == source_class)
+        else:
+            source_mask = np.ones(len(cls_all), dtype=bool)
+
+        n_source = source_mask.sum()
+        if n_source == 0:
+            self._status.setText("No points match the selected source class(es)")
+            return
+
+        xs_sub = self._data["x"][source_mask]
+        ys_sub = self._data["y"][source_mask]
+        zs_sub = self._data["z"][source_mask]
+        rn_sub = (self._data.get("return_number")[source_mask]
+                  if self._data.get("return_number") is not None else None)
+        nr_sub = (self._data.get("num_returns")[source_mask]
+                  if self._data.get("num_returns") is not None else None)
+        st_sub = (self._data.get("sensor_type")[source_mask]
+                  if self._data.get("sensor_type") is not None else None)
+
         if method == "smrf":
             params = {
                 "slope_threshold": self._smrf_slope.value(),
@@ -319,7 +387,6 @@ class GroundClassifyDialog(QDialog):
             params = {
                 "max_distance": self._tin_dist.value(),
                 "max_angle": self._tin_angle.value(),
-                "max_distance_above": self._tin_above.value(),
                 "max_terrain_angle": self._tin_terrain_angle.value(),
                 "reduce_iter_angle_when_edge": (
                     self._tin_reduce_edge.value()
@@ -333,18 +400,31 @@ class GroundClassifyDialog(QDialog):
                 ),
                 "only_upward": self._tin_only_upward.isChecked(),
                 "follow_surface_trend": self._tin_follow_trend.isChecked(),
+                "remove_low_outliers": self._tin_remove_low_outliers.isChecked(),
+                "low_outlier_neighbors": 8,
+                "low_outlier_threshold": self._tin_low_outlier_threshold.value(),
+                "exclude_single_returns_in_water": self._tin_exclude_single_returns_water.isChecked(),
                 "cell_size": None,
             }
 
+        self._source_mask = source_mask
+        self._source_class = source_class
+
         self._run_btn.setEnabled(False)
-        self._status.setText("Classifying ground...")
+        self._status.setText(
+            f"Classifying ground on {n_source:,} points "
+            f"(out of {len(cls_all):,} total)…"
+        )
         self._progress.setValue(0)
 
         self._worker = _GroundClassifyWorker(
-            self._data["x"], self._data["y"], self._data["z"],
-            self._data["classification"],
+            xs_sub, ys_sub, zs_sub,
+            self._data["classification"][source_mask],
             method=method, params=params,
             tile_id=self._tile_id, db=self._db,
+            return_numbers=rn_sub,
+            num_returns=nr_sub,
+            sensor_type=st_sub,
             parent=self,
         )
         self._worker.progress.connect(self._on_progress)
@@ -357,12 +437,23 @@ class GroundClassifyDialog(QDialog):
         self._progress.setValue(int(pct))
 
     def _on_finished(self, mask: np.ndarray):
-        self._ground_mask = mask
-        n_total = len(mask)
+        # mask covers only source-class points — expand to full length
+        full_mask = np.zeros(len(self._data["x"]), dtype=bool)
+        # Non-source points that are already class 2 (ground) stay ground
+        cls_all = self._data["classification"]
+        non_source_ground = ~self._source_mask & (cls_all == 2)
+        full_mask[non_source_ground] = True
+        # Source-class points: use TIN result
+        full_mask[self._source_mask] = mask
+
+        self._ground_mask = full_mask
+        n_source = self._source_mask.sum()
         n_ground = mask.sum()
+        n_total = len(full_mask)
         self._status.setText(
-            f"Done: {n_ground:,} ground / {n_total:,} points "
-            f"({n_ground/n_total*100:.1f}%)"
+            f"Done: {n_ground:,} ground / {n_source:,} source points "
+            f"({n_ground/max(n_source,1)*100:.1f}%) "
+            f"[{n_total:,} total]"
         )
         self._progress.setValue(100)
         self._run_btn.setEnabled(True)
@@ -371,6 +462,13 @@ class GroundClassifyDialog(QDialog):
     def _on_error(self, msg: str):
         self._status.setText(f"Error: {msg}")
         self._run_btn.setEnabled(True)
+
+    def accept(self):
+        """OK: wait for worker thread before closing."""
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.quit()
+            self._worker.wait(3000)
+        super().accept()
 
     def _on_accept(self):
         if self._ground_mask is not None:

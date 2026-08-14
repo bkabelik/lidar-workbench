@@ -77,6 +77,15 @@ _TILE_BUF_TO_CHUNK: Dict[str, str] = {
 BBox = Tuple[float, float, float, float]  # (min_x, min_y, max_x, max_y)
 
 
+def _make_chunk_dtype(extra_dims: Dict[str, Any]) -> np.dtype:
+    """Build the tile chunk structured dtype: base fields + extra dims."""
+    fields = [(name, _TILE_CHUNK_DTYPE.fields[name][0])
+              for name in _TILE_CHUNK_DTYPE.names]
+    for name in sorted(extra_dims):
+        fields.append((name, np.dtype(extra_dims[name])))
+    return np.dtype(fields)
+
+
 class TileManager:
     """
     Manages tile import, creation, and data access.
@@ -182,7 +191,7 @@ class TileManager:
         flight_line_counter = 0  # auto-increment when file has no flight line
         header_template: Optional[dict] = None  # captured from first file
         # Union extra dimensions across all files (different scanners may differ)
-        _union_extra_dims: Dict[str, str] = {}  # name → type
+        _union_extra_dims: Dict[str, Any] = {}  # name → dtype
         _template_format_id: Optional[int] = None
 
         for i, las_path in enumerate(las_files):
@@ -210,8 +219,16 @@ class TileManager:
                             len(header_template["extra_dimensions"]),
                         )
                     # Union extra dimensions from all files
-                    for ed in file_tmpl["extra_dimensions"]:
-                        _union_extra_dims[ed.name] = ed.type
+                    for dim_name, dim_dtype in file_tmpl["extra_dimensions"]:
+                        if dim_name in _union_extra_dims:
+                            if _union_extra_dims[dim_name] != dim_dtype:
+                                logger.warning(
+                                    "Extra dim %r dtype conflict (%s vs %s) — keeping %s",
+                                    dim_name, _union_extra_dims[dim_name],
+                                    dim_dtype, _union_extra_dims[dim_name],
+                                )
+                        else:
+                            _union_extra_dims[dim_name] = dim_dtype
                 except Exception as exc:
                     if header_template is None:
                         logger.warning("Could not read header template from %s: %s", las_path, exc)
@@ -280,7 +297,11 @@ class TileManager:
             }
         else:
             # Replace file-specific list with the union across all files
-            header_template["extra_dimensions"] = list(_union_extra_dims.items())  # [(name, type), ...]
+            header_template["extra_dimensions"] = list(_union_extra_dims.items())  # [(name, dtype), ...]
+
+        # Extra dims carried through the streaming chunk pipeline
+        extra_dim_names: List[str] = sorted(_union_extra_dims.keys())
+        chunk_dtype = _make_chunk_dtype(_union_extra_dims) if _union_extra_dims else _TILE_CHUNK_DTYPE
 
         # ── Phase 2: compute grid ───────────────────────────────────
         global_bbox: BBox = (
@@ -388,6 +409,12 @@ class TileManager:
                         wh  = (_safe_attr(chunk, "withheld", np.uint8, 0))
                         ov  = (_safe_attr(chunk, "overlap", np.uint8, 0))
 
+                        # Extra dimensions (union across files; absent dims → 0)
+                        extra_arrs = {
+                            name: _safe_attr(chunk, name, _union_extra_dims[name], 0)
+                            for name in extra_dim_names
+                        }
+
                         # Only iterate tiles that actually received points
                         occupied = np.unique(tile_idx_arr)
                         for tidx in occupied:
@@ -400,6 +427,7 @@ class TileManager:
                                     "gt":[], "sar":[], "sa":[], "sdf":[], "efl":[], "ud":[],
                                     "red":[], "grn":[], "blu":[],
                                     "kp":[], "syn":[], "wh":[], "ov":[],
+                                    **{name: [] for name in extra_dim_names},
                                 }
                                 if tidx not in tile_scanner_map:
                                     tile_scanner_map[tidx] = {}
@@ -427,6 +455,8 @@ class TileManager:
                             buf["syn"].append(syn[mask])
                             buf["wh"].append(wh[mask])
                             buf["ov"].append(ov[mask])
+                            for name in extra_dim_names:
+                                buf[name].append(extra_arrs[name][mask])
                             sc_name = info.get("scanner", '')
                             tile_scanner_map[tidx][sc_name] = (
                                 tile_scanner_map[tidx].get(sc_name, 0) + mask.sum()
@@ -450,7 +480,10 @@ class TileManager:
 
                 # Flush this file's buffers to disk, then free RAM
                 if tile_buffers:
-                    flushed = _flush_tile_buffers(tile_buffers, chunk_dir, file_idx)
+                    flushed = _flush_tile_buffers(
+                        tile_buffers, chunk_dir, file_idx,
+                        chunk_dtype=chunk_dtype, extra_dim_names=extra_dim_names,
+                    )
                     for tidx, n_pts in flushed.items():
                         tile_total_points[tidx] = tile_total_points.get(tidx, 0) + n_pts
                     tile_buffers.clear()
@@ -475,7 +508,7 @@ class TileManager:
 
                 if len(chunk_paths) == 1:
                     # Single chunk — read directly
-                    data = np.fromfile(str(chunk_paths[0]), dtype=_TILE_CHUNK_DTYPE)
+                    data = np.fromfile(str(chunk_paths[0]), dtype=chunk_dtype)
                 else:
                     # Byte-level concatenate all chunks into one temp file,
                     # then read once.  Avoids loading N arrays + np.concatenate.
@@ -488,7 +521,7 @@ class TileManager:
                                     if not buf:
                                         break
                                     out.write(buf)
-                    data = np.fromfile(str(merged_path), dtype=_TILE_CHUNK_DTYPE)
+                    data = np.fromfile(str(merged_path), dtype=chunk_dtype)
                     merged_path.unlink()  # clean up the merge temp
 
                 n_pts = len(data)
@@ -507,6 +540,7 @@ class TileManager:
                 reds = data["red"]; grns = data["green"]; blus = data["blue"]
                 kps = data["key_point"]; syns = data["synthetic"]
                 whs = data["withheld"]; ovs = data["overlap"]
+                extra_vals = {name: data[name] for name in extra_dim_names}
                 del data  # free the structured array
 
                 tile_id = f"tile_{tidx:04d}"
@@ -523,6 +557,7 @@ class TileManager:
                     reds=reds, greens=grns, blues=blus,
                     key_points=kps, synthetics=syns,
                     withhelds=whs, overlaps=ovs,
+                    extra_dims=extra_vals,
                     header_template=header_template,
                 )
 
@@ -675,6 +710,16 @@ class TileManager:
                 result["synthetic"] = _safe("synthetic", np.uint8, 0)
                 result["withheld"] = _safe("withheld", np.uint8, 0)
                 result["overlap"] = _safe("overlap", np.uint8, 0)
+
+                # Extra dimensions (name → per-point values) — preserved so
+                # downstream steps can carry them through rewrites.
+                extra_dims: Dict[str, np.ndarray] = {}
+                for ed in las_data.point_format.extra_dimensions:
+                    name = ed.name
+                    if hasattr(las_data, name):
+                        extra_dims[name] = np.array(getattr(las_data, name))
+                if extra_dims:
+                    result["extra_dims"] = extra_dims
 
                 # Build per-point sensor_type from flightline→sensor_type mapping
                 fl_st_raw = tile_info.get("flightline_sensor_types", "{}")
@@ -974,7 +1019,10 @@ def _read_las_header_template(las_path: Path) -> dict:
         template = {
             "version": f"{hdr.version.major}.{hdr.version.minor}",
             "point_format_id": pf.id,
-            "extra_dimensions": list(pf.extra_dimensions),
+            # Normalise to (name, dtype) pairs — pf.extra_dimensions yields
+            # DimensionInfo objects (namedtuples) which break tuple-unpacking
+            # downstream.
+            "extra_dimensions": [(e.name, e.dtype) for e in pf.extra_dimensions],
             "vlrs": list(hdr.vlrs) if hasattr(hdr, 'vlrs') else [],
             "x_scale": float(hdr.x_scale),
             "y_scale": float(hdr.y_scale),
@@ -994,11 +1042,15 @@ def _flush_tile_buffers(
     tile_buffers: Dict[int, Dict[str, list]],
     chunk_dir: Path,
     file_idx: int,
+    chunk_dtype: Optional[np.dtype] = None,
+    extra_dim_names: Optional[List[str]] = None,
 ) -> Dict[int, int]:
     """Serialize accumulated in-memory tile buffers to raw binary chunks on disk.
 
     Returns a dict mapping ``tile_idx → point_count`` for the flushed chunk.
     """
+    dtype = chunk_dtype if chunk_dtype is not None else _TILE_CHUNK_DTYPE
+    extra_names = extra_dim_names or []
     tile_pts: Dict[int, int] = {}
     for tidx, buf in tile_buffers.items():
         # Concatenate all per-attribute lists into flat arrays
@@ -1009,11 +1061,13 @@ def _flush_tile_buffers(
             arrays[field_name] = arr
             if n_pts == 0:
                 n_pts = len(arr)
+        for name in extra_names:
+            arrays[name] = np.concatenate(buf[name])
         if n_pts == 0:
             continue
 
         # Build structured array and write raw binary
-        data = np.empty(n_pts, dtype=_TILE_CHUNK_DTYPE)
+        data = np.empty(n_pts, dtype=dtype)
         for field_name, arr in arrays.items():
             data[field_name] = arr
 
@@ -1083,6 +1137,7 @@ def _write_las_file(
     withhelds: Optional[np.ndarray] = None,
     overlaps: Optional[np.ndarray] = None,
     header_template: Optional[dict] = None,
+    extra_dims: Optional[Dict[str, np.ndarray]] = None,
 ) -> None:
     """
     Write a set of points to a LAS file via laspy.
@@ -1091,6 +1146,9 @@ def _write_las_file(
     VLRs, extra dimensions, scales) when provided; falls back to LAS 1.4
     point format 6 otherwise.  Only writes attributes that the chosen point
     format actually supports.
+
+    *extra_dims* maps extra-dimension name → per-point values (same length as
+    ``xs``) and preserves them across processing steps.
     """
     if not HAS_LASPY:
         raise RuntimeError("laspy required")
@@ -1106,15 +1164,17 @@ def _write_las_file(
         # Copy VLRs (carries CRS, etc.)
         for vlr in header_template["vlrs"]:
             header.vlrs.append(vlr)
-        # Copy extra-dimension definitions (union across all input files)
+        # Copy extra-dimension definitions (union across all input files).
+        # Normalised to (name, dtype) pairs by _read_las_header_template.
         for ed in header_template["extra_dimensions"]:
-            # ed is (name, type) tuple from the union, or ExtraBytesParams
-            if isinstance(ed, tuple):
+            if hasattr(ed, "name") and hasattr(ed, "dtype"):
+                dim_name, dim_type = ed.name, ed.dtype
+            elif isinstance(ed, tuple) and len(ed) == 2:
                 dim_name, dim_type = ed
             else:
-                dim_name, dim_type = ed.name, ed.type
+                continue
             try:
-                header.add_extra_dim(name=dim_name, type=dim_type)
+                header.add_extra_dim(laspy.ExtraBytesParams(name=dim_name, type=dim_type))
             except Exception:
                 logger.debug("Skipping extra dim %s (may already exist)", dim_name)
         # Copy scales from source
@@ -1126,6 +1186,21 @@ def _write_las_file(
         header.x_scale = 0.001
         header.y_scale = 0.001
         header.z_scale = 0.001
+
+    # Declare any extra dims supplied as values (authoritative for the data
+    # being written), in case the header template didn't carry them.
+    if extra_dims:
+        existing = {e.name for e in header.point_format.extra_dimensions}
+        for name, values in extra_dims.items():
+            if values is None or len(values) != n or name in existing:
+                continue
+            try:
+                header.add_extra_dim(
+                    laspy.ExtraBytesParams(name=name, type=np.dtype(values.dtype))
+                )
+                existing.add(name)
+            except Exception:
+                logger.debug("Skipping extra dim %s (may already exist)", name)
 
     # Per-tile offsets
     header.x_offset = xs.min() if n > 0 else 0.0
@@ -1190,6 +1265,16 @@ def _write_las_file(
                 setattr(las_data, attr_name, arr.astype(np.uint8))
             except Exception:
                 pass
+
+    # Extra dimensions (e.g. Amplitude / Reflectance / Deviation)
+    if extra_dims:
+        for name, values in extra_dims.items():
+            if values is None or len(values) != n or not hasattr(las_data, name):
+                continue
+            try:
+                setattr(las_data, name, np.asarray(values).astype(np.dtype(values.dtype)))
+            except Exception:
+                logger.debug("Failed to write extra dim %s", name)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     las_data.write(str(path))

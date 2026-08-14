@@ -143,9 +143,23 @@ class _BathyWorker(QThread):
 
     def _process_one(self, data: dict, tile_idx: int, n_tiles: int) -> dict:
         """Run the pipeline on a single tile's data, return result dict."""
-        result = {k: v.copy() if isinstance(v, np.ndarray) else v
-                  for k, v in data.items()}
+        # Operate in-place on the freshly-loaded dict.  ``load_tile_points_full``
+        # is not cached, so each tile's dict is exclusive to this call — copying
+        # every array here would double memory for large tiles (OOM risk).
+        result = data
         water_surface_z: Optional[float] = None
+
+        def _subset_all(k: np.ndarray) -> None:
+            """Subset every per-point array (and extra dims) by boolean mask k."""
+            for key, val in result.items():
+                if isinstance(val, np.ndarray) and len(val) == len(k):
+                    result[key] = val[k]
+            ed = result.get("extra_dims")
+            if isinstance(ed, dict):
+                for name in list(ed):
+                    v = ed[name]
+                    if isinstance(v, np.ndarray) and len(v) == len(k):
+                        ed[name] = v[k]
 
         # ── Early skip: tile with zero bathy points ─────────────────
         st = result.get("sensor_type")
@@ -182,11 +196,7 @@ class _BathyWorker(QThread):
                     k = keep_mask | (result["sensor_type"] != 2)
                 else:
                     k = keep_mask
-                result["x"], result["y"], result["z"] = result["x"][k], result["y"][k], result["z"][k]
-                for key in ("classification", "intensity", "return_number",
-                            "point_source_id", "sensor_type", "gps_time"):
-                    if key in result and result[key] is not None:
-                        result[key] = result[key][k]
+                _subset_all(k)
 
             elif name == "snells":
                 label = f"Snell's…" if n_tiles == 1 else f"Tile {tile_idx+1}/{n_tiles}: Snell's…"
@@ -278,11 +288,7 @@ class _BathyWorker(QThread):
                             and (result["sensor_type"] == 2).any())
                 if is_bathy:
                     k = k | (result["sensor_type"] != 2)
-                result["x"], result["y"], result["z"] = result["x"][k], result["y"][k], result["z"][k]
-                for key in ("classification", "intensity", "return_number",
-                            "point_source_id", "sensor_type", "gps_time"):
-                    if key in result and result[key] is not None:
-                        result[key] = result[key][k]
+                _subset_all(k)
 
             elif name == "river_crop":
                 label = f"River crop…" if n_tiles == 1 else f"Tile {tile_idx+1}/{n_tiles}: River crop…"
@@ -296,11 +302,7 @@ class _BathyWorker(QThread):
                 st = result.get("sensor_type")
                 if st is not None and (st == 2).any():
                     k = k | (st != 2)
-                result["x"], result["y"], result["z"] = result["x"][k], result["y"][k], result["z"][k]
-                for key in ("classification", "intensity", "return_number",
-                            "point_source_id", "sensor_type", "gps_time"):
-                    if key in result and result[key] is not None:
-                        result[key] = result[key][k]
+                _subset_all(k)
 
             elif name == "benthic":
                 label = f"Benthic filter…" if n_tiles == 1 else f"Tile {tile_idx+1}/{n_tiles}: Benthic filter…"
@@ -316,11 +318,7 @@ class _BathyWorker(QThread):
                             and (result["sensor_type"] == 2).any())
                 if is_bathy:
                     k = k | (result["sensor_type"] != 2)
-                result["x"], result["y"], result["z"] = result["x"][k], result["y"][k], result["z"][k]
-                for key in ("classification", "intensity", "return_number",
-                            "point_source_id", "sensor_type", "gps_time"):
-                    if key in result and result[key] is not None:
-                        result[key] = result[key][k]
+                _subset_all(k)
 
         return result
 
@@ -918,7 +916,13 @@ class BathyDialog(QDialog):
             self._tile_ids, steps, _loader, max_workers=workers, parent=self,
         )
         self._bathy_worker.progress.connect(self._on_bathy_progress)
-        self._bathy_worker.tile_done.connect(self.tile_save_requested.emit)
+        # BlockingQueuedConnection gives back-pressure: the worker thread waits
+        # until the main thread has SAVED each tile before emitting the next,
+        # so large result dicts can't pile up in the event queue (OOM fix).
+        self._bathy_worker.tile_done.connect(
+            self.tile_save_requested.emit,
+            Qt.ConnectionType.BlockingQueuedConnection,
+        )
         self._bathy_worker.finished_all.connect(self._on_bathy_finished)
         self._bathy_worker.error.connect(self._on_bathy_error)
         self._bathy_worker.start()
