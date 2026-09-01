@@ -1,8 +1,13 @@
 """
 LiDAR Workbench — DTM View (2D Top-Down).
 
-Displays a colour-coded DTM raster with overlaid point classes and
-supports interactive profile-line drawing.
+Displays a colour-coded DTM raster or a class-coloured 2D point scatter,
+and supports interactive profile-line drawing plus pan/zoom navigation.
+
+Rendering is done into cached ``QPixmap`` images (one for the DTM raster,
+one for the point scatter) so that panning and zooming only translate/scale
+an image instead of drawing hundreds of thousands of individual points per
+frame.
 """
 
 from __future__ import annotations
@@ -15,7 +20,6 @@ import numpy as np
 
 from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import (
-    QBrush,
     QColor,
     QImage,
     QMouseEvent,
@@ -25,12 +29,15 @@ from PySide6.QtGui import (
     QPixmap,
     QWheelEvent,
 )
-from PySide6.QtWidgets import QVBoxLayout, QWidget
+from PySide6.QtWidgets import QWidget
 
 from ..config import get_class_color
 from ..dtm_generator import generate_dtm
 
 logger = logging.getLogger("lidar_workbench.gui.view_dtm")
+
+# Maximum long-side pixel dimension of the cached scatter image.
+_SCATTER_MAX_DIM = 2048
 
 
 class ViewDTM(QWidget):
@@ -38,9 +45,13 @@ class ViewDTM(QWidget):
     2D top-down DTM view with point overlay and profile-line interaction.
 
     The user can:
-        - Pan and zoom the DTM raster.
-        - See ground points colour-coded by class.
-        - Draw a profile line by click-dragging.
+        - Pan (middle-button drag) and zoom (scroll wheel) the view.
+        - See ground points colour-coded by class (point mode) or the
+          interpolated DTM raster (DTM mode).
+        - Draw a profile line by left-click-dragging.
+
+    Class visibility is independent of the other views and is controlled
+    externally via :meth:`set_class_visibility`.
 
     Signals:
         profile_line_defined(start_xy, end_xy):
@@ -65,14 +76,24 @@ class ViewDTM(QWidget):
 
         self._points_x: Optional[np.ndarray] = None
         self._points_y: Optional[np.ndarray] = None
+        self._points_z: Optional[np.ndarray] = None
         self._points_class: Optional[np.ndarray] = None
+
+        # Original (unsampled) arrays for DTM generation
+        self._points_x_orig: Optional[np.ndarray] = None
+        self._points_y_orig: Optional[np.ndarray] = None
+        self._points_z_orig: Optional[np.ndarray] = None
+        self._points_class_orig: Optional[np.ndarray] = None
+
+        # Class visibility: None = all classes visible
+        self._class_visibility: Optional[np.ndarray] = None
 
         # View transform
         self._offset_x: float = 0.0
         self._offset_y: float = 0.0
         self._scale: float = 1.0  # pixels per CRS unit
 
-        # Display toggle: show DTM raster or point scatter
+        # Display toggle: show DTM raster (True) or point scatter (False)
         self._show_dtm: bool = False
 
         # Profile drawing state
@@ -85,39 +106,35 @@ class ViewDTM(QWidget):
         self._corridor_end: Optional[Tuple[float, float]] = None
         self._corridor_width: float = 5.0
 
-        # Rendered DTM image (cached)
+        # Panning state
+        self._panning: bool = False
+        self._pan_last: Optional[QPointF] = None
+
+        # Cached rendered images
         self._dtm_pixmap: Optional[QPixmap] = None
+        self._scatter_pixmap: Optional[QPixmap] = None
+        self._scatter_bbox: Optional[Tuple[float, float, float, float]] = None
 
     # ── public API ─────────────────────────────────────────────────
 
-    def load_points(
-        self,
-        data: dict,
-        ground_class: int = 2,
-    ) -> None:
+    def load_points(self, data: dict) -> None:
         """
         Load point data for 2D top-down display.
 
         DTM generation is **not** performed here — it is a batch operation
-        done after classification.  This view shows a simple 2D point
-        scatter coloured by elevation for fast interactive browsing.
+        done after classification.  This view shows a class-coloured 2D
+        point scatter for fast interactive browsing.
 
         Args:
             data: Dict with keys ``x, y, z, classification``.
-            ground_class: ASPRS code for ground (default 2).  Unused during
-                          interactive viewing; used only by batch DTM export.
         """
         xs = data["x"]
         ys = data["y"]
         zs = data["z"]
-        cls = data.get("classification", np.zeros(len(xs), dtype=np.uint8))
+        cls = data.get("classification")
+        if cls is None:
+            cls = np.zeros(len(xs), dtype=np.uint8)
 
-        self._points_x = xs
-        self._points_y = ys
-        self._points_z = zs
-        self._points_class = cls
-
-        # Keep originals for later DTM generation
         self._points_x_orig = xs
         self._points_y_orig = ys
         self._points_z_orig = zs
@@ -131,11 +148,17 @@ class ViewDTM(QWidget):
             self._points_y = ys[::step]
             self._points_z = zs[::step]
             self._points_class = cls[::step]
+        else:
+            self._points_x = xs
+            self._points_y = ys
+            self._points_z = zs
+            self._points_class = cls
 
-        # Clear any cached DTM
+        # Clear any cached DTM (regenerated explicitly via generate_dtm)
         self._dtm_grid_x = None
         self._dtm_grid_y = None
         self._dtm_grid_z = None
+        self._dtm_pixmap = None
 
         self._render_scatter()
         self._fit_view()
@@ -148,8 +171,8 @@ class ViewDTM(QWidget):
         try:
             xs = self._points_x_orig
             ys = self._points_y_orig
-            zs = getattr(self, '_points_z_orig', np.zeros_like(xs))
-            cls = getattr(self, '_points_class_orig', np.zeros(len(xs), dtype=np.uint8))
+            zs = self._points_z_orig
+            cls = self._points_class_orig
             gx, gy, gz, bbox = generate_dtm(xs, ys, zs, cls, ground_class=ground_class)
             self._dtm_grid_x = gx
             self._dtm_grid_y = gy
@@ -166,14 +189,22 @@ class ViewDTM(QWidget):
     def toggle_dtm(self) -> None:
         """Toggle between DTM raster and point scatter view."""
         self._show_dtm = not self._show_dtm
-        self._fit_view()
+        self.update()
+
+    def set_class_visibility(self, visibility: Optional[np.ndarray]) -> None:
+        """Set which ASPRS classes are visible (bool array indexed by class code)."""
+        self._class_visibility = visibility
+        self._render_scatter()
         self.update()
 
     def contextMenuEvent(self, event) -> None:
         """Right-click context menu."""
         from PySide6.QtWidgets import QMenu
         menu = QMenu(self)
-        label = "🟢 Show Points" if self._show_dtm else "🗻 Show DTM"
+        if self._show_dtm and self._dtm_pixmap is not None:
+            label = "🟢 Show Points"
+        else:
+            label = "🗻 Show DTM"
         toggle_action = menu.addAction(label)
         toggle_action.triggered.connect(self.toggle_dtm)
         menu.addSeparator()
@@ -182,14 +213,21 @@ class ViewDTM(QWidget):
         menu.exec(event.globalPos())
 
     def clear(self) -> None:
-        """Clear all data."""
+        """Clear all data (class visibility preference is preserved)."""
         self._dtm_grid_x = None
         self._dtm_grid_y = None
         self._dtm_grid_z = None
         self._points_x = None
         self._points_y = None
+        self._points_z = None
         self._points_class = None
+        self._points_x_orig = None
+        self._points_y_orig = None
+        self._points_z_orig = None
+        self._points_class_orig = None
         self._dtm_pixmap = None
+        self._scatter_pixmap = None
+        self._scatter_bbox = None
         self._profile_start = None
         self._profile_end = None
         self._corridor_start = None
@@ -228,19 +266,23 @@ class ViewDTM(QWidget):
         wy = (py - self.height() / 2) / self._scale + self._offset_y
         return wx, wy
 
-    def _show_context_menu(self, pos):
-        """Right-click context menu."""
-        from PySide6.QtWidgets import QMenu
-        menu = QMenu(self)
-        dtm_action = menu.addAction("Generate DTM from Ground Points")
-        dtm_action.triggered.connect(lambda: self.generate_dtm())
-        menu.exec(self.mapToGlobal(pos.toPoint()))
+    def _bbox_to_widget_rect(self, bbox: Tuple[float, float, float, float]) -> QRectF:
+        """Convert a world-space bbox ``(x_min, x_max, y_min, y_max)`` to a widget rect."""
+        x_min, x_max, y_min, y_max = bbox
+        p1 = self._world_to_widget(x_min, y_min)
+        p2 = self._world_to_widget(x_max, y_max)
+        return QRectF(p1, p2).normalized()
 
     def _fit_view(self) -> None:
-        """Fit the DTM bbox to the widget."""
-        if self._dtm_grid_x is None or self._dtm_grid_y is None:
+        """Fit the view to the point extent (falling back to the DTM bbox)."""
+        if self._points_x is not None and len(self._points_x) > 0:
+            x_min, x_max = float(self._points_x.min()), float(self._points_x.max())
+            y_min, y_max = float(self._points_y.min()), float(self._points_y.max())
+        elif self._dtm_grid_x is not None and self._dtm_grid_y is not None:
+            x_min, x_max, y_min, y_max = self._dtm_bbox
+        else:
             return
-        x_min, x_max, y_min, y_max = self._dtm_bbox
+
         cx = (x_min + x_max) / 2
         cy = (y_min + y_max) / 2
         self._offset_x = cx
@@ -255,51 +297,84 @@ class ViewDTM(QWidget):
     # ── rendering ──────────────────────────────────────────────────
 
     def _render_scatter(self) -> None:
-        """Pre-render a fast 2D height-coloured point scatter as a QPixmap."""
+        """Pre-render the class-coloured 2D point scatter as a QPixmap."""
         if self._points_x is None or len(self._points_x) == 0:
-            self._dtm_pixmap = None
+            self._scatter_pixmap = None
+            self._scatter_bbox = None
             return
-
-        w, h = self.width(), self.height()
-        if w < 2 or h < 2:
-            w, h = 400, 300
 
         xs = self._points_x
         ys = self._points_y
-        zs = self._points_z
+        cls = self._points_class
 
-        # Normalise coordinates to pixel space
-        x_min, x_max = xs.min(), xs.max()
-        y_min, y_max = ys.min(), ys.max()
+        # Apply class visibility filter
+        if cls is not None and self._class_visibility is not None:
+            vis = self._class_visibility[np.asarray(cls, dtype=np.int64)]
+            xs = xs[vis]
+            ys = ys[vis]
+            cls = cls[vis]
+
+        if len(xs) == 0:
+            self._scatter_pixmap = None
+            self._scatter_bbox = None
+            return
+
+        # World bbox with a small pad
+        x_min, x_max = float(xs.min()), float(xs.max())
+        y_min, y_max = float(ys.min()), float(ys.max())
         x_pad = (x_max - x_min) * 0.02 or 1.0
         y_pad = (y_max - y_min) * 0.02 or 1.0
-        px = ((xs - x_min + x_pad) / (x_max - x_min + 2 * x_pad) * (w - 1)).astype(np.int32)
-        py = ((y_max - ys + y_pad) / (y_max - y_min + 2 * y_pad) * (h - 1)).astype(np.int32)
-        # Clip
-        px = np.clip(px, 0, w - 1)
-        py = np.clip(py, 0, h - 1)
+        x_min -= x_pad
+        x_max += x_pad
+        y_min -= y_pad
+        y_max += y_pad
 
-        # Height colour map
-        z_min, z_max = float(zs.min()), float(zs.max())
-        if z_max <= z_min:
-            z_norm = np.full_like(zs, 0.5)
+        span_x = (x_max - x_min) or 1.0
+        span_y = (y_max - y_min) or 1.0
+        long_side = max(span_x, span_y)
+        res = long_side / _SCATTER_MAX_DIM  # world units per pixel
+        w = max(2, int(round(span_x / res)))
+        h = max(2, int(round(span_y / res)))
+
+        col = ((xs - x_min) / span_x * (w - 1)).astype(np.int32)
+        row = ((ys - y_min) / span_y * (h - 1)).astype(np.int32)
+        col = np.clip(col, 0, w - 1)
+        row = np.clip(row, 0, h - 1)
+
+        # Transparent RGBA canvas
+        img = np.zeros((h, w, 4), dtype=np.uint8)
+
+        def _stamp(rows, cols, rgb):
+            rows = np.clip(rows, 0, h - 1)
+            cols = np.clip(cols, 0, w - 1)
+            img[rows, cols, 0] = rgb[0]
+            img[rows, cols, 1] = rgb[1]
+            img[rows, cols, 2] = rgb[2]
+            img[rows, cols, 3] = 255
+
+        if cls is not None:
+            for code in np.unique(cls):
+                m = cls == code
+                r, g, b = get_class_color(int(code))
+                rgb = (int(r * 255), int(g * 255), int(b * 255))
+                rr = row[m]
+                cc = col[m]
+                # Draw a small 2x2 block so points remain visible when zoomed out
+                _stamp(rr, cc, rgb)
+                _stamp(rr, cc + 1, rgb)
+                _stamp(rr + 1, cc, rgb)
+                _stamp(rr + 1, cc + 1, rgb)
         else:
-            z_norm = (zs - z_min) / (z_max - z_min)
+            rr = row
+            cc = col
+            _stamp(rr, cc, (200, 200, 200))
+            _stamp(rr, cc + 1, (200, 200, 200))
+            _stamp(rr + 1, cc, (200, 200, 200))
+            _stamp(rr + 1, cc + 1, (200, 200, 200))
 
-        # RGB array
-        img = np.zeros((h, w, 3), dtype=np.uint8)
-        r = np.clip((z_norm - 0.5) * 4.0, 0, 1) + np.clip((z_norm - 0.75) * 4.0, 0, 1)
-        g = np.clip(z_norm * 4.0, 0, 1) * (z_norm <= 0.5) + np.clip((1 - z_norm) * 4.0, 0, 1) * (z_norm > 0.5)
-        b = np.clip((0.25 - z_norm) * 4.0, 0, 1) + np.clip((0.5 - z_norm) * 4.0, 0, 1) * (z_norm > 0.25)
-        b = np.clip(b, 0, 1)
-        cr = (r * 255).astype(np.uint8)
-        cg = (g * 255).astype(np.uint8)
-        cb = (b * 255).astype(np.uint8)
-
-        img[py, px] = np.column_stack((cr, cg, cb))
-
-        qimg = QImage(img.data, w, h, w * 3, QImage.Format_RGB888)
-        self._dtm_pixmap = QPixmap.fromImage(qimg.copy())
+        qimg = QImage(img.data, w, h, w * 4, QImage.Format_RGBA8888)
+        self._scatter_pixmap = QPixmap.fromImage(qimg.copy())
+        self._scatter_bbox = (x_min, x_max, y_min, y_max)
 
     def _render_dtm(self) -> None:
         """Pre-render the DTM raster as a QPixmap with hillshade relief."""
@@ -387,27 +462,24 @@ class ViewDTM(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), QColor("#1a1a2e"))
 
-        # Draw DTM raster (if toggled on)
-        if self._show_dtm and self._dtm_pixmap is not None and not self._dtm_pixmap.isNull():
-            x_min, x_max, y_min, y_max = self._dtm_bbox
-            top_left = self._world_to_widget(x_min, y_min)
-            bottom_right = self._world_to_widget(x_max, y_max)
-            target_rect = QRectF(top_left, bottom_right)
-            painter.drawPixmap(target_rect.toRect(), self._dtm_pixmap)
+        show_raster = self._show_dtm and self._dtm_pixmap is not None
 
-        # Draw point overlay — always visible when we have points
-        if self._points_x is not None:
-            painter.setPen(Qt.NoPen)
-            n = len(self._points_x)
-            # Downsample for performance
-            step = max(1, n // 75_000)
-            for i in range(0, n, step):
-                pt = self._world_to_widget(self._points_x[i], self._points_y[i])
-                cls = self._points_class[i] if self._points_class is not None else 0
-                r, g, b = get_class_color(int(cls))
-                color = QColor(int(r * 255), int(g * 255), int(b * 255), 180)
-                painter.setBrush(QBrush(color))
-                painter.drawEllipse(pt, 2, 2)
+        if show_raster:
+            # DTM raster (hillshade) — smooth scaling looks better here
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+            target_rect = self._bbox_to_widget_rect(self._dtm_bbox)
+            painter.drawPixmap(
+                target_rect, self._dtm_pixmap,
+                QRectF(0, 0, self._dtm_pixmap.width(), self._dtm_pixmap.height()),
+            )
+            painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+        elif self._scatter_pixmap is not None and self._scatter_bbox is not None:
+            # Class-coloured point scatter
+            target_rect = self._bbox_to_widget_rect(self._scatter_bbox)
+            painter.drawPixmap(
+                target_rect, self._scatter_pixmap,
+                QRectF(0, 0, self._scatter_pixmap.width(), self._scatter_pixmap.height()),
+            )
 
         # Draw profile line
         if self._profile_start is not None:
@@ -471,10 +543,22 @@ class ViewDTM(QWidget):
             self._profile_start = (wx, wy)
             self._profile_end = (wx, wy)
             self.update()
-        elif event.button() == Qt.RightButton:
-            self._show_context_menu(event.position())
+        elif event.button() == Qt.MiddleButton:
+            self._panning = True
+            self._pan_last = event.position()
+            self.setCursor(Qt.ClosedHandCursor)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._panning:
+            if self._pan_last is not None:
+                dx = event.position().x() - self._pan_last.x()
+                dy = event.position().y() - self._pan_last.y()
+                self._offset_x -= dx / self._scale
+                self._offset_y -= dy / self._scale
+            self._pan_last = event.position()
+            self.update()
+            return
+
         wx, wy = self._widget_to_world(event.position().x(), event.position().y())
         if self._drawing_profile:
             self._profile_end = (wx, wy)
@@ -495,14 +579,28 @@ class ViewDTM(QWidget):
                 if dx * dx + dy * dy > 1.0:  # minimum length
                     self.profile_line_defined.emit(self._profile_start, self._profile_end)
             self.update()
+        elif event.button() == Qt.MiddleButton and self._panning:
+            self._panning = False
+            self._pan_last = None
+            self.unsetCursor()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        """Zoom in/out."""
+        """Zoom in/out, centred on the cursor position."""
+        px = event.position().x()
+        py = event.position().y()
+        wx, wy = self._widget_to_world(px, py)
+
         factor = 1.1 if event.angleDelta().y() > 0 else 0.9
-        self._scale *= factor
-        self._scale = max(0.001, min(self._scale, 1000.0))
+        self._scale = max(0.001, min(self._scale * factor, 1000.0))
+
+        # Keep the world point under the cursor stationary
+        self._offset_x = wx - (px - self.width() / 2) / self._scale
+        self._offset_y = wy - (py - self.height() / 2) / self._scale
         self.update()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self._render_dtm()
+        # Re-render scatter at the same world resolution (no-op unless the
+        # cached image was never built); keep the user's current zoom/pan.
+        if self._scatter_pixmap is None:
+            self._render_scatter()

@@ -36,11 +36,13 @@ def load_general_settings() -> dict:
     """Load general settings, falling back to defaults."""
     from ..config import (
         DEFAULT_FILTER_WORKERS, DEFAULT_CLASSIFY_WORKERS, DEFAULT_BATHY_WORKERS,
+        DEFAULT_GROUND_WORKERS,
         DEFAULT_BRUSH_RADIUS_M, DEFAULT_RECT_WIDTH_M, DEFAULT_RECT_HEIGHT_M,
     )
     defaults = {"filter_workers": DEFAULT_FILTER_WORKERS,
                 "classify_workers": DEFAULT_CLASSIFY_WORKERS,
                 "bathy_workers": DEFAULT_BATHY_WORKERS,
+                "ground_workers": DEFAULT_GROUND_WORKERS,
                 "brush_radius": DEFAULT_BRUSH_RADIUS_M,
                 "rect_width": DEFAULT_RECT_WIDTH_M,
                 "rect_height": DEFAULT_RECT_HEIGHT_M}
@@ -231,6 +233,16 @@ class SettingsDialog(QDialog):
         gen3_layout.addStretch()
         layout.addLayout(gen3_layout)
 
+        gen4_layout = QHBoxLayout()
+        gen4_layout.addWidget(QLabel("Ground parallel workers:"))
+        self._ground_workers_spin = QSpinBox()
+        self._ground_workers_spin.setRange(1, 16)
+        self._ground_workers_spin.setValue(self._settings.get("ground_workers", 4))
+        self._ground_workers_spin.setToolTip("Number of tiles to classify ground in parallel")
+        gen4_layout.addWidget(self._ground_workers_spin)
+        gen4_layout.addStretch()
+        layout.addLayout(gen4_layout)
+
         # ── Manual edit tool sizes ─────────────────────────────────
         layout.addWidget(QLabel("<b>Manual Edit Tools</b>"))
         
@@ -299,6 +311,7 @@ class SettingsDialog(QDialog):
         self._settings["filter_workers"] = self._filter_workers_spin.value()
         self._settings["classify_workers"] = self._classify_workers_spin.value()
         self._settings["bathy_workers"] = self._bathy_workers_spin.value()
+        self._settings["ground_workers"] = self._ground_workers_spin.value()
         self._settings["brush_radius"] = self._brush_radius_spin.value()
         self._settings["rect_width"] = self._rect_width_spin.value()
         self._settings["rect_height"] = self._rect_height_spin.value()

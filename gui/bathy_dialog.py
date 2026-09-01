@@ -41,6 +41,7 @@ from ..noise_filter import (
     water_surface_ghost_removal,
     river_corridor_mask,
     benthic_continuity_filter,
+    extract_bathy_bed,
 )
 from ..refraction import (
     apply_snells_correction,
@@ -164,7 +165,7 @@ class _BathyWorker(QThread):
         # ── Early skip: tile with zero bathy points ─────────────────
         st = result.get("sensor_type")
         has_bathy = (st is not None and (st == 2).any()) if st is not None else False
-        bathy_step_names = {"snells", "water_surface", "river_crop", "benthic", "ws_crop"}
+        bathy_step_names = {"snells", "water_surface", "river_crop", "benthic", "ws_crop", "bed_extract"}
         has_non_bathy_steps = any(s["name"] not in bathy_step_names
                                   for s in self._steps)
         if not has_bathy and not has_non_bathy_steps and len(result["x"]) > 0:
@@ -318,6 +319,28 @@ class _BathyWorker(QThread):
                             and (result["sensor_type"] == 2).any())
                 if is_bathy:
                     k = k | (result["sensor_type"] != 2)
+                _subset_all(k)
+
+            elif name == "bed_extract":
+                label = f"Extract riverbed…" if n_tiles == 1 else f"Tile {tile_idx+1}/{n_tiles}: Extract riverbed…"
+                self.progress.emit(label, tile_pct_base + pct_base * tile_pct_range / 100)
+                bed = extract_bathy_bed(
+                    result["x"], result["y"], result["z"],
+                    result.get("sensor_type"),
+                    return_numbers=result.get("return_number"),
+                    num_returns=result.get("num_returns"),
+                    cell_size=step.get("cell_size"),
+                    tolerance=step.get("tolerance", 1.0),
+                    progress=lambda msg, pct: self.progress.emit(
+                        msg, tile_pct_base + pct_base * tile_pct_range / 100
+                    ),
+                )
+                # Keep the riverbed + everything non-bathy (topo/land).
+                st = result.get("sensor_type")
+                if st is not None:
+                    k = bed | (st != 2)
+                else:
+                    k = bed
                 _subset_all(k)
 
         return result
@@ -612,6 +635,43 @@ class BathyDialog(QDialog):
         bf.addRow("Max Slope:", self._benthic_slope_spin)
         layout.addWidget(benthic_group)
 
+        # ═══════════════════════════════════════════════════════════
+        # 5. Extract Riverbed (bathy bed-only)
+        # ═══════════════════════════════════════════════════════════
+        bed_group = QGroupBox("5. Extract Riverbed (bathy bed-only)")
+        bedf = QFormLayout(bed_group)
+        self._bed_extract_enabled = QCheckBox(
+            "Extract riverbed from green-laser points (keep bed only)"
+        )
+        self._bed_extract_enabled.setChecked(False)
+        self._bed_extract_enabled.setToolTip(
+            "Keeps only the riverbed (bathymetric last returns at the "
+            "local minimum elevation) and drops the water surface, water "
+            "column, ghost and aquatic-vegetation returns.  Topographic "
+            "points are preserved."
+        )
+        bedf.addRow(self._bed_extract_enabled)
+        self._bed_cell_spin = QDoubleSpinBox()
+        self._bed_cell_spin.setRange(1.0, 20.0)
+        self._bed_cell_spin.setDecimals(1)
+        self._bed_cell_spin.setValue(3.0)
+        self._bed_cell_spin.setSuffix(" m")
+        self._bed_cell_spin.setToolTip(
+            "Grid cell size for the local bed reference."
+        )
+        bedf.addRow("Bed Cell Size:", self._bed_cell_spin)
+        self._bed_tol_spin = QDoubleSpinBox()
+        self._bed_tol_spin.setRange(0.1, 10.0)
+        self._bed_tol_spin.setDecimals(2)
+        self._bed_tol_spin.setValue(1.0)
+        self._bed_tol_spin.setSuffix(" m")
+        self._bed_tol_spin.setToolTip(
+            "Max height above the local bed a point may sit and still "
+            "count as bed."
+        )
+        bedf.addRow("Bed Tolerance:", self._bed_tol_spin)
+        layout.addWidget(bed_group)
+
         # ── Progress ──
         self._status = QLabel("Ready")
         layout.addWidget(self._status)
@@ -885,6 +945,12 @@ class BathyDialog(QDialog):
                 "name": "benthic",
                 "search_radius": self._benthic_radius_spin.value(),
                 "max_slope": self._benthic_slope_spin.value(),
+            })
+        if self._bed_extract_enabled.isChecked():
+            steps.append({
+                "name": "bed_extract",
+                "cell_size": self._bed_cell_spin.value(),
+                "tolerance": self._bed_tol_spin.value(),
             })
 
         if not steps:

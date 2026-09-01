@@ -21,16 +21,20 @@ from typing import Optional
 import numpy as np
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QMenu,
+    QPushButton,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
+from ..config import ASPRS_CLASS_COLORS, ASPRS_CLASS_NAMES
 from .view_3d import View3D
 from .view_dtm import ViewDTM
 from .view_profile import ViewProfile
@@ -64,6 +68,16 @@ class MultiViewWidget(QWidget):
         super().__init__(parent)
         self._current_tile_id: Optional[str] = None
         self._point_data: Optional[dict] = None
+
+        # Per-viewer ASPRS class visibility (indexed by class code).
+        # Each viewer can hide/show classes independently.
+        self._class_visibility = {
+            "3d": np.ones(256, dtype=bool),
+            "dtm": np.ones(256, dtype=bool),
+            "profile": np.ones(256, dtype=bool),
+        }
+        self._class_menus: dict = {}
+
         self._setup_ui()
 
     def _setup_ui(self) -> None:
@@ -98,6 +112,19 @@ class MultiViewWidget(QWidget):
         toolbar.addWidget(QLabel("Colour:"))
         toolbar.addWidget(self._colour_combo)
 
+        toolbar.addSpacing(12)
+
+        # Per-viewer class visibility buttons
+        toolbar.addWidget(QLabel("Classes:"))
+        self._cls_btn_3d = self._add_class_button("3d", "3D")
+        self._cls_btn_dtm = self._add_class_button("dtm", "DTM")
+        self._cls_btn_profile = self._add_class_button("profile", "Profile")
+        toolbar.addWidget(self._cls_btn_3d)
+        toolbar.addWidget(self._cls_btn_dtm)
+        toolbar.addWidget(self._cls_btn_profile)
+
+        toolbar.addSpacing(12)
+
         # Flightline toggle checkboxes (populated on load)
         self._fl_toggle_layout = QHBoxLayout()
         self._fl_toggle_layout.setContentsMargins(0, 0, 0, 0)
@@ -130,6 +157,93 @@ class MultiViewWidget(QWidget):
 
         main_layout.addWidget(self._vertical_splitter, stretch=1)
 
+    # ── per-viewer class visibility ───────────────────────────────
+
+    def _add_class_button(self, view_key: str, label: str) -> QPushButton:
+        """Create a toolbar button with a checkable ASPRS-class popup menu."""
+        btn = QPushButton(f"{label} ▾")
+        btn.setFlat(True)
+        btn.setToolTip(f"Toggle ASPRS class visibility in the {label} view")
+        btn.setStyleSheet(
+            "QPushButton { padding: 2px 6px; font-weight: bold; }"
+            "QPushButton::menu-indicator { image: none; }"
+        )
+        menu = QMenu(btn)
+        btn.setMenu(menu)
+        menu.triggered.connect(
+            lambda action, key=view_key: self._on_class_toggled(key, action)
+        )
+        menu.aboutToShow.connect(
+            lambda key=view_key: self._rebuild_class_menu(key)
+        )
+        self._class_menus[view_key] = menu
+        return btn
+
+    def _rebuild_class_menu(self, view_key: str) -> None:
+        """(Re)build the popup menu for one viewer from its visibility state."""
+        menu = self._class_menus.get(view_key)
+        if menu is None:
+            return
+        menu.clear()
+
+        vis = self._class_visibility[view_key]
+
+        all_action = menu.addAction("▸ Show All")
+        all_action.setData(-1)
+        none_action = menu.addAction("▸ Hide All")
+        none_action.setData(-2)
+        menu.addSeparator()
+
+        for code in sorted(ASPRS_CLASS_NAMES.keys()):
+            name = ASPRS_CLASS_NAMES[code]
+            r, g, b = ASPRS_CLASS_COLORS.get(code, (0.5, 0.5, 0.5))
+            pm = QPixmap(14, 14)
+            pm.fill(QColor(int(r * 255), int(g * 255), int(b * 255)))
+            action = menu.addAction(f"{code:2d}: {name}")
+            action.setCheckable(True)
+            action.setChecked(bool(vis[code]))
+            action.setData(code)
+            action.setIcon(pm)
+
+    def _on_class_toggled(self, view_key: str, action) -> None:
+        """Handle a class-visibility menu action for one viewer."""
+        code = action.data()
+        vis = self._class_visibility[view_key]
+        if code == -1:
+            vis[:] = True
+        elif code == -2:
+            vis[:] = False
+        else:
+            vis[code] = action.isChecked()
+
+        self._apply_class_visibility(view_key)
+
+    def _apply_class_visibility(self, view_key: str) -> None:
+        """Push the stored visibility for one viewer to its widget."""
+        vis = self._class_visibility[view_key]
+        if view_key == "3d":
+            self._view_3d.set_class_visibility(vis)
+        elif view_key == "dtm":
+            self._view_dtm.set_class_visibility(vis)
+        elif view_key == "profile":
+            self._view_profile.set_class_visibility(vis)
+
+    def _apply_all_class_visibility(self) -> None:
+        """Push all three viewers' visibility state to their widgets."""
+        for key in ("3d", "dtm", "profile"):
+            self._apply_class_visibility(key)
+
+    def set_class_visibility(self, view_key: str, visibility: np.ndarray) -> None:
+        """Set the class-visibility array for one viewer (``3d``/``dtm``/``profile``)."""
+        if view_key not in self._class_visibility:
+            raise ValueError(f"Unknown view key: {view_key!r}")
+        self._class_visibility[view_key] = np.asarray(visibility, dtype=bool)
+        self._apply_class_visibility(view_key)
+
+    def class_visibility(self, view_key: str) -> np.ndarray:
+        """Return the current class-visibility array for one viewer."""
+        return self._class_visibility[view_key]
+
     # ── public API ─────────────────────────────────────────────────
 
     def load_tile(self, tile_id: str, point_data: dict) -> None:
@@ -158,6 +272,9 @@ class MultiViewWidget(QWidget):
 
         # Clear profile view (populated when a profile line is drawn)
         self._view_profile.clear()
+
+        # Re-apply per-viewer class visibility (views may have been reloaded)
+        self._apply_all_class_visibility()
 
         # Rebuild flightline toggle checkboxes
         self._rebuild_flightline_toggles()

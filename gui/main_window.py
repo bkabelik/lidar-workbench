@@ -16,8 +16,8 @@ from typing import List, Optional
 
 import numpy as np
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QKeySequence, QPixmap
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -25,7 +25,6 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMainWindow,
-    QMenu,
     QMenuBar,
     QMessageBox,
     QPushButton,
@@ -39,7 +38,6 @@ from PySide6.QtWidgets import (
 
 from ..config import (
     APP_DESCRIPTION, APP_NAME, APP_ORG, APP_VERSION, APP_WEBSITE,
-    ASPRS_CLASS_COLORS, ASPRS_CLASS_NAMES,
     DEFAULT_PROFILE_WIDTH_M, QCStatus, TileStatus,
 )
 from ..database import Database
@@ -59,6 +57,64 @@ from .settings_dialog import SettingsDialog, load_shortcuts
 from .tile_list_widget import TileListWidget
 
 logger = logging.getLogger("lidar_workbench.gui.main_window")
+
+
+class _ExportLasWorker(QThread):
+    """Background worker that clips tiles to their core and writes LAS files.
+
+    Tiles are processed in parallel via :class:`ProcessPoolExecutor` so
+    several large LAS files can be read/written concurrently.
+    """
+
+    progress = Signal(int, int)          # done, total
+    tile_done = Signal(str, str)         # tile_id, written path
+    finished_all = Signal(int)           # number of exported tiles
+    error = Signal(str)
+
+    def __init__(self, jobs: list, output_dir: str, global_bbox: tuple,
+                 overlap_m: float, workers: int = 4, parent=None):
+        super().__init__(parent)
+        self._jobs = list(jobs)
+        self._output_dir = output_dir
+        self._global_bbox = tuple(global_bbox)
+        self._overlap_m = float(overlap_m)
+        self._workers = max(1, int(workers))
+
+    def run(self) -> None:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        from ..export_manager import export_las_tile
+
+        total = len(self._jobs)
+        if total == 0:
+            self.finished_all.emit(0)
+            return
+
+        done = 0
+        try:
+            with ProcessPoolExecutor(max_workers=min(self._workers, total)) as pool:
+                futures = {
+                    pool.submit(
+                        export_las_tile,
+                        job, self._output_dir, self._global_bbox, self._overlap_m,
+                    ): job
+                    for job in self._jobs
+                }
+                for fut in as_completed(futures):
+                    job = futures[fut]
+                    try:
+                        path = fut.result()
+                        if path:
+                            self.tile_done.emit(job["tile_id"], path)
+                    except Exception as exc:
+                        logger.exception("LAS export failed for %s", job["tile_id"])
+                        self.error.emit(f"{job['tile_id']}: {exc}")
+                    done += 1
+                    self.progress.emit(done, total)
+            self.finished_all.emit(done)
+        except Exception as exc:
+            logger.exception("LAS export failed")
+            self.error.emit(str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -98,9 +154,6 @@ class MainWindow(QMainWindow):
         self._dtm_ref_distances: Optional[np.ndarray] = None
         self._dtm_ref_elevations: Optional[np.ndarray] = None
 
-        # Class visibility filter (indexed by ASPRS class code, all visible by default)
-        self.class_visibility = np.ones(256, dtype=bool)
-
         # Cached profile line for width changes
         self._profile_start: Optional[tuple] = None
         self._profile_end: Optional[tuple] = None
@@ -111,6 +164,10 @@ class MainWindow(QMainWindow):
 
         # Keep ground-control dialog alive (non-modal, prevent GC of wrapper)
         self._ground_control_dlg: Optional[GroundControlDialog] = None
+
+        # True when the project has changes that haven't been persisted via
+        # File → Save Project (tile/geometry edits, processing results, …).
+        self._project_dirty = False
 
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.setMinimumSize(1200, 700)
@@ -132,23 +189,56 @@ class MainWindow(QMainWindow):
         logger.info("MainWindow initialised")
 
     def closeEvent(self, event) -> None:
-        """Handle window close — prompt to save if tiles have been edited."""
-        try:
-            edited = self._db.get_tiles_by_status(TileStatus.EDITED)
-            if edited:
-                reply = QMessageBox.question(
-                    self, "Unsaved Changes",
-                    f"You have {len(edited)} tile(s) with unsaved edits.\n"
-                    "Close anyway?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                if reply == QMessageBox.No:
-                    event.ignore()
-                    return
-        except Exception:
-            pass
+        """Handle window close — ask to save the project if it is dirty.
+
+        Tile LAS files are written immediately after every processing step,
+        so the only thing that can remain unsaved is the project metadata
+        (project.json).  We track that with :attr:`_project_dirty`.
+        """
+        if not self._confirm_save_if_needed():
+            event.ignore()
+            return
         super().closeEvent(event)
+
+    def _mark_project_dirty(self) -> None:
+        """Record that the open project has unsaved changes."""
+        self._project_dirty = True
+
+    def _clear_project_dirty(self) -> None:
+        self._project_dirty = False
+
+    def _confirm_save_if_needed(self) -> bool:
+        """Return ``True`` when it is safe to close/switch the project.
+
+        If the current project has unsaved changes, prompt with
+        Save / Discard / Cancel.  Returns ``False`` only on Cancel.
+        """
+        if not self._pm.is_open or not self._project_dirty:
+            return True
+
+        reply = QMessageBox.question(
+            self,
+            "Unsaved Project Changes",
+            "The project has unsaved changes.\n"
+            "Save the project before closing?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+        if reply == QMessageBox.Save:
+            try:
+                self._on_save_project()
+            except Exception:
+                logger.exception("Failed to save project")
+                QMessageBox.critical(
+                    self, "Save Failed",
+                    "The project could not be saved.\n"
+                    "You can cancel closing and inspect the error.",
+                )
+                return False
+            return True
+        if reply == QMessageBox.Discard:
+            return True
+        return False  # Cancel
 
     # ── menu bar ───────────────────────────────────────────────────
 
@@ -242,6 +332,11 @@ class MainWindow(QMainWindow):
         export_action.triggered.connect(self._on_export_raster)
         tools_menu.addAction(export_action)
 
+        export_las_action = QAction("&Export LAS (Cut Tiles)…", self)
+        export_las_action.setObjectName("export_las_tiles")
+        export_las_action.triggered.connect(self._on_export_las)
+        tools_menu.addAction(export_las_action)
+
         tools_menu.addSeparator()
 
         crs_action = QAction("&CRS / Projection…", self)
@@ -306,7 +401,7 @@ class MainWindow(QMainWindow):
         classify_btn.triggered.connect(self._on_classify)
 
         ground_btn = toolbar.addAction("Ground")
-        ground_btn.setToolTip("Ground classification (SMRF or TIN)")
+        ground_btn.setToolTip("Ground classification (SMRF, EP-PTD, APTD, H-PTD, DL-Hybrid)")
         ground_btn.triggered.connect(self._on_ground_classify)
 
         bathy_btn = toolbar.addAction("Bathy")
@@ -322,67 +417,6 @@ class MainWindow(QMainWindow):
         crs_btn = toolbar.addAction("CRS")
         crs_btn.setToolTip("CRS / Projection (assign, transform, match points)")
         crs_btn.triggered.connect(self._on_crs)
-
-        toolbar.addSeparator()
-
-        self._class_vis_btn = QPushButton("Classes ▾")
-        self._class_vis_btn.setToolTip("Toggle visibility of ASPRS classes in all views")
-        self._class_vis_btn.setFlat(True)
-        self._class_vis_btn.setStyleSheet(
-            "QPushButton { padding: 2px 8px; font-weight: bold; }"
-            "QPushButton::menu-indicator { image: none; }"
-        )
-        self._class_vis_menu = QMenu(self._class_vis_btn)
-        self._class_vis_btn.setMenu(self._class_vis_menu)
-        toolbar.addWidget(self._class_vis_btn)
-        self._build_class_visibility_menu()
-
-    def _build_class_visibility_menu(self) -> None:
-        """Build the popup menu with checkable ASPRS class items."""
-        menu = self._class_vis_menu
-        menu.clear()
-        menu.triggered.disconnect()
-        menu.triggered.connect(self._on_class_visibility_toggled)
-
-        all_action = menu.addAction("▸ Show All")
-        all_action.setData(-1)
-        none_action = menu.addAction("▸ Hide All")
-        none_action.setData(-2)
-        menu.addSeparator()
-
-        for code in sorted(ASPRS_CLASS_NAMES.keys()):
-            name = ASPRS_CLASS_NAMES[code]
-            r, g, b = ASPRS_CLASS_COLORS.get(code, (0.5, 0.5, 0.5))
-            pm = QPixmap(14, 14)
-            pm.fill(QColor(int(r * 255), int(g * 255), int(b * 255)))
-            action = menu.addAction(f"{code:2d}: {name}")
-            action.setCheckable(True)
-            action.setChecked(bool(self.class_visibility[code]))
-            action.setData(code)
-            action.setIcon(pm)
-
-    def _on_class_visibility_toggled(self, action: QAction) -> None:
-        code = action.data()
-        if code == -1:
-            self.class_visibility[:] = True
-        elif code == -2:
-            self.class_visibility[:] = False
-        else:
-            self.class_visibility[code] = action.isChecked()
-
-        # Rebuild menu to sync all check states
-        self._build_class_visibility_menu()
-
-        # Propagate to views instantly (no disk reload needed)
-        self._multi_view._view_3d.set_class_visibility(self.class_visibility)
-        self._multi_view._view_profile.set_class_visibility(self.class_visibility)
-
-        # Also do a full data reload for the profile view (class changes
-        # may affect profile selection state) if a tile is open
-        if self._editor.tile_id is not None:
-            data = self._tm.load_tile_points_full(self._editor.tile_id)
-            if data is not None:
-                self._multi_load_for_edit(data)
 
     def _setup_central_widget(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
@@ -533,6 +567,8 @@ class MainWindow(QMainWindow):
         _make("classify_high_noise", lambda: self._properties_panel.classify_requested.emit(18))
 
     def _on_new_project(self) -> None:
+        if not self._confirm_save_if_needed():
+            return
         directory = QFileDialog.getExistingDirectory(
             self, "Select Project Location"
         )
@@ -555,6 +591,7 @@ class MainWindow(QMainWindow):
             proj_dir = Path(directory) / safe_name
             self._pm.create(proj_dir, name=name)
             self._sync_db()
+            self._clear_project_dirty()
             self._refresh_tile_list()
             self._add_recent_project(str(proj_dir))
             self.set_status(f"Created project '{name}' in {directory}")
@@ -564,6 +601,8 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", f"Failed to create project:\n{exc}")
 
     def _on_open_project(self) -> None:
+        if not self._confirm_save_if_needed():
+            return
         directory = QFileDialog.getExistingDirectory(
             self, "Open Project Directory"
         )
@@ -572,6 +611,7 @@ class MainWindow(QMainWindow):
         try:
             self._pm.open(directory)
             self._sync_db()
+            self._clear_project_dirty()
             self._refresh_tile_list()
             self._add_recent_project(directory)
             self.set_status(f"Opened project: {self._pm.metadata.get('name', directory)}")
@@ -583,6 +623,7 @@ class MainWindow(QMainWindow):
     def _on_save_project(self) -> None:
         if self._pm.is_open:
             self._pm.save()
+            self._clear_project_dirty()
             self.set_status("Project saved", timeout=3000)
 
     def _on_import(self) -> None:
@@ -598,6 +639,7 @@ class MainWindow(QMainWindow):
         if wizard.exec() == ImportWizard.Accepted:
             tile_ids = wizard.imported_tile_ids
             self._refresh_tile_list()
+            self._mark_project_dirty()
             self.set_status(f"Imported {len(tile_ids)} tile(s)", timeout=5000)
 
     def _on_preview(self) -> None:
@@ -633,6 +675,7 @@ class MainWindow(QMainWindow):
             wizard = ImportWizard(self._tm, parent=self, preselected_dir=directory)
             if wizard.exec() == ImportWizard.Accepted:
                 self._refresh_tile_list()
+                self._mark_project_dirty()
                 self.set_status(
                     f"Imported {len(wizard.imported_tile_ids)} tile(s) from "
                     f"{Path(directory).name}", timeout=5000
@@ -733,6 +776,7 @@ class MainWindow(QMainWindow):
             logger.info("Filter on %s: no noise points found", tile_id)
             self._tm.update_tile_status(tile_id, TileStatus.FILTERED)
             self._tile_list_widget.update_tile_status(tile_id, TileStatus.FILTERED)
+            self._mark_project_dirty()
             # Record processing time even for zero-noise results
             if duration > 0:
                 try:
@@ -859,6 +903,7 @@ class MainWindow(QMainWindow):
         # Update tile status
         self._tm.update_tile_status(tile_id, TileStatus.FILTERED)
         self._tile_list_widget.update_tile_status(tile_id, TileStatus.FILTERED)
+        self._mark_project_dirty()
         logger.info("Filtered %s: %d kept, %d noise → %s", tile_id, n_kept, n_noise, noise_name)
 
         # Record processing time
@@ -921,102 +966,69 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _on_ground_classify(self) -> None:
-        """Open the ground classification dialog for the currently open tile."""
-        if self._editor.tile_id is None:
-            QMessageBox.information(self, "No Tile Open",
-                                    "Please open a tile first (double-click in tile list).")
+        """Open the ground classification dialog for the selected tiles."""
+        selected = self._tile_list_widget.get_selected_tile_ids()
+        if not selected:
+            QMessageBox.information(
+                self, "No Tiles Selected",
+                "Select one or more tiles in the tile list first."
+            )
             return
-        data = self._tm.load_tile_points_full(self._editor.tile_id)
-        if data is None:
+
+        tiles_dir = self._pm.tiles_dir
+        if tiles_dir is None:
+            return
+
+        # Build small, picklable job descriptors for the worker processes.
+        jobs = []
+        for tid in selected:
+            tile_info = self._db.get_tile(tid)
+            if tile_info is None:
+                continue
+            las_path = tiles_dir / tile_info["filename"]
+            if not las_path.is_file():
+                continue
+            fl_raw = tile_info.get("flightline_sensor_types", "{}")
+            try:
+                fl_map = json.loads(fl_raw) if isinstance(fl_raw, str) else fl_raw
+            except Exception:
+                fl_map = {}
+            jobs.append({
+                "tile_id": tid,
+                "las_path": str(las_path),
+                "flightline_sensor_types": fl_map or {},
+            })
+
+        if not jobs:
+            QMessageBox.information(
+                self, "No Tiles",
+                "No readable LAS files found for the selected tiles."
+            )
             return
 
         from .ground_classify_dialog import GroundClassifyDialog
-        dlg = GroundClassifyDialog(data, tile_id=self._editor.tile_id, db=self._db, parent=self)
-        dlg.ground_applied.connect(lambda mask, sc: self._apply_ground_mask(mask, sc))
+        dlg = GroundClassifyDialog(jobs=jobs, db=self._db, parent=self)
+        dlg.tile_processed.connect(self._on_ground_tile_done)
+        dlg.ground_applied.connect(self._on_ground_all_saved)
         dlg.exec()
 
-    def _apply_ground_mask(self, mask: np.ndarray, source_class: int = -1) -> None:
-        """Apply ground classification mask to the current tile.
-
-        Args:
-            mask: Boolean array, True = ground.
-            source_class: Only reclassify points whose current class matches
-                          this value.  -1 means all points, -2 means
-                          classes 1 & 2 (unclassified + ground).
-        """
-        if self._editor.tile_id is None:
+    def _on_ground_tile_done(self, tile_id: str, result: dict) -> None:
+        """Update status after a worker process has written a tile."""
+        # Nothing changed for tiles without matching source-class points.
+        if result.get("n_affected", 0) == 0:
             return
-        full_data = self._tm.load_tile_points_full(self._editor.tile_id)
-        if full_data is None:
-            return
-        n_total = len(full_data["x"])
-        if len(mask) != n_total:
-            self.set_status("Ground mask size mismatch", timeout=5000)
-            return
+        self._tm.update_tile_status(tile_id, TileStatus.EDITED)
+        self._tile_list_widget.update_tile_status(tile_id, TileStatus.EDITED)
+        self._mark_project_dirty()
 
-        cls = full_data["classification"]
-        if source_class == -2:
-            # Classes 1 & 2 — allows re-running ground classification
-            in_source = (cls == 1) | (cls == 2)
-            cls[in_source & mask] = 2     # ground
-            cls[in_source & ~mask] = 1    # unclassified
-            n_affected = in_source.sum()
-        elif source_class >= 0:
-            # Only modify points matching the source class
-            in_source = (cls == source_class)
-            cls[in_source & mask] = 2     # ground
-            cls[in_source & ~mask] = 1    # unclassified
-            n_affected = in_source.sum()
-        else:
-            cls[mask] = 2     # ground
-            cls[~mask] = 1    # unclassified
-            n_affected = n_total
-
-        # ── Write updated classifications back to the LAS file ──────
-        tile_info = self._db.get_tile(self._editor.tile_id)
-        tiles_dir = self._pm.tiles_dir
-        if tile_info is not None and tiles_dir is not None:
-            from ..tile_manager import _read_las_header_template, _write_las_file
-            las_path = tiles_dir / tile_info["filename"]
-            # Preserve the original point format / VLRs / extra dims
-            try:
-                header_tmpl = _read_las_header_template(las_path)
-            except Exception:
-                header_tmpl = None
-            _write_las_file(
-                las_path,
-                full_data["x"], full_data["y"], full_data["z"],
-                classes=full_data["classification"],
-                intensities=full_data.get("intensity"),
-                return_numbers=full_data.get("return_number"),
-                num_returns=full_data.get("num_returns"),
-                point_source_ids=full_data.get("point_source_id"),
-                gps_times=full_data.get("gps_time"),
-                scan_angle_ranks=full_data.get("scan_angle_rank"),
-                scan_direction_flags=full_data.get("scan_direction_flag"),
-                edge_of_flight_lines=full_data.get("edge_of_flight_line"),
-                user_data_array=full_data.get("user_data"),
-                reds=full_data.get("red"),
-                greens=full_data.get("green"),
-                blues=full_data.get("blue"),
-                key_points=full_data.get("key_point"),
-                synthetics=full_data.get("synthetic"),
-                withhelds=full_data.get("withheld"),
-                overlaps=full_data.get("overlap"),
-                header_template=header_tmpl,
-                extra_dims=full_data.get("extra_dims"),
-            )
-            self._tm.update_tile_status(self._editor.tile_id, TileStatus.EDITED)
-
-        self._editor.open_tile(self._editor.tile_id)
-        self._multi_load_for_edit(full_data)
-        self._tile_list_widget.update_tile_status(self._editor.tile_id, TileStatus.EDITED)
+    def _on_ground_all_saved(self) -> None:
+        """Called when all ground-classified tiles have been processed."""
+        if self._editor.tile_id:
+            reload_data = self._tm.load_tile_points_full(self._editor.tile_id)
+            if reload_data:
+                self._multi_load_for_edit(reload_data)
+        self._refresh_tile_list()
         self._regenerate_dtm()
-        n_ground = mask.sum()
-        self.set_status(
-            f"Ground: {n_ground:,} / {n_affected:,} points ({n_ground/max(n_affected,1)*100:.1f}%)",
-            timeout=8000,
-        )
 
     def _on_bathy_process(self) -> None:
         """Open the bathymetry processing dialog for selected tiles."""
@@ -1119,6 +1131,60 @@ class MainWindow(QMainWindow):
             self._db.update_point_count(conn, tile_id, new_count)
 
         self._tile_list_widget.update_tile_status(tile_id, TileStatus.EDITED)
+        self._mark_project_dirty()
+
+    def _write_tile_data_to_las(self, tile_id: str, data: dict) -> bool:
+        """Write an in-memory tile data dict back to its LAS file.
+
+        Preserves the original header template / VLRs / extra dimensions and
+        updates the tile bbox + point count in the database afterwards.
+        """
+        tile_info = self._db.get_tile(tile_id)
+        if tile_info is None or self._pm.tiles_dir is None:
+            return False
+        las_path = self._pm.tiles_dir / tile_info["filename"]
+        if not las_path.is_file():
+            return False
+
+        from ..tile_manager import _read_las_header_template, _write_las_file
+
+        try:
+            header_template = _read_las_header_template(las_path)
+        except Exception:
+            header_template = None
+
+        _write_las_file(
+            las_path,
+            data["x"], data["y"], data["z"],
+            classes=data.get("classification"),
+            intensities=data.get("intensity"),
+            return_numbers=data.get("return_number"),
+            num_returns=data.get("num_returns"),
+            point_source_ids=data.get("point_source_id"),
+            gps_times=data.get("gps_time"),
+            scan_angle_ranks=data.get("scan_angle_rank"),
+            scan_angles=data.get("scan_angle"),
+            scan_direction_flags=data.get("scan_direction_flag"),
+            edge_of_flight_lines=data.get("edge_of_flight_line"),
+            user_data_array=data.get("user_data"),
+            reds=data.get("red"),
+            greens=data.get("green"),
+            blues=data.get("blue"),
+            key_points=data.get("key_point"),
+            synthetics=data.get("synthetic"),
+            withhelds=data.get("withheld"),
+            overlaps=data.get("overlap"),
+            header_template=header_template,
+            extra_dims=data.get("extra_dims"),
+        )
+
+        bbox = (
+            float(data["x"].min()), float(data["y"].min()),
+            float(data["x"].max()), float(data["y"].max()),
+        )
+        with self._db.connect() as conn:
+            self._db.update_tile_bbox(conn, tile_id, bbox, point_count=len(data["x"]))
+        return True
 
     def _on_ground_control(self) -> None:
         """Open the Ground Control dialog for selected tiles."""
@@ -1173,41 +1239,16 @@ class MainWindow(QMainWindow):
         data["y"] = data["y"] + dy
         data["z"] = data["z"] + dz
 
-        # Write back to LAS file
-        tile_info = self._db.get_tile(self._editor.tile_id)
-        if tile_info is None:
-            return
-
-        tiles_dir = self._pm.tiles_dir
-        if tiles_dir is None:
-            return
-
-        las_path = tiles_dir / tile_info["filename"]
-        if not las_path.is_file():
+        tile_id = self._editor.tile_id
+        if not self._write_tile_data_to_las(tile_id, data):
+            QMessageBox.critical(self, "Shift Failed", "Failed to write tile LAS file.")
             return
 
         try:
-            import laspy
-            import shutil
-
-            # Backup
-            backup_path = las_path.with_suffix(las_path.suffix + ".bak")
-            if not backup_path.exists():
-                shutil.copy2(las_path, backup_path)
-
-            with laspy.open(las_path, mode="rw") as writer:
-                writer.header = writer.header
-                las_data = writer.read()
-                las_data.x = data["x"]
-                las_data.y = data["y"]
-                las_data.z = data["z"]
-                writer.write(las_data)
-
-            self._editor.open_tile(self._editor.tile_id)
+            self._editor.open_tile(tile_id)
             self._multi_load_for_edit(data)
-            self._tile_list_widget.update_tile_status(
-                self._editor.tile_id, TileStatus.EDITED
-            )
+            self._tile_list_widget.update_tile_status(tile_id, TileStatus.EDITED)
+            self._mark_project_dirty()
             self._regenerate_dtm()
             if dx == 0.0 and dy == 0.0:
                 self.set_status(
@@ -1423,11 +1464,13 @@ class MainWindow(QMainWindow):
                 if new_z is not None:
                     data["z"] = new_z
                 # Write back
-                self._editor.open_tile(tid)
-                self._multi_load_for_edit(data)
-                self._tile_list_widget.update_tile_status(tid, TileStatus.EDITED)
-                if self._db:
-                    self._db.set_tile_crs(tid, int(target_epsg), None)
+                if self._write_tile_data_to_las(tid, data):
+                    self._editor.open_tile(tid)
+                    self._multi_load_for_edit(data)
+                    self._tile_list_widget.update_tile_status(tid, TileStatus.EDITED)
+                    if self._db:
+                        self._db.set_tile_crs(tid, int(target_epsg), None)
+            self._mark_project_dirty()
             self._regenerate_dtm()
             self.set_status(
                 f"CRS transformed {len(tile_ids)} tile(s): EPSG:{source_epsg} → EPSG:{target_epsg}",
@@ -1471,9 +1514,11 @@ class MainWindow(QMainWindow):
                     data["x"], data["y"], data["z"], params,
                 )
                 data["x"], data["y"], data["z"] = new_x, new_y, new_z
-                self._editor.open_tile(tid)
-                self._multi_load_for_edit(data)
-                self._tile_list_widget.update_tile_status(tid, TileStatus.EDITED)
+                if self._write_tile_data_to_las(tid, data):
+                    self._editor.open_tile(tid)
+                    self._multi_load_for_edit(data)
+                    self._tile_list_widget.update_tile_status(tid, TileStatus.EDITED)
+            self._mark_project_dirty()
             self._regenerate_dtm()
             self.set_status(
                 f"Applied {label} to {len(tile_ids)} tile(s) "
@@ -1485,7 +1530,12 @@ class MainWindow(QMainWindow):
             self.set_status("Match transform failed", timeout=5000)
 
     def _on_export_raster(self, tile_ids: Optional[List[str]] = None) -> None:
-        """Open the DTM / DSM export dialog."""
+        """Open the DTM / DSM export dialog.
+
+        Only bboxes are gathered up front; point data is loaded one tile
+        at a time inside the export worker so large projects never hold all
+        tiles in memory.
+        """
         if tile_ids is None:
             tile_ids = self._tile_list_widget.get_selected_tile_ids()
         if not tile_ids:
@@ -1495,32 +1545,65 @@ class MainWindow(QMainWindow):
             )
             return
 
-        selected = tile_ids
+        selected = list(tile_ids)
 
-        # Load point data and bboxes for selected tiles
-        self.set_status(f"Loading {len(selected)} tile(s) for export…", timeout=0)
-
-        tile_points: dict = {}
+        # Gather per-tile metadata only — no point data is loaded here.
+        # Use the LAS header as the authoritative bbox and heal the DB in
+        # the process (DB bboxes go stale after coordinate transforms / LAS
+        # replacement).
+        jobs: list = []
         tile_bboxes: dict = {}
-        for tile_id in selected:
-            data = self._tm.load_tile_points_full(tile_id)
-            bbox = self._tm.get_tile_bbox(tile_id)
-            if data is not None and bbox is not None:
-                tile_points[tile_id] = data
-                tile_bboxes[tile_id] = bbox
-
-        if not tile_points:
-            QMessageBox.warning(self, "Load Error", "Failed to load tile data.")
-            self.set_status("Export cancelled — failed to load tiles", timeout=5000)
+        missing: list = []
+        tiles_dir = self._pm.tiles_dir
+        if tiles_dir is None:
+            QMessageBox.warning(self, "Load Error", "Project tiles directory is unavailable.")
             return
+
+        for tile_id in selected:
+            tile_info = self._db.get_tile(tile_id)
+            if tile_info is None:
+                missing.append(tile_id)
+                continue
+            las_path = tiles_dir / tile_info["filename"]
+            if not las_path.is_file():
+                logger.warning("Skipping %s — LAS file missing: %s", tile_id, las_path)
+                missing.append(tile_id)
+                continue
+            bbox = self._tm.sync_tile_bbox_from_las(tile_id)
+            if bbox is None:
+                bbox = self._tm.get_tile_bbox(tile_id)
+            if bbox is None:
+                missing.append(tile_id)
+                continue
+            jobs.append({"tile_id": tile_id, "las_path": str(las_path), "bbox": bbox})
+            tile_bboxes[tile_id] = bbox
+
+        if not jobs:
+            QMessageBox.warning(self, "Load Error", "Failed to read tile metadata.")
+            self.set_status("Export cancelled — failed to read tiles", timeout=5000)
+            return
+
+        if missing:
+            logger.warning("Skipping tiles without LAS/bbox: %s", missing)
+
+        global_bbox = (
+            min(b[0] for b in tile_bboxes.values()),
+            max(b[2] for b in tile_bboxes.values()),
+            min(b[1] for b in tile_bboxes.values()),
+            max(b[3] for b in tile_bboxes.values()),
+        )
+
+        from .settings_dialog import load_general_settings
+        settings = load_general_settings()
+        workers = int(settings.get("raster_export_workers", settings.get("ground_workers", 4)))
 
         output_dir = str(self._pm.dtm_dir) if self._pm.dtm_dir else "."
 
         dialog = ExportDialog(
-            list(tile_points.keys()),
-            tile_points,
-            tile_bboxes,
+            jobs,
+            global_bbox,
             output_dir,
+            workers=workers,
             parent=self,
         )
         if dialog.exec() == QDialog.Accepted:
@@ -1530,6 +1613,106 @@ class MainWindow(QMainWindow):
             )
         else:
             self.set_status("Export cancelled", timeout=3000)
+
+    def _on_export_las(self) -> None:
+        """Export selected tiles as LAS files cut to their non-overlapping core."""
+        selected = self._tile_list_widget.get_selected_tile_ids()
+        if not selected:
+            QMessageBox.information(
+                self, "No Tiles Selected",
+                "Select one or more tiles in the tile list first."
+            )
+            return
+
+        tiles_dir = self._pm.tiles_dir
+        if tiles_dir is None:
+            return
+
+        jobs: list = []
+        tile_bboxes: dict = {}
+        for tid in selected:
+            tile_info = self._db.get_tile(tid)
+            if tile_info is None:
+                continue
+            las_path = tiles_dir / tile_info["filename"]
+            if not las_path.is_file():
+                logger.warning("Skipping %s — LAS file missing: %s", tid, las_path)
+                continue
+            bbox = self._tm.sync_tile_bbox_from_las(tid)
+            if bbox is None:
+                bbox = self._tm.get_tile_bbox(tid)
+            if bbox is None:
+                logger.warning("Skipping %s — no bbox", tid)
+                continue
+            jobs.append({"tile_id": tid, "las_path": str(las_path), "bbox": bbox})
+            tile_bboxes[tid] = bbox
+
+        if not jobs:
+            QMessageBox.information(
+                self, "No Tiles",
+                "No readable LAS files found for the selected tiles."
+            )
+            return
+
+        global_bbox = (
+            min(b[0] for b in tile_bboxes.values()),
+            min(b[1] for b in tile_bboxes.values()),
+            max(b[2] for b in tile_bboxes.values()),
+            max(b[3] for b in tile_bboxes.values()),
+        )
+        overlap_m = float(self._pm.metadata.get("tile_overlap_m", 0.0) or 0.0)
+
+        default_dir = str(self._pm.project_root / "tiles_core") if self._pm.project_root else "."
+        output_dir = QFileDialog.getExistingDirectory(
+            self, "Export LAS (Cut Tiles) — Output Directory", default_dir
+        )
+        if not output_dir:
+            return
+
+        from .settings_dialog import load_general_settings
+        settings = load_general_settings()
+        workers = int(settings.get("las_export_workers", settings.get("ground_workers", 4)))
+
+        from PySide6.QtWidgets import QProgressDialog
+        self._las_export_progress = QProgressDialog(
+            f"Exporting {len(jobs)} LAS tile(s) with {workers} worker(s)…",
+            "", 0, len(jobs), self,
+        )
+        self._las_export_progress.setWindowModality(Qt.WindowModal)
+        self._las_export_progress.setMinimumDuration(400)
+        self._las_export_progress.setValue(0)
+
+        self._las_export_worker = _ExportLasWorker(
+            jobs, output_dir, global_bbox, overlap_m, workers=workers, parent=self,
+        )
+        self._las_export_worker.progress.connect(self._on_las_export_progress)
+        self._las_export_worker.tile_done.connect(self._on_las_export_tile_done)
+        self._las_export_worker.finished_all.connect(self._on_las_export_finished)
+        self._las_export_worker.error.connect(self._on_las_export_error)
+        self._las_export_worker.start()
+
+    def _on_las_export_progress(self, done: int, total: int) -> None:
+        if hasattr(self, "_las_export_progress"):
+            self._las_export_progress.setLabelText(f"Exported {done}/{total} tiles…")
+            self._las_export_progress.setValue(done)
+
+    def _on_las_export_tile_done(self, tile_id: str, path: str) -> None:
+        self.set_status(f"Exported {tile_id} → {Path(path).name}", timeout=5000)
+
+    def _on_las_export_finished(self, n: int) -> None:
+        if hasattr(self, "_las_export_progress"):
+            self._las_export_progress.close()
+        self.set_status(f"LAS export done — {n} tile(s)", timeout=8000)
+        QMessageBox.information(
+            self, "LAS Export Complete",
+            f"Exported {n} tile(s) to the selected output directory."
+        )
+
+    def _on_las_export_error(self, msg: str) -> None:
+        logger.error("LAS export error: %s", msg)
+        QMessageBox.warning(self, "LAS Export Error", msg)
+        if hasattr(self, "_las_export_progress"):
+            self._las_export_progress.close()
 
     def _on_settings(self) -> None:
         dialog = SettingsDialog(self)
@@ -1838,6 +2021,8 @@ to reassign it.</p>
 <td>Number of Pointcept subprocesses.  Set to 1 for single GPU.</td></tr>
 <tr><td><b>Bathy parallel workers</b></td><td>1–16</td><td>4</td>
 <td>Number of tiles to process in parallel for bathymetry.</td></tr>
+<tr><td><b>Ground parallel workers</b></td><td>1–16</td><td>4</td>
+<td>Number of tiles to classify ground in parallel.</td></tr>
 </table>
 
 <h3>Manual Edit Tools</h3>
@@ -1854,10 +2039,18 @@ to reassign it.</p>
 <h2>Other Tools &amp; Dialogs</h2>
 
 <h3>Ground Classification</h3>
-<p><b>Tools → Ground Classification…</b> — classify ground points using
-SMRF (Simple Morphological Filter) or TIN (Triangulated Irregular Network)
-densification.  SMRF builds a minimum surface with progressive window
-sizes; TIN iteratively densifies a ground surface from seed points.</p>
+<p><b>Tools → Ground Classification…</b> — classify ground points using one of
+several algorithms: <b>SMRF</b> (Simple Morphological Filter), <b>EP-PTD</b>
+(Edge-Preserving Progressive TIN Densification, Axelsson), <b>APTD</b>
+(Adaptive Grid PTD, AGPTD), <b>H-PTD</b> (Fast PTD using adjacent-surface
+information), or <b>DL-Hybrid PTD</b> (Pointcept deep-learning prior +
+geometric densification).  Select one or more tiles in the tile list to run
+the classification on all of them in parallel.</p>
+
+<h3>Ground Classification Parallelism</h3>
+<p>Configure workers in <b>Settings → General → Ground parallel workers</b>.
+Each worker is a separate Python process, so TIN/SMRF densification scales
+across multiple CPU cores.</p>
 
 <h3>Ground Control</h3>
 <p><b>Tools → Ground Control…</b> — import ground control points (GCPs)
@@ -1952,17 +2145,14 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
             QMessageBox.warning(self, "Load Error", f"Failed to load tile {tile_id}.")
             return
 
-        # Apply class visibility filter for views
-        view_data = self._apply_class_filter(data)
-
         # Open in editor
         if not self._editor.open_tile(tile_id):
             QMessageBox.warning(self, "Edit Error", f"Failed to open tile {tile_id} for editing.")
             return
 
-        # Load into multi-view
-        self._multi_view.load_tile(tile_id, view_data)
-        self._properties_panel.set_tile_data(view_data)
+        # Load into multi-view (each viewer filters classes independently)
+        self._multi_view.load_tile(tile_id, data)
+        self._properties_panel.set_tile_data(data)
         self._properties_panel.set_undo_info(*self._editor.undo_stack_info)
 
         # Auto-generate DTM if tile is classified
@@ -2154,6 +2344,7 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
                 self._tile_list_widget.update_tile_status(
                     self._editor.tile_id, TileStatus.EDITED
                 )
+                self._mark_project_dirty()
                 self._regenerate_dtm()
 
             self.set_status(
@@ -2174,6 +2365,7 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
                 self._tile_list_widget.update_tile_status(
                     self._editor.tile_id, TileStatus.EDITED
                 )
+                self._mark_project_dirty()
                 self._regenerate_dtm()
             self.set_status(f"Undo: {desc}", timeout=3000)
 
@@ -2188,6 +2380,7 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
                 self._tile_list_widget.update_tile_status(
                     self._editor.tile_id, TileStatus.EDITED
                 )
+                self._mark_project_dirty()
                 self._regenerate_dtm()
             self.set_status(f"Redo: {desc}", timeout=3000)
 
@@ -2239,30 +2432,10 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
                 self._db.delete_tile(conn, tid)
 
         self._refresh_tile_list()
+        self._mark_project_dirty()
         self.set_status(f"Deleted {len(tile_ids)} tile(s)", timeout=5000)
 
     # ── helpers ────────────────────────────────────────────────────
-
-    def _apply_class_filter(self, point_data: dict) -> dict:
-        """Return a filtered copy of *point_data* with only visible classes."""
-        cls = point_data.get("classification")
-        if cls is None or self.class_visibility.all():
-            return point_data
-        visible = self.class_visibility[cls]
-        if visible.all():
-            return point_data
-        filtered = {"x": point_data["x"][visible],
-                    "y": point_data["y"][visible],
-                    "z": point_data["z"][visible]}
-        for key in ("classification", "intensity", "return_number",
-                    "num_returns", "point_source_id", "scan_direction_flag",
-                    "edge_of_flight_line", "scan_angle_rank", "user_data",
-                    "gps_time", "red", "green", "blue",
-                    "key_point", "synthetic", "withheld", "overlap",
-                    "sensor_type"):
-            if key in point_data:
-                filtered[key] = point_data[key][visible]
-        return filtered
 
     def _multi_load_for_edit(self, point_data: dict) -> None:
         """
@@ -2272,19 +2445,19 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
         # Keep tile data in sync for the info button
         self._properties_panel.set_tile_data(point_data)
 
-        # Apply class visibility filter
-        filtered = self._apply_class_filter(point_data)
-
-        # Update 3D
+        # Update 3D (full data — class visibility is applied inside the view)
         self._multi_view._view_3d.load_point_cloud(
-            filtered["x"], filtered["y"], filtered["z"],
-            filtered.get("classification"),
-            filtered.get("intensity"),
-            filtered.get("return_number"),
-            filtered.get("point_source_id"),
+            point_data["x"], point_data["y"], point_data["z"],
+            point_data.get("classification"),
+            point_data.get("intensity"),
+            point_data.get("return_number"),
+            point_data.get("point_source_id"),
         )
-        # Update DTM
-        self._multi_view._view_dtm.load_points(filtered)
+        # Update DTM (full data — DTM is generated from ground class only)
+        self._multi_view._view_dtm.load_points(point_data)
+
+        # Re-apply per-viewer class visibility after reloading
+        self._multi_view._apply_all_class_visibility()
 
         # Refresh profile view if a profile exists in the editor
         profile = self._editor.profile
@@ -2300,7 +2473,7 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
                 ys=profile.ys,
                 zs=profile.elevations,
             )
-            self._multi_view._view_profile.set_class_visibility(self.class_visibility)
+            self._multi_view._apply_class_visibility("profile")
             if self._dtm_ref_distances is not None:
                 self._multi_view._view_profile.set_dtm_reference(
                     self._dtm_ref_distances, self._dtm_ref_elevations
@@ -2449,9 +2622,12 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
             self._recent_menu.addAction(action)
 
     def _open_recent(self, path: str) -> None:
+        if not self._confirm_save_if_needed():
+            return
         try:
             self._pm.open(path)
             self._sync_db()
+            self._clear_project_dirty()
             self._refresh_tile_list()
             self._add_recent_project(path)
             self.set_status(f"Opened: {self._pm.metadata.get('name', path)}")

@@ -76,6 +76,9 @@ class ViewProfile(QWidget):
         self._dtm_distances: Optional[np.ndarray] = None
         self._dtm_elevations: Optional[np.ndarray] = None
 
+        # Class visibility: None = all visible (persists across profile loads)
+        self._class_visibility: Optional[np.ndarray] = None
+
         # View transform
         self._offset_x: float = 0.0    # distance offset
         self._offset_y: float = 0.0    # elevation offset
@@ -152,7 +155,6 @@ class ViewProfile(QWidget):
         self._zs = zs
         self._current_mask = None
         self._width_adjusting = True  # enter width-adjust mode
-        self._class_visibility: Optional[np.ndarray] = None
         self._fit_view()
         self.update()
 

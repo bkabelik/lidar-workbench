@@ -24,11 +24,14 @@ import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
 logger = logging.getLogger("lidar_workbench.export_manager")
+
+#: Signature of a per-tile loader: returns full point data for a tile or None.
+TileLoader = Callable[[str], Optional[Dict[str, np.ndarray]]]
 
 # ── constants ───────────────────────────────────────────────────────────
 NODATA_VALUE: float = -9999.0
@@ -317,6 +320,606 @@ def export_merged_raster(
         progress_callback(100.0, f"Merged {config.mode.upper()} export complete")
 
     return written
+
+
+# ── streaming API (one tile in memory at a time) ────────────────────────
+
+def export_dtm_streaming(
+    tile_loader: TileLoader,
+    tile_bboxes: Dict[str, Tuple[float, float, float, float]],
+    config: ExportConfig,
+    progress_callback: Optional[callable] = None,
+) -> List[Path]:
+    """Memory-safe :func:`export_dtm` — loads and releases one tile at a time."""
+    _validate_config(config)
+    out = Path(config.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    global_bbox = _global_bbox(tile_bboxes)
+    master = _master_grid(global_bbox, config.resolution)
+
+    written: List[Path] = []
+    total = len(config.tile_ids)
+
+    for idx, tile_id in enumerate(config.tile_ids):
+        bbox = tile_bboxes.get(tile_id)
+        if bbox is None:
+            logger.warning("Skipping tile %s — no bbox", tile_id)
+            continue
+
+        if progress_callback:
+            progress_callback((idx / total) * 90.0, f"DTM tile {tile_id}…")
+
+        pts = tile_loader(tile_id)
+        if pts is None:
+            logger.warning("Skipping tile %s — could not load", tile_id)
+            continue
+
+        cls = pts["classification"]
+        ground_mask = cls == config.ground_class
+        if not ground_mask.any():
+            logger.warning("Tile %s: no ground points — skipping DTM", tile_id)
+            del pts
+            continue
+
+        sub = _slice_grid(master, bbox)
+        sub.data = _tin_interpolate(
+            pts["x"][ground_mask], pts["y"][ground_mask], pts["z"][ground_mask], sub
+        )
+        del pts
+
+        stem = tile_id if tile_id.startswith("tile_") else f"tile_{tile_id}"
+        asc_path = out / f"{stem}_dtm.asc"
+        _write_ascii_grid(sub, asc_path)
+        written.append(asc_path)
+
+        if config.compute_hillshade:
+            hs_path = out / f"{stem}_dtm_hillshade.tif"
+            _write_hillshade(sub, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+            written.append(hs_path)
+
+    if progress_callback:
+        progress_callback(100.0, f"DTM export complete — {len(written)} file(s)")
+
+    return written
+
+
+def export_dsm_streaming(
+    tile_loader: TileLoader,
+    tile_bboxes: Dict[str, Tuple[float, float, float, float]],
+    config: ExportConfig,
+    progress_callback: Optional[callable] = None,
+) -> List[Path]:
+    """Memory-safe :func:`export_dsm` — loads and releases one tile at a time."""
+    _validate_config(config)
+    out = Path(config.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    global_bbox = _global_bbox(tile_bboxes)
+    master = _master_grid(global_bbox, config.resolution)
+
+    written: List[Path] = []
+    total = len(config.tile_ids)
+
+    for idx, tile_id in enumerate(config.tile_ids):
+        bbox = tile_bboxes.get(tile_id)
+        if bbox is None:
+            continue
+
+        if progress_callback:
+            progress_callback((idx / total) * 90.0, f"DSM tile {tile_id}…")
+
+        pts = tile_loader(tile_id)
+        if pts is None:
+            continue
+
+        cls = pts["classification"]
+        keep = np.isin(cls, list(config.dsm_classes))
+        if not keep.any():
+            logger.warning("Tile %s: no points in selected classes — skipping DSM", tile_id)
+            del pts
+            continue
+
+        sub = _slice_grid(master, bbox)
+        sub.data = _bin_max(pts["x"][keep], pts["y"][keep], pts["z"][keep], sub)
+        del pts
+
+        stem = tile_id if tile_id.startswith("tile_") else f"tile_{tile_id}"
+        asc_path = out / f"{stem}_dsm.asc"
+        _write_ascii_grid(sub, asc_path)
+        written.append(asc_path)
+
+        if config.compute_hillshade:
+            hs_path = out / f"{stem}_dsm_hillshade.tif"
+            _write_hillshade(sub, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+            written.append(hs_path)
+
+    if progress_callback:
+        progress_callback(100.0, f"DSM export complete — {len(written)} file(s)")
+
+    return written
+
+
+def export_merged_raster_streaming(
+    tile_loader: TileLoader,
+    tile_bboxes: Dict[str, Tuple[float, float, float, float]],
+    config: ExportConfig,
+    progress_callback: Optional[callable] = None,
+) -> List[Path]:
+    """
+    Memory-safe merged raster export.
+
+    Processes one tile at a time and composites each tile's raster into a
+    single master grid.  For DTM this composites per-tile TIN rasters
+    (taking the minimum in overlap cells) instead of building one global
+    Delaunay triangulation over all points — the latter does not scale to
+    large projects because it requires every ground point in memory at once.
+    """
+    _validate_config(config)
+    out = Path(config.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    global_bbox = _global_bbox(tile_bboxes)
+    master = _master_grid(global_bbox, config.resolution)
+
+    # Accumulator: empty cells are +inf (DTM) or -inf (DSM) so tiles can be
+    # composited with fmin / maximum.  nodata is only materialised at the end.
+    acc = np.full(master.data.shape, np.inf if config.mode == "dtm" else -np.inf, dtype=np.float64)
+
+    total = len(config.tile_ids)
+    processed = 0
+
+    for idx, tile_id in enumerate(config.tile_ids):
+        bbox = tile_bboxes.get(tile_id)
+        if bbox is None:
+            continue
+
+        if progress_callback:
+            progress_callback((idx / total) * 90.0, f"Merged {config.mode.upper()} — {tile_id}…")
+
+        pts = tile_loader(tile_id)
+        if pts is None:
+            continue
+
+        if config.mode == "dtm":
+            ground_mask = pts["classification"] == config.ground_class
+            if not ground_mask.any():
+                del pts
+                continue
+            sub = _slice_grid(master, bbox)
+            sub.data = _tin_interpolate(
+                pts["x"][ground_mask], pts["y"][ground_mask], pts["z"][ground_mask], sub
+            )
+        else:
+            keep = np.isin(pts["classification"], list(config.dsm_classes))
+            if not keep.any():
+                del pts
+                continue
+            sub = _slice_grid(master, bbox)
+            sub.data = _bin_max(pts["x"][keep], pts["y"][keep], pts["z"][keep], sub)
+
+        del pts
+
+        # Composite sub-grid into the global accumulator.
+        col_start = int(round((sub.xllcorner - master.xllcorner) / master.cellsize))
+        row_start = int(round((sub.yllcorner - master.yllcorner) / master.cellsize))
+        acc_slice = acc[row_start:row_start + sub.nrows, col_start:col_start + sub.ncols]
+        valid = sub.data != master.nodata
+        if config.mode == "dtm":
+            np.fmin(acc_slice, np.where(valid, sub.data, np.inf), out=acc_slice)
+        else:
+            np.maximum(acc_slice, np.where(valid, sub.data, -np.inf), out=acc_slice)
+        processed += 1
+
+    if processed == 0:
+        logger.warning("No tile data to export")
+        return []
+
+    acc[~np.isfinite(acc)] = master.nodata
+    master.data = acc
+
+    written: List[Path] = []
+    name = "merged_dtm" if config.mode == "dtm" else "merged_dsm"
+    asc_path = out / f"{name}.asc"
+    _write_ascii_grid(master, asc_path)
+    written.append(asc_path)
+
+    if config.compute_hillshade:
+        hs_path = out / f"{name}_hillshade.tif"
+        _write_hillshade(master, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+        written.append(hs_path)
+
+    if progress_callback:
+        progress_callback(100.0, f"Merged {config.mode.upper()} export complete")
+
+    return written
+
+
+# ── parallel tile rasterisation (ProcessPoolExecutor) ───────────────────
+
+def _load_las_xyz_cls(las_path: str):
+    """Load XYZ + classification arrays from a LAS file (worker process)."""
+    import laspy
+
+    with laspy.open(las_path) as reader:
+        las_data = reader.read()
+        return (
+            np.array(las_data.x, dtype=np.float64),
+            np.array(las_data.y, dtype=np.float64),
+            np.array(las_data.z, dtype=np.float64),
+            np.array(las_data.classification, dtype=np.uint8),
+        )
+
+
+def _rasterize_tile_job(job: Dict, global_bbox: tuple, config: ExportConfig) -> Optional[dict]:
+    """
+    Rasterise one tile in a worker process.
+
+    Returns a picklable dict with the tile raster plus its georeferencing,
+    or ``None`` when the tile has no points for the requested export.
+    """
+    xs, ys, zs, cls = _load_las_xyz_cls(job["las_path"])
+    bbox = tuple(job["bbox"])
+
+    master = _master_grid(global_bbox, config.resolution)
+    sub = _slice_grid(master, bbox)
+
+    if config.mode == "dtm":
+        ground_mask = cls == config.ground_class
+        if not ground_mask.any():
+            return None
+        sub.data = _tin_interpolate(xs[ground_mask], ys[ground_mask], zs[ground_mask], sub)
+    else:
+        keep = np.isin(cls, list(config.dsm_classes))
+        if not keep.any():
+            return None
+        sub.data = _bin_max(xs[keep], ys[keep], zs[keep], sub)
+
+    return {
+        "tile_id": job["tile_id"],
+        "xllcorner": sub.xllcorner,
+        "yllcorner": sub.yllcorner,
+        "cellsize": sub.cellsize,
+        "nodata": sub.nodata,
+        "data": sub.data,
+    }
+
+
+def _write_tile_raster_files(result: dict, config: ExportConfig, out: Path, suffix: str) -> List[Path]:
+    """Write a per-tile raster dict returned by :func:`_rasterize_tile_job`."""
+    grid = RasterGrid(
+        data=result["data"],
+        xllcorner=result["xllcorner"],
+        yllcorner=result["yllcorner"],
+        cellsize=result["cellsize"],
+        nodata=result["nodata"],
+    )
+    stem = result["tile_id"] if result["tile_id"].startswith("tile_") else f"tile_{result['tile_id']}"
+    asc_path = out / f"{stem}_{suffix}.asc"
+    _write_ascii_grid(grid, asc_path)
+    written = [asc_path]
+
+    if config.compute_hillshade:
+        hs_path = out / f"{stem}_{suffix}_hillshade.tif"
+        _write_hillshade(grid, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+        written.append(hs_path)
+
+    return written
+
+
+def export_dtm_parallel(
+    jobs: List[Dict],
+    global_bbox: Tuple[float, float, float, float],
+    config: ExportConfig,
+    workers: int = 4,
+    progress_callback: Optional[callable] = None,
+) -> List[Path]:
+    """Parallel, memory-safe per-tile DTM export."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    _validate_config(config)
+    out = Path(config.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    written: List[Path] = []
+    total = len(jobs)
+    if total == 0:
+        return written
+
+    done = 0
+    with ProcessPoolExecutor(max_workers=max(1, min(int(workers), total))) as pool:
+        futures = {
+            pool.submit(_rasterize_tile_job, job, global_bbox, config): job
+            for job in jobs
+        }
+        for fut in as_completed(futures):
+            job = futures[fut]
+            try:
+                result = fut.result()
+                if result is not None:
+                    written.extend(_write_tile_raster_files(result, config, out, "dtm"))
+            except Exception as exc:
+                logger.exception("DTM rasterisation failed for %s", job.get("tile_id"))
+            done += 1
+            if progress_callback:
+                progress_callback(done / total * 90.0, f"DTM {done}/{total} tiles")
+
+    if progress_callback:
+        progress_callback(100.0, f"DTM export complete — {len(written)} file(s)")
+    return written
+
+
+def export_dsm_parallel(
+    jobs: List[Dict],
+    global_bbox: Tuple[float, float, float, float],
+    config: ExportConfig,
+    workers: int = 4,
+    progress_callback: Optional[callable] = None,
+) -> List[Path]:
+    """Parallel, memory-safe per-tile DSM export."""
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    _validate_config(config)
+    out = Path(config.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    written: List[Path] = []
+    total = len(jobs)
+    if total == 0:
+        return written
+
+    done = 0
+    with ProcessPoolExecutor(max_workers=max(1, min(int(workers), total))) as pool:
+        futures = {
+            pool.submit(_rasterize_tile_job, job, global_bbox, config): job
+            for job in jobs
+        }
+        for fut in as_completed(futures):
+            job = futures[fut]
+            try:
+                result = fut.result()
+                if result is not None:
+                    written.extend(_write_tile_raster_files(result, config, out, "dsm"))
+            except Exception as exc:
+                logger.exception("DSM rasterisation failed for %s", job.get("tile_id"))
+            done += 1
+            if progress_callback:
+                progress_callback(done / total * 90.0, f"DSM {done}/{total} tiles")
+
+    if progress_callback:
+        progress_callback(100.0, f"DSM export complete — {len(written)} file(s)")
+    return written
+
+
+def export_merged_raster_parallel(
+    jobs: List[Dict],
+    global_bbox: Tuple[float, float, float, float],
+    config: ExportConfig,
+    workers: int = 4,
+    progress_callback: Optional[callable] = None,
+) -> List[Path]:
+    """
+    Parallel merged DTM/DSM export.
+
+    Each tile is rasterised in a worker process; the parent composites the
+    returned tile rasters into one master grid as they complete, so memory
+    stays bounded to the master grid plus one tile raster at a time.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    _validate_config(config)
+    out = Path(config.output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    master = _master_grid(global_bbox, config.resolution)
+    acc = np.full(master.data.shape, np.inf if config.mode == "dtm" else -np.inf, dtype=np.float64)
+
+    total = len(jobs)
+    done = 0
+    processed = 0
+    if total == 0:
+        return []
+
+    with ProcessPoolExecutor(max_workers=max(1, min(int(workers), total))) as pool:
+        futures = {
+            pool.submit(_rasterize_tile_job, job, global_bbox, config): job
+            for job in jobs
+        }
+        for fut in as_completed(futures):
+            job = futures[fut]
+            try:
+                result = fut.result()
+                if result is not None:
+                    data = result["data"]
+                    col_start = int(round((result["xllcorner"] - master.xllcorner) / master.cellsize))
+                    row_start = int(round((result["yllcorner"] - master.yllcorner) / master.cellsize))
+                    acc_slice = acc[row_start:row_start + data.shape[0],
+                                    col_start:col_start + data.shape[1]]
+                    valid = data != result["nodata"]
+                    if config.mode == "dtm":
+                        np.fmin(acc_slice, np.where(valid, data, np.inf), out=acc_slice)
+                    else:
+                        np.maximum(acc_slice, np.where(valid, data, -np.inf), out=acc_slice)
+                    processed += 1
+            except Exception as exc:
+                logger.exception("Merged rasterisation failed for %s", job.get("tile_id"))
+            done += 1
+            if progress_callback:
+                progress_callback(done / total * 90.0, f"Merged {config.mode.upper()} {done}/{total} tiles")
+
+    if processed == 0:
+        logger.warning("No tile data to export")
+        return []
+
+    acc[~np.isfinite(acc)] = master.nodata
+    master.data = acc
+
+    written: List[Path] = []
+    name = "merged_dtm" if config.mode == "dtm" else "merged_dsm"
+    asc_path = out / f"{name}.asc"
+    _write_ascii_grid(master, asc_path)
+    written.append(asc_path)
+
+    if config.compute_hillshade:
+        hs_path = out / f"{name}_hillshade.tif"
+        _write_hillshade(master, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+        written.append(hs_path)
+
+    if progress_callback:
+        progress_callback(100.0, f"Merged {config.mode.upper()} export complete")
+    return written
+
+
+def compute_core_bbox(
+    bbox: Tuple[float, float, float, float],
+    global_bbox: Tuple[float, float, float, float],
+    overlap_m: float,
+) -> Tuple[float, float, float, float]:
+    """
+    Shrink *bbox* to its non-overlapping core.
+
+    Interior edges are moved inward by ``overlap_m / 2`` so neighbouring
+    tile cores partition the project exactly (left core ``<= x <`` right
+    core, bottom core ``<= y <`` top core).  Outer edges of the project are
+    kept unchanged.
+    """
+    minx, miny, maxx, maxy = bbox
+    gminx, gminy, gmaxx, gmaxy = global_bbox
+    half = overlap_m / 2.0
+    eps = 1e-9
+
+    core_minx = minx + half if minx > gminx + eps else minx
+    core_maxx = maxx - half if maxx < gmaxx - eps else maxx
+    core_miny = miny + half if miny > gminy + eps else miny
+    core_maxy = maxy - half if maxy < gmaxy - eps else maxy
+
+    # Guard against pathological overlaps.
+    if core_maxx <= core_minx:
+        core_minx = core_maxx = (minx + maxx) / 2.0
+    if core_maxy <= core_miny:
+        core_miny = core_maxy = (miny + maxy) / 2.0
+
+    return (core_minx, core_miny, core_maxx, core_maxy)
+
+
+def export_las_tile(
+    job: Dict,
+    output_dir: str,
+    global_bbox: Tuple[float, float, float, float],
+    overlap_m: float,
+) -> Optional[str]:
+    """
+    Export one LAS tile clipped to its non-overlapping core.
+
+    Runs in a worker process (picklable *job* dict) and preserves the
+    original point format, VLRs and extra dimensions.  Returns the written
+    path, or ``None`` when the core contains no points.
+    """
+    import laspy
+
+    from .tile_manager import _read_las_header_template, _write_las_file
+
+    las_path = Path(job["las_path"])
+    bbox = tuple(job["bbox"])
+    core = compute_core_bbox(bbox, global_bbox, overlap_m)
+
+    with laspy.open(las_path) as reader:
+        las_data = reader.read()
+        xs = np.array(las_data.x, dtype=np.float64)
+        ys = np.array(las_data.y, dtype=np.float64)
+        zs = np.array(las_data.z, dtype=np.float64)
+        n = len(xs)
+
+        mask = (
+            (xs >= core[0]) & (xs < core[2])
+            & (ys >= core[1]) & (ys < core[3])
+        )
+        if not mask.any():
+            logger.warning("Core of %s is empty — skipping LAS export", las_path.name)
+            return None
+
+        def _safe(attr: str, dtype, default):
+            if not hasattr(las_data, attr):
+                return None
+            arr = np.array(getattr(las_data, attr), dtype=dtype)
+            return arr if len(arr) == n else None
+
+        def _subset(arr):
+            return None if arr is None else arr[mask]
+
+        # Scan angle: LAS 1.4 point formats 6+ store ``scan_angle`` as
+        # scaled integer; older formats store ``scan_angle_rank``.
+        scan_angle_ranks = _safe("scan_angle_rank", np.int8, 0)
+        scan_angles = _safe("scan_angle", np.float64, 0.0)
+
+        extra_dims: Dict[str, np.ndarray] = {}
+        for ed in las_data.point_format.extra_dimensions:
+            name = ed.name
+            if hasattr(las_data, name):
+                arr = np.array(getattr(las_data, name))
+                if len(arr) == n:
+                    extra_dims[name] = arr[mask]
+
+        subset = {
+            "x": xs[mask],
+            "y": ys[mask],
+            "z": zs[mask],
+            "classification": _subset(_safe("classification", np.uint8, 0)),
+            "intensity": _subset(_safe("intensity", np.uint16, 0)),
+            "return_number": _subset(_safe("return_number", np.uint8, 1)),
+            "num_returns": _subset(_safe("number_of_returns", np.uint8, 1)),
+            "point_source_id": _subset(_safe("point_source_id", np.uint16, 0)),
+            "gps_time": _subset(_safe("gps_time", np.float64, 0.0)),
+            "scan_angle_rank": scan_angle_ranks[mask] if scan_angle_ranks is not None else None,
+            "scan_angle": scan_angles[mask] if scan_angles is not None else None,
+            "scan_direction_flag": _subset(_safe("scan_direction_flag", np.uint8, 0)),
+            "edge_of_flight_line": _subset(_safe("edge_of_flight_line", np.uint8, 0)),
+            "user_data": _subset(_safe("user_data", np.uint8, 0)),
+            "red": _subset(_safe("red", np.uint16, 0)),
+            "green": _subset(_safe("green", np.uint16, 0)),
+            "blue": _subset(_safe("blue", np.uint16, 0)),
+            "key_point": _subset(_safe("key_point", np.uint8, 0)),
+            "synthetic": _subset(_safe("synthetic", np.uint8, 0)),
+            "withheld": _subset(_safe("withheld", np.uint8, 0)),
+            "overlap": _subset(_safe("overlap", np.uint8, 0)),
+        }
+
+    try:
+        header_template = _read_las_header_template(las_path)
+    except Exception:
+        header_template = None
+        logger.warning("Could not read header template from %s — using fallback", las_path)
+
+    out_path = Path(output_dir) / f"{las_path.stem}_core.las"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_las_file(
+        out_path,
+        subset["x"],
+        subset["y"],
+        subset["z"],
+        classes=subset["classification"],
+        intensities=subset["intensity"],
+        return_numbers=subset["return_number"],
+        num_returns=subset["num_returns"],
+        point_source_ids=subset["point_source_id"],
+        gps_times=subset["gps_time"],
+        scan_angle_ranks=subset["scan_angle_rank"],
+        scan_angles=subset["scan_angle"],
+        scan_direction_flags=subset["scan_direction_flag"],
+        edge_of_flight_lines=subset["edge_of_flight_line"],
+        user_data_array=subset["user_data"],
+        reds=subset["red"],
+        greens=subset["green"],
+        blues=subset["blue"],
+        key_points=subset["key_point"],
+        synthetics=subset["synthetic"],
+        withhelds=subset["withheld"],
+        overlaps=subset["overlap"],
+        header_template=header_template,
+        extra_dims=extra_dims,
+    )
+    logger.info("Exported %d points to %s", len(subset["x"]), out_path)
+    return str(out_path)
 
 
 # ── interpolation methods ───────────────────────────────────────────────

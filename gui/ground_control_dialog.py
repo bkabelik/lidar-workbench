@@ -154,15 +154,14 @@ class _GroundControlWorker(QThread):
                 })
                 continue
 
-            nearby_z = cz[indices]
-            z_median = float(np.median(nearby_z))
-            dz = gz - z_median
+            nearby_xyz = np.column_stack((cx[indices], cy[indices], cz[indices]))
+            z_cloud, dz, z_std = self._compare_gcp_to_surface(gx, gy, gz, nearby_xyz)
 
             results.append({
                 "name": name, "x": gx, "y": gy, "z_in": gz,
-                "z_cloud": z_median, "dz": dz,
+                "z_cloud": z_cloud, "dz": dz,
                 "n_nearby": n_nearby,
-                "z_std": float(np.std(nearby_z)),
+                "z_std": z_std,
             })
 
         self.finished_gcp.emit(results)
@@ -246,6 +245,48 @@ class _GroundControlWorker(QThread):
             })
 
         self.finished_roofs.emit(results)
+
+    @staticmethod
+    def _compare_gcp_to_surface(gx: float, gy: float, gz: float,
+                                nearby_xyz: np.ndarray):
+        """
+        Compare a GCP against a robust local point-cloud surface.
+
+        Best practice (ASPRS/USGS vertical checkpoints): filter to the
+        desired class, take points within a small horizontal radius, reject
+        vertical outliers (MAD/sigma clipping), then estimate the surface —
+        a RANSAC plane on slopes, the clipped median on flat terrain — and
+        return ``(z_surface, dz, z_std)`` with ``dz = GCP Z − surface Z``.
+        """
+        if len(nearby_xyz) < 3:
+            z_med = float(np.median(nearby_xyz[:, 2])) if len(nearby_xyz) else float("nan")
+            return z_med, gz - z_med, float(np.std(nearby_xyz[:, 2])) if len(nearby_xyz) else 0.0
+
+        zs = nearby_xyz[:, 2]
+        z_med = float(np.median(zs))
+        mad = float(np.median(np.abs(zs - z_med)))
+        sigma = 1.4826 * mad
+        # Vertical outlier gate: keep points within 2 robust sigma, with a
+        # small absolute floor so flat, noise-free ground is not over-clipped.
+        keep = np.abs(zs - z_med) <= max(2.0 * sigma, 0.15)
+        if keep.sum() < 3:
+            keep = np.ones(len(zs), dtype=bool)
+        inliers = nearby_xyz[keep]
+
+        normal, _ = _GroundControlWorker._fit_ransac_plane(inliers)
+        if normal is not None and abs(normal[2]) > 0.5:
+            mean = inliers.mean(axis=0)
+            denom = normal[2]
+            z_surf = float(
+                mean[2]
+                - (normal[0] * (gx - mean[0]) + normal[1] * (gy - mean[1])) / denom
+            )
+            # Keep the fitted surface inside the observed inlier Z range.
+            z_surf = float(np.clip(z_surf, inliers[:, 2].min(), inliers[:, 2].max()))
+        else:
+            z_surf = float(np.median(inliers[:, 2]))
+
+        return z_surf, gz - z_surf, float(np.std(inliers[:, 2]))
 
     @staticmethod
     def _fit_plane_normal(verts: np.ndarray) -> np.ndarray:

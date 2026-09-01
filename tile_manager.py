@@ -328,6 +328,16 @@ class TileManager:
                 tile_size_m = DEFAULT_TILE_SIZE_M
         overlap_m = overlap_m if overlap_m is not None else DEFAULT_TILE_OVERLAP_M
 
+        # Persist the actual tiling parameters so later exports (e.g. LAS
+        # cut-to-core export) know the real overlap.
+        if self._pm.is_open:
+            self._pm.metadata["tile_size_m"] = float(tile_size_m)
+            self._pm.metadata["tile_overlap_m"] = float(overlap_m)
+            try:
+                self._pm.save()
+            except Exception:
+                logger.warning("Could not persist tiling parameters to project.json")
+
         tile_bboxes = _compute_tile_grid(global_bbox, tile_size_m, overlap_m)
         # Grid origin for tile-index math
         grid_x0, grid_y0 = global_bbox[0], global_bbox[1]
@@ -820,6 +830,40 @@ class TileManager:
             info["bbox_min_x"], info["bbox_min_y"],
             info["bbox_max_x"], info["bbox_max_y"],
         )
+
+    def get_tile_bbox_from_las(self, tile_id: str) -> Optional[BBox]:
+        """Return the bounding box stored in the tile's LAS header.
+
+        This is the authoritative bbox after coordinate transforms or any
+        external LAS replacement; the DB bbox can become stale."""
+        tile_info = self._db.get_tile(tile_id)
+        if tile_info is None:
+            return None
+        tiles_dir = self._pm.tiles_dir
+        if tiles_dir is None:
+            return None
+        las_path = tiles_dir / tile_info["filename"]
+        if not las_path.is_file():
+            return None
+        try:
+            with laspy.open(las_path) as reader:
+                hdr = reader.header
+            return (hdr.x_min, hdr.y_min, hdr.x_max, hdr.y_max)
+        except Exception as exc:
+            logger.warning("Failed to read LAS bbox for %s: %s", tile_id, exc)
+            return None
+
+    def sync_tile_bbox_from_las(self, tile_id: str) -> Optional[BBox]:
+        """Return the LAS-header bbox and persist it to the database."""
+        actual = self.get_tile_bbox_from_las(tile_id)
+        if actual is None:
+            return None
+        try:
+            with self._db.connect() as conn:
+                self._db.update_tile_bbox(conn, tile_id, actual)
+        except Exception:
+            logger.warning("Failed to sync tile bbox for %s", tile_id)
+        return actual
 
     def get_tiles_in_viewport(
         self,

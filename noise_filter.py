@@ -25,7 +25,10 @@ from .config import (
 from .ground import (
     compute_adaptive_spacing,
     ground_classify_smrf,
-    ground_classify_tin,
+    ground_classify_epptd,
+    ground_classify_aptd,
+    ground_classify_hptd,
+    ground_classify_dl_hybrid_ptd,
 )
 
 logger = logging.getLogger("lidar_workbench.noise_filter")
@@ -1392,6 +1395,115 @@ def benthic_continuity_filter(
     return final_bed
 
 
+def extract_bathy_bed(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    sensor_type: np.ndarray,
+    return_numbers: Optional[np.ndarray] = None,
+    num_returns: Optional[np.ndarray] = None,
+    cell_size: Optional[float] = None,
+    tolerance: float = 1.0,
+    progress: ProgressCB = None,
+) -> np.ndarray:
+    """
+    Extract the riverbed from bathymetric (green-laser) points.
+
+    In a mixed topo+bathy tile the near-infrared topo laser reflects off the
+    water surface while the green bathy laser reaches the bed.  This returns a
+    boolean mask of the *bed* — the bathymetric points (``sensor_type == 2``)
+    that are last returns and lie at the local minimum elevation (the "lowest
+    points per cell"), optionally cleaned by benthic continuity.
+
+    Args:
+        xs, ys, zs:       Point coordinates (full arrays).
+        sensor_type:      Per-point sensor code (0=unknown, 1=topo, 2=bathy).
+        return_numbers:   Optional per-point return numbers (1-based).
+        num_returns:      Optional per-point number-of-returns.
+        cell_size:        Grid cell size for the local bed reference (metres).
+                          Defaults to 3 m.
+        tolerance:        Max height above the local bed a point may sit and
+                          still count as bed (metres).
+        progress:         Optional callback.
+
+    Returns:
+        Boolean ``bed_mask`` over all input points.
+    """
+    n = len(xs)
+    bed = np.zeros(n, dtype=bool)
+    bathy = np.asarray(sensor_type) == 2
+    if not bathy.any():
+        return bed
+
+    b_idx = np.where(bathy)[0]
+    bx = xs[bathy]
+    by = ys[bathy]
+    bz = zs[bathy]
+
+    # Prefer last returns (the bed).  In water the first/intermediate returns
+    # are the surface / water column.
+    cand = np.ones(len(bx), dtype=bool)
+    if (return_numbers is not None and num_returns is not None
+            and len(return_numbers) == n and len(num_returns) == n
+            and int(np.asarray(num_returns).max()) > 1):
+        cand = (np.asarray(return_numbers)[bathy]
+                == np.asarray(num_returns)[bathy])
+
+    if cand.sum() < 3:
+        return bed
+
+    c_pos = np.where(cand)[0]
+    cx = bx[cand]
+    cy = by[cand]
+    cz = bz[cand]
+
+    if progress:
+        progress(f"Bathy bed: {cand.sum()} last returns…", 5.0)
+
+    # Local minimum-Z reference = the bed, on a coarse grid
+    if cell_size is None:
+        cell_size = 3.0
+    if cell_size <= 0:
+        cell_size = 3.0
+    min_x, max_x = float(cx.min()), float(cx.max())
+    min_y, max_y = float(cy.min()), float(cy.max())
+    nx = max(1, int(np.ceil((max_x - min_x) / cell_size)) + 1)
+    ny = max(1, int(np.ceil((max_y - min_y) / cell_size)) + 1)
+    if nx == 1 and ny == 1:
+        # Degenerate single cell — keep the last returns as-is.
+        bed[b_idx[c_pos]] = True
+        return bed
+
+    gx = np.clip(((cx - min_x) / cell_size).astype(np.int32), 0, nx - 1)
+    gy = np.clip(((cy - min_y) / cell_size).astype(np.int32), 0, ny - 1)
+    grid = np.full((nx, ny), np.inf, dtype=np.float64)
+    np.minimum.at(grid, (gx, gy), cz)
+
+    ref = grid[gx, gy]
+    keep = np.isfinite(ref) & (cz <= ref + tolerance)
+
+    if progress:
+        progress(f"Bathy bed: {keep.sum()} bed points…", 60.0)
+
+    # Benthic continuity to drop isolated water-column / ghost noise.
+    if keep.sum() >= 100:
+        try:
+            certain = np.zeros(len(bx), dtype=bool)
+            certain[c_pos[keep]] = True
+            bed_bathy = benthic_continuity_filter(
+                bx, by, bz, certain_bed_mask=certain,
+                progress=progress,
+            )
+            bed[b_idx[bed_bathy]] = True
+        except Exception as exc:
+            logger.warning("Benthic continuity failed in bed extract: %s", exc)
+            bed[b_idx[c_pos[keep]]] = True
+    else:
+        bed[b_idx[c_pos[keep]]] = True
+
+    return bed
+
+
 # ── parallel filter worker ──────────────────────────────────────────
 
 try:
@@ -1605,7 +1717,7 @@ def _apply_pipeline(data: dict, pipeline: list) -> np.ndarray:
                 window_growth=step.get("window_growth", 1.5),
             )
         elif step["type"] == "ground_tin":
-            k = ground_classify_tin(
+            k = ground_classify_epptd(
                 data["x"][keep], data["y"][keep], data["z"][keep],
                 max_distance=step.get("max_distance", 1.4),
                 max_angle=step.get("max_angle", 6.0),
@@ -1621,6 +1733,106 @@ def _apply_pipeline(data: dict, pipeline: list) -> np.ndarray:
                 exclude_single_returns_in_water=step.get("exclude_single_returns_in_water", False),
                 sensor_type=data.get("sensor_type"),
                 cell_size=step.get("cell_size"),
+                return_numbers=(
+                    data["return_number"][keep]
+                    if data.get("return_number") is not None else None
+                ),
+                num_returns=(
+                    data["num_returns"][keep]
+                    if data.get("num_returns") is not None else None
+                ),
+            )
+        elif step["type"] == "ground_epptd":
+            k = ground_classify_epptd(
+                data["x"][keep], data["y"][keep], data["z"][keep],
+                max_distance=step.get("max_distance", 1.4),
+                max_angle=step.get("max_angle", 6.0),
+                max_terrain_angle=step.get("max_terrain_angle", 88.0),
+                max_building_size=step.get("max_building_size"),
+                reduce_iter_angle_when_edge=step.get("reduce_iter_angle_when_edge"),
+                stop_tri_when_edge=step.get("stop_tri_when_edge"),
+                only_upward=step.get("only_upward", False),
+                follow_surface_trend=step.get("follow_surface_trend", True),
+                remove_low_outliers=step.get("remove_low_outliers", False),
+                low_outlier_neighbors=step.get("low_outlier_neighbors", 8),
+                low_outlier_threshold=step.get("low_outlier_threshold", 1.0),
+                exclude_single_returns_in_water=step.get("exclude_single_returns_in_water", False),
+                sensor_type=data.get("sensor_type"),
+                cell_size=step.get("cell_size"),
+                return_numbers=(
+                    data["return_number"][keep]
+                    if data.get("return_number") is not None else None
+                ),
+                num_returns=(
+                    data["num_returns"][keep]
+                    if data.get("num_returns") is not None else None
+                ),
+            )
+        elif step["type"] == "ground_aptd":
+            k = ground_classify_aptd(
+                data["x"][keep], data["y"][keep], data["z"][keep],
+                k_neighbors=step.get("k_neighbors", 4),
+                radius_factor=step.get("radius_factor", 4.0),
+                min_neighbors=step.get("min_neighbors", 2),
+                primary_grid_size=step.get("primary_grid_size"),
+                point_count_threshold=step.get("point_count_threshold", 5),
+                slope_threshold=step.get("slope_threshold", 0.5),
+                max_angle=step.get("max_angle"),
+                max_distance=step.get("max_distance"),
+                max_terrain_angle=step.get("max_terrain_angle"),
+                exclude_single_returns_in_water=step.get("exclude_single_returns_in_water", False),
+                sensor_type=data.get("sensor_type"),
+                return_numbers=(
+                    data["return_number"][keep]
+                    if data.get("return_number") is not None else None
+                ),
+                num_returns=(
+                    data["num_returns"][keep]
+                    if data.get("num_returns") is not None else None
+                ),
+            )
+        elif step["type"] == "ground_hptd":
+            k = ground_classify_hptd(
+                data["x"][keep], data["y"][keep], data["z"][keep],
+                window_size=step.get("window_size"),
+                step_factor=step.get("step_factor", 0.5),
+                max_angle=step.get("max_angle", 6.0),
+                max_distance=step.get("max_distance"),
+                relative_elevation_factor=step.get("relative_elevation_factor", 1.0),
+                signed=step.get("signed", True),
+                below_tolerance=step.get("below_tolerance", 0.5),
+                max_terrain_angle=step.get("max_terrain_angle", 88.0),
+                follow_surface_trend=step.get("follow_surface_trend", True),
+                exclude_single_returns_in_water=step.get("exclude_single_returns_in_water", False),
+                sensor_type=data.get("sensor_type"),
+                return_numbers=(
+                    data["return_number"][keep]
+                    if data.get("return_number") is not None else None
+                ),
+                num_returns=(
+                    data["num_returns"][keep]
+                    if data.get("num_returns") is not None else None
+                ),
+            )
+        elif step["type"] == "ground_dl_hybrid":
+            cls = data.get("classification")
+            dl_conf = (
+                (np.asarray(cls)[keep] == 2).astype(np.float64)
+                if cls is not None else None
+            )
+            k = ground_classify_dl_hybrid_ptd(
+                data["x"][keep], data["y"][keep], data["z"][keep],
+                dl_ground_confidence=dl_conf,
+                dl_confidence_threshold=step.get("dl_confidence_threshold", 0.5),
+                dl_seed_weight=step.get("dl_seed_weight", 1.0),
+                max_distance=step.get("max_distance", 1.4),
+                max_angle=step.get("max_angle", 6.0),
+                max_terrain_angle=step.get("max_terrain_angle", 88.0),
+                max_building_size=step.get("max_building_size"),
+                only_upward=step.get("only_upward", False),
+                follow_surface_trend=step.get("follow_surface_trend", True),
+                exclude_single_returns_in_water=step.get("exclude_single_returns_in_water", False),
+                sensor_type=data.get("sensor_type"),
                 return_numbers=(
                     data["return_number"][keep]
                     if data.get("return_number") is not None else None

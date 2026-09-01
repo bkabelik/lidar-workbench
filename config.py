@@ -57,6 +57,7 @@ DEFAULT_ROR_MIN_POINTS: Final[int] = 5
 DEFAULT_FILTER_WORKERS: Final[int] = 4     # parallel filter threads
 DEFAULT_CLASSIFY_WORKERS: Final[int] = 1  # parallel classify processes (GPU-heavy)
 DEFAULT_BATHY_WORKERS: Final[int] = 4     # parallel bathy tiles
+DEFAULT_GROUND_WORKERS: Final[int] = 4    # parallel ground-classification tiles
 
 # ── Advanced filter defaults ──────────────────────────────────────
 DEFAULT_ISOLATED_SEARCH_RADIUS: Final[float] = 0.5

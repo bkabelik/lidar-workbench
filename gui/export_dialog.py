@@ -9,9 +9,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-
-import numpy as np
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtCore import QThread, Signal, Qt
 from PySide6.QtWidgets import (
@@ -34,7 +32,12 @@ from PySide6.QtWidgets import (
 )
 
 from ..config import ASPRS_CLASS_NAMES
-from ..export_manager import ExportConfig, export_dtm, export_dsm, export_merged_raster
+from ..export_manager import (
+    ExportConfig,
+    export_dsm_parallel,
+    export_dtm_parallel,
+    export_merged_raster_parallel,
+)
 
 logger = logging.getLogger("lidar_workbench.gui.export_dialog")
 
@@ -55,7 +58,7 @@ DSM_CLASS_OPTIONS: List[Tuple[int, str]] = [
 
 
 class _ExportWorker(QThread):
-    """Background worker that calls the export engine."""
+    """Background worker that calls the parallel raster export engine."""
 
     progress = Signal(float, str)
     finished_ok = Signal(list)
@@ -63,39 +66,44 @@ class _ExportWorker(QThread):
 
     def __init__(
         self,
-        tile_points: Dict[str, Dict[str, np.ndarray]],
-        tile_bboxes: Dict[str, Tuple[float, float, float, float]],
+        jobs: list,
+        global_bbox: Tuple[float, float, float, float],
         config: ExportConfig,
         merged: bool,
+        workers: int = 4,
         parent=None,
     ):
         super().__init__(parent)
-        self._tile_points = tile_points
-        self._tile_bboxes = tile_bboxes
+        self._jobs = jobs
+        self._global_bbox = global_bbox
         self._config = config
         self._merged = merged
+        self._workers = workers
 
     def run(self) -> None:
         try:
             if self._merged:
-                files = export_merged_raster(
-                    self._tile_points,
-                    self._tile_bboxes,
+                files = export_merged_raster_parallel(
+                    self._jobs,
+                    self._global_bbox,
                     self._config,
+                    workers=self._workers,
                     progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
                 )
             elif self._config.mode == "dtm":
-                files = export_dtm(
-                    self._tile_points,
-                    self._tile_bboxes,
+                files = export_dtm_parallel(
+                    self._jobs,
+                    self._global_bbox,
                     self._config,
+                    workers=self._workers,
                     progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
                 )
             else:
-                files = export_dsm(
-                    self._tile_points,
-                    self._tile_bboxes,
+                files = export_dsm_parallel(
+                    self._jobs,
+                    self._global_bbox,
                     self._config,
+                    workers=self._workers,
                     progress_callback=lambda pct, msg: self.progress.emit(pct, msg),
                 )
             self.finished_ok.emit(files)
@@ -108,26 +116,30 @@ class ExportDialog(QDialog):
     """
     Modal dialog for configuring raster export.
 
+    Tile rasters are computed in parallel worker processes via *jobs* and
+    *global_bbox*, so large projects never hold all point clouds in memory
+    and use all configured CPU cores.
+
     Usage::
 
-        dlg = ExportDialog(tile_ids, tile_points, tile_bboxes, project_dtm_dir, parent=self)
+        dlg = ExportDialog(jobs, global_bbox, project_dtm_dir, workers=4, parent=self)
         if dlg.exec() == QDialog.Accepted:
             print("Export complete — files:", dlg.written_files)
     """
 
     def __init__(
         self,
-        tile_ids: List[str],
-        tile_points: Dict[str, Dict[str, np.ndarray]],
-        tile_bboxes: Dict[str, Tuple[float, float, float, float]],
+        jobs: List[dict],
+        global_bbox: Tuple[float, float, float, float],
         default_output_dir: str,
+        workers: int = 4,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self._tile_ids = tile_ids
-        self._tile_points = tile_points
-        self._tile_bboxes = tile_bboxes
+        self._jobs = list(jobs)
+        self._global_bbox = global_bbox
         self._default_output_dir = default_output_dir
+        self._workers = max(1, int(workers))
         self._worker: Optional[_ExportWorker] = None
         self.written_files: List[str] = []
 
@@ -222,6 +234,7 @@ class ExportDialog(QDialog):
         self._merged_check.setChecked(False)
         self._merged_check.setToolTip(
             "When checked, all tiles are combined into one large .asc file. "
+            "Tiles are composited one at a time, so memory stays bounded. "
             "Unchecked: one .asc per tile (seamless — aligned to common grid)."
         )
         out_form.addRow(self._merged_check)
@@ -277,7 +290,7 @@ class ExportDialog(QDialog):
         config = ExportConfig(
             mode="dtm" if self._dtm_radio.isChecked() else "dsm",
             resolution=self._res_spin.value(),
-            tile_ids=list(self._tile_ids),
+            tile_ids=[job["tile_id"] for job in self._jobs],
             output_dir=out_dir,
             compute_hillshade=self._hillshade_check.isChecked(),
         )
@@ -297,16 +310,17 @@ class ExportDialog(QDialog):
         self._set_ui_enabled(False)
         self._progress_bar.setVisible(True)
         self._progress_bar.setValue(0)
-        self._status_label.setText("Loading tile data…")
+        self._status_label.setText("Rasterising tiles…")
 
         merged = self._merged_check.isChecked()
 
         # Start worker
         self._worker = _ExportWorker(
-            self._tile_points,
-            self._tile_bboxes,
+            self._jobs,
+            self._global_bbox,
             config,
             merged,
+            workers=self._workers,
             parent=self,
         )
         self._worker.progress.connect(self._on_progress)

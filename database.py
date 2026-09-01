@@ -351,6 +351,24 @@ class Database:
                 (status, tile_id),
             )
 
+    def update_tile_bbox(
+        self,
+        conn: sqlite3.Connection,
+        tile_id: str,
+        bbox: tuple[float, float, float, float],
+        point_count: Optional[int] = None,
+    ) -> None:
+        """Update the stored bounding box (and optionally point count) of a tile."""
+        with Database._write_lock:
+            conn.execute(
+                """UPDATE tiles
+                   SET bbox_min_x = ?, bbox_min_y = ?, bbox_max_x = ?, bbox_max_y = ?,
+                       point_count = COALESCE(?, point_count),
+                       last_modified = CURRENT_TIMESTAMP
+                   WHERE id = ?""",
+                (bbox[0], bbox[1], bbox[2], bbox[3], point_count, tile_id),
+            )
+
     def update_point_count(self, conn: sqlite3.Connection, tile_id: str, count: int) -> None:
         """Update the point count for a tile."""
         with Database._write_lock:

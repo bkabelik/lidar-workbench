@@ -9,7 +9,8 @@ Densification (Axelsson).
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -30,100 +31,394 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ..ground import ground_classify_smrf, ground_classify_tin
+from ..ground import (
+    ground_classify_smrf,
+    ground_classify_epptd,
+    ground_classify_aptd,
+    ground_classify_hptd,
+    ground_classify_dl_hybrid_ptd,
+)
+from ..tile_manager import _read_las_header_template, _write_las_file
 
 logger = logging.getLogger("lidar_workbench.gui.ground_classify_dialog")
 
 
-class _GroundClassifyWorker(QThread):
-    progress = Signal(str, float)
-    finished = Signal(np.ndarray)  # ground_mask
+def _load_las_for_ground(las_path: str, flightline_sensor_types: dict) -> dict:
+    """Load a tile's points directly from a LAS file (runs in a worker
+    process).  Mirrors :meth:`TileManager.load_tile_points_full` so the
+    ground classifiers receive identical arrays."""
+    import laspy
+
+    with laspy.open(las_path) as reader:
+        las_data = reader.read()
+        result = {
+            "x": np.array(las_data.x, dtype=np.float64),
+            "y": np.array(las_data.y, dtype=np.float64),
+            "z": np.array(las_data.z, dtype=np.float64),
+        }
+        _safe = lambda attr, dtype, default: (
+            np.array(getattr(las_data, attr), dtype=dtype)
+            if hasattr(las_data, attr) else
+            np.full(len(result["x"]), default, dtype=dtype)
+        )
+        result["classification"] = _safe("classification", np.uint8, 0)
+        result["intensity"] = _safe("intensity", np.uint16, 0)
+        result["return_number"] = _safe("return_number", np.uint8, 1)
+        result["num_returns"] = _safe("num_returns", np.uint8, 1)
+        result["point_source_id"] = _safe("point_source_id", np.uint16, 0)
+        result["scan_direction_flag"] = _safe("scan_direction_flag", np.uint8, 0)
+        result["edge_of_flight_line"] = _safe("edge_of_flight_line", np.uint8, 0)
+        result["scan_angle_rank"] = _safe("scan_angle_rank", np.int8, 0)
+        result["user_data"] = _safe("user_data", np.uint8, 0)
+        result["gps_time"] = _safe("gps_time", np.float64, 0.0)
+        result["red"] = _safe("red", np.uint16, 0)
+        result["green"] = _safe("green", np.uint16, 0)
+        result["blue"] = _safe("blue", np.uint16, 0)
+        result["key_point"] = _safe("key_point", np.uint8, 0)
+        result["synthetic"] = _safe("synthetic", np.uint8, 0)
+        result["withheld"] = _safe("withheld", np.uint8, 0)
+        result["overlap"] = _safe("overlap", np.uint8, 0)
+
+        extra_dims = {}
+        for ed in las_data.point_format.extra_dimensions:
+            name = ed.name
+            if hasattr(las_data, name):
+                extra_dims[name] = np.array(getattr(las_data, name))
+        if extra_dims:
+            result["extra_dims"] = extra_dims
+
+    # Per-point sensor_type from the flightline→sensor mapping.
+    fl_to_st = {}
+    for k, v in (flightline_sensor_types or {}).items():
+        if v == "topo":
+            fl_to_st[int(k)] = 1
+        elif v == "bathy":
+            fl_to_st[int(k)] = 2
+    if fl_to_st:
+        src_ids = result["point_source_id"]
+        st_arr = np.zeros(len(result["x"]), dtype=np.uint8)
+        for fl, st_code in fl_to_st.items():
+            st_arr[src_ids == fl] = st_code
+        result["sensor_type"] = st_arr
+
+    return result
+
+
+def _ground_process_tile(tile_id: str, las_path: str, method: str,
+                         params: dict, source_class: int,
+                         flightline_sensor_types: dict) -> dict:
+    """Run ground classification on one tile inside a worker process.
+
+    Loads the LAS, classifies SMRF/TIN, writes the updated classification
+    back to disk, and returns a small summary dict (safe to pickle back
+    to the GUI process)."""
+    import time
+
+    las_path = Path(las_path)
+
+    t0 = time.perf_counter()
+    result = {
+        "tile_id": tile_id,
+        "n_ground": 0,
+        "n_affected": 0,
+        "n_source": 0,
+        "duration": 0.0,
+    }
+
+    data = _load_las_for_ground(str(las_path), flightline_sensor_types)
+    cls_all = data["classification"]
+    n_total = len(cls_all)
+    sc = source_class
+
+    if method == "dl_hybrid" and sc == 2:
+        # With source class 2 only, every source point is already a DL
+        # ground prediction and the DL prior carries no information —
+        # the result degenerates to EP-PTD.  Broaden the source set to
+        # classes 1 & 2 so class-2 points act as trusted DL seeds while
+        # class-1 points are densified geometrically against them.
+        source_mask = (cls_all == 1) | (cls_all == 2)
+        sc = -2
+    elif sc == -2:
+        source_mask = (cls_all == 1) | (cls_all == 2)
+    elif sc >= 0:
+        source_mask = (cls_all == sc)
+    else:
+        source_mask = np.ones(n_total, dtype=bool)
+
+    n_source = int(source_mask.sum())
+    result["n_source"] = n_source
+    if n_source == 0:
+        return result
+
+    xs_sub = data["x"][source_mask]
+    ys_sub = data["y"][source_mask]
+    zs_sub = data["z"][source_mask]
+    rn = data.get("return_number")
+    nr = data.get("num_returns")
+    st = data.get("sensor_type")
+    rn_sub = rn[source_mask] if rn is not None else None
+    nr_sub = nr[source_mask] if nr is not None else None
+    st_sub = st[source_mask] if st is not None else None
+
+    if method == "smrf":
+        mask = ground_classify_smrf(
+            xs_sub, ys_sub, zs_sub,
+            cell_size=params.get("cell_size"),
+            slope_threshold=params["slope_threshold"],
+            max_window=params["max_window"],
+            elevation_threshold=params["elevation_threshold"],
+            base_window=params.get("base_window", 2.0),
+            window_growth=params.get("window_growth", 1.5),
+        )
+    elif method == "aptd":
+        mask = ground_classify_aptd(
+            xs_sub, ys_sub, zs_sub,
+            k_neighbors=params.get("k_neighbors", 4),
+            radius_factor=params.get("radius_factor", 4.0),
+            min_neighbors=params.get("min_neighbors", 2),
+            primary_grid_size=params.get("primary_grid_size"),
+            point_count_threshold=params.get("point_count_threshold", 5),
+            slope_threshold=params.get("slope_threshold", 0.5),
+            max_angle=params.get("max_angle"),
+            max_distance=params.get("max_distance"),
+            max_terrain_angle=params.get("max_terrain_angle"),
+            exclude_single_returns_in_water=params.get("exclude_single_returns_in_water", False),
+            sensor_type=st_sub,
+            return_numbers=rn_sub,
+            num_returns=nr_sub,
+        )
+    elif method == "hptd":
+        mask = ground_classify_hptd(
+            xs_sub, ys_sub, zs_sub,
+            window_size=params.get("window_size"),
+            step_factor=params.get("step_factor", 0.5),
+            max_angle=params.get("max_angle", 6.0),
+            max_distance=params.get("max_distance"),
+            relative_elevation_factor=params.get("relative_elevation_factor", 1.0),
+            signed=params.get("signed", True),
+            below_tolerance=params.get("below_tolerance", 0.5),
+            max_terrain_angle=params.get("max_terrain_angle", 88.0),
+            follow_surface_trend=params.get("follow_surface_trend", True),
+            exclude_single_returns_in_water=params.get("exclude_single_returns_in_water", False),
+            sensor_type=st_sub,
+            return_numbers=rn_sub,
+            num_returns=nr_sub,
+        )
+    elif method == "dl_hybrid":
+        # Pointcept's ASPRS class 2 (ground) is the DL prior.
+        dl_conf_sub = (
+            (cls_all[source_mask] == 2).astype(np.float64)
+            if cls_all is not None else None
+        )
+        mask = ground_classify_dl_hybrid_ptd(
+            xs_sub, ys_sub, zs_sub,
+            dl_ground_confidence=dl_conf_sub,
+            dl_confidence_threshold=params.get("dl_confidence_threshold", 0.5),
+            dl_seed_weight=params.get("dl_seed_weight", 1.0),
+            max_distance=params.get("max_distance", 1.4),
+            max_angle=params.get("max_angle", 6.0),
+            max_terrain_angle=params.get("max_terrain_angle", 88.0),
+            only_upward=params.get("only_upward", False),
+            follow_surface_trend=params.get("follow_surface_trend", True),
+            exclude_single_returns_in_water=params.get("exclude_single_returns_in_water", False),
+            sensor_type=st_sub,
+            return_numbers=rn_sub,
+            num_returns=nr_sub,
+        )
+    else:  # "epptd" (and legacy "tin")
+        mask = ground_classify_epptd(
+            xs_sub, ys_sub, zs_sub,
+            max_distance=params["max_distance"],
+            max_angle=params["max_angle"],
+            max_terrain_angle=params.get("max_terrain_angle", 88.0),
+            reduce_iter_angle_when_edge=params.get("reduce_iter_angle_when_edge"),
+            stop_tri_when_edge=params.get("stop_tri_when_edge"),
+            only_upward=params.get("only_upward", False),
+            follow_surface_trend=params.get("follow_surface_trend", True),
+            remove_low_outliers=params.get("remove_low_outliers", False),
+            low_outlier_neighbors=params.get("low_outlier_neighbors", 8),
+            low_outlier_threshold=params.get("low_outlier_threshold", 1.0),
+            exclude_single_returns_in_water=params.get("exclude_single_returns_in_water", False),
+            sensor_type=st_sub,
+            cell_size=None,
+            return_numbers=rn_sub,
+            num_returns=nr_sub,
+        )
+
+    # Expand the source-only mask back to the full tile.
+    full_mask = np.zeros(n_total, dtype=bool)
+    non_source_ground = ~source_mask & (cls_all == 2)
+    full_mask[non_source_ground] = True
+    full_mask[source_mask] = mask
+
+    new_cls = cls_all.copy()
+    if sc == -2:
+        in_source = (cls_all == 1) | (cls_all == 2)
+        new_cls[in_source & full_mask] = 2
+        new_cls[in_source & ~full_mask] = 1
+        n_affected = int(in_source.sum())
+    elif sc >= 0:
+        in_source = (cls_all == sc)
+        new_cls[in_source & full_mask] = 2
+        new_cls[in_source & ~full_mask] = 1
+        n_affected = int(in_source.sum())
+    else:
+        new_cls[full_mask] = 2
+        new_cls[~full_mask] = 1
+        n_affected = n_total
+
+    data["classification"] = new_cls
+
+    # Preserve the original point format / VLRs / extra dims.
+    try:
+        header_tmpl = _read_las_header_template(las_path)
+    except Exception:
+        header_tmpl = None
+    _write_las_file(
+        las_path,
+        data["x"], data["y"], data["z"],
+        classes=data["classification"],
+        intensities=data.get("intensity"),
+        return_numbers=data.get("return_number"),
+        num_returns=data.get("num_returns"),
+        point_source_ids=data.get("point_source_id"),
+        gps_times=data.get("gps_time"),
+        scan_angle_ranks=data.get("scan_angle_rank"),
+        scan_direction_flags=data.get("scan_direction_flag"),
+        edge_of_flight_lines=data.get("edge_of_flight_line"),
+        user_data_array=data.get("user_data"),
+        reds=data.get("red"),
+        greens=data.get("green"),
+        blues=data.get("blue"),
+        key_points=data.get("key_point"),
+        synthetics=data.get("synthetic"),
+        withhelds=data.get("withheld"),
+        overlaps=data.get("overlap"),
+        header_template=header_tmpl,
+        extra_dims=data.get("extra_dims"),
+    )
+
+    result["n_ground"] = int(mask.sum())
+    result["n_affected"] = n_affected
+    result["duration"] = time.perf_counter() - t0
+    return result
+
+
+class _GroundBatchWorker(QThread):
+    """Background worker that classifies ground points for many tiles in
+    parallel using a process pool.
+
+    Each tile is handled by a separate Python process (via
+    ProcessPoolExecutor) so the GIL-bound TIN/SMRF densification loop can
+    actually use all configured CPU cores.  Results are small summary dicts,
+    emitted one per tile for the GUI to update status."""
+
+    progress = Signal(str, float)          # message, percentage
+    tile_done = Signal(str, dict)          # (tile_id, summary_dict)
+    finished_all = Signal(int)             # number of tiles processed
     error = Signal(str)
 
-    def __init__(self, xs, ys, zs, classifications, method: str, params: dict,
-                 tile_id: str = None, db=None, return_numbers=None, num_returns=None,
-                 sensor_type=None, parent=None):
+    def __init__(self, jobs: list, method: str, params: dict,
+                 source_class: int, workers: int = 4, db=None, parent=None):
         super().__init__(parent)
-        self._xs, self._ys, self._zs = xs, ys, zs
-        self._classifications = classifications
+        self._jobs = list(jobs)
         self._method = method
         self._params = params
-        self._tile_id = tile_id
+        self._source_class = source_class
+        self._workers = max(1, int(workers))
         self._db = db
-        self._return_numbers = return_numbers
-        self._num_returns = num_returns
-        self._sensor_type = sensor_type
 
     def run(self):
-        import time as _time
-        t0 = _time.perf_counter()
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        import time
+
+        n_total = len(self._jobs)
+        if n_total == 0:
+            self.finished_all.emit(0)
+            return
+
+        t_start = time.time()
+        processed = 0
+        max_workers = min(self._workers, n_total)
+
         try:
-            if self._method == "smrf":
-                mask = ground_classify_smrf(
-                    self._xs, self._ys, self._zs,
-                    cell_size=self._params.get("cell_size"),
-                    slope_threshold=self._params["slope_threshold"],
-                    max_window=self._params["max_window"],
-                    elevation_threshold=self._params["elevation_threshold"],
-                    base_window=self._params.get("base_window", 2.0),
-                    window_growth=self._params.get("window_growth", 1.5),
-                    progress=lambda msg, pct: self.progress.emit(msg, pct),
-                )
-            else:
-                mask = ground_classify_tin(
-                    self._xs, self._ys, self._zs,
-                    max_distance=self._params["max_distance"],
-                    max_angle=self._params["max_angle"],
-                    max_terrain_angle=self._params.get("max_terrain_angle", 88.0),
-                    reduce_iter_angle_when_edge=self._params.get("reduce_iter_angle_when_edge"),
-                    stop_tri_when_edge=self._params.get("stop_tri_when_edge"),
-                    only_upward=self._params.get("only_upward", False),
-                    follow_surface_trend=self._params.get("follow_surface_trend", True),
-                    remove_low_outliers=self._params.get("remove_low_outliers", False),
-                    low_outlier_neighbors=self._params.get("low_outlier_neighbors", 8),
-                    low_outlier_threshold=self._params.get("low_outlier_threshold", 1.0),
-                    exclude_single_returns_in_water=self._params.get("exclude_single_returns_in_water", False),
-                    sensor_type=self._sensor_type,
-                    cell_size=None,
-                    return_numbers=self._return_numbers,
-                    num_returns=self._num_returns,
-                    progress=lambda msg, pct: self.progress.emit(msg, pct),
-                )
-            duration = _time.perf_counter() - t0
-            # Record processing time
-            if self._tile_id and self._db:
-                try:
-                    with self._db.connect() as conn:
-                        self._db.record_processing_time(
-                            conn, self._tile_id, "ground",
-                            duration_seconds=duration,
-                            point_count=len(self._xs),
-                            params={**self._params, "method": self._method},
-                            batch_id=None,
+            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                futures = {}
+                for job in self._jobs:
+                    fut = pool.submit(
+                        _ground_process_tile,
+                        job["tile_id"], job["las_path"],
+                        self._method, self._params, self._source_class,
+                        job.get("flightline_sensor_types", {}),
+                    )
+                    futures[fut] = job["tile_id"]
+
+                for fut in as_completed(futures):
+                    tid = futures[fut]
+                    try:
+                        result = fut.result()
+                        processed += 1
+                        self._record_time(tid, result)
+                        self.tile_done.emit(tid, result)
+                        self.progress.emit(
+                            f"Done {processed}/{n_total} tiles",
+                            processed / n_total * 100,
                         )
-                except Exception:
-                    pass
-            self.finished.emit(mask)
+                    except Exception as exc:
+                        processed += 1
+                        logger.error(
+                            "Ground classification error on %s: %s", tid, exc
+                        )
+                        self.error.emit(f"{tid}: {exc}")
+
+            elapsed = time.time() - t_start
+            self.progress.emit(
+                f"Done: {processed}/{n_total} tiles in {elapsed:.1f}s", 100.0
+            )
+            self.finished_all.emit(processed)
         except Exception as exc:
+            logger.exception("Ground classification failed")
             self.error.emit(str(exc))
+
+    def _record_time(self, tile_id: str, result: dict) -> None:
+        """Record per-tile processing time (thread-local SQLite connection)."""
+        if self._db is None:
+            return
+        try:
+            with self._db.connect() as conn:
+                self._db.record_processing_time(
+                    conn, tile_id, "ground",
+                    duration_seconds=result.get("duration", 0.0),
+                    point_count=result.get("n_source", 0),
+                    params={**self._params, "method": self._method},
+                    batch_id=None,
+                )
+        except Exception:
+            pass
 
 
 class GroundClassifyDialog(QDialog):
-    """Dialog for ground classification with preview."""
+    """Dialog for ground classification over one or more tiles.
 
-    ground_applied = Signal(np.ndarray, int)  # ground_mask, source_class
+    Configures SMRF or Progressive-TIN ground classification and then runs
+    it on every selected tile in parallel worker processes.  Each finished
+    tile is emitted via ``tile_processed`` so the main window can update
+    tile status and refresh the views."""
 
-    def __init__(self, tile_data: dict, tile_id: str = None, db=None, parent=None):
+    ground_applied = Signal()            # all tiles processed
+    tile_processed = Signal(str, dict)   # (tile_id, summary_dict)
+
+    def __init__(self, jobs: list, db=None, parent=None):
         super().__init__(parent)
-        self._data = tile_data
-        self._tile_id = tile_id
+        self._jobs = list(jobs)
         self._db = db
-        self._worker: Optional[_GroundClassifyWorker] = None
-        self._ground_mask: Optional[np.ndarray] = None
-        self._source_class: int = 2  # default: class 2 (ground) from Pointcept
-        self._source_mask: Optional[np.ndarray] = None  # set in _on_run
+        self._worker: Optional[_GroundBatchWorker] = None
 
-        self.setWindowTitle("Ground Classification")
+        n_tiles = len(self._jobs)
+        title = "Ground Classification"
+        if n_tiles > 1:
+            title += f" ({n_tiles} tiles selected)"
+        self.setWindowTitle(title)
         self.setMinimumWidth(480)
         self._setup_ui()
 
@@ -142,7 +437,10 @@ class GroundClassifyDialog(QDialog):
         mf = QFormLayout(method_group)
         self._method_combo = QComboBox()
         self._method_combo.addItem("SMRF — Simple Morphological Filter (PDAL)", "smrf")
-        self._method_combo.addItem("TIN — Progressive Densification", "tin")
+        self._method_combo.addItem("EP-PTD — Edge-Preserving PTD (Axelsson)", "epptd")
+        self._method_combo.addItem("APTD — Adaptive Grid PTD (AGPTD)", "aptd")
+        self._method_combo.addItem("H-PTD — Hierarchical/Fast PTD (FPTD)", "hptd")
+        self._method_combo.addItem("DL-Hybrid PTD — Pointcept + PTD", "dl_hybrid")
         self._method_combo.currentIndexChanged.connect(self._on_method_changed)
         mf.addRow("Method:", self._method_combo)
 
@@ -186,8 +484,8 @@ class GroundClassifyDialog(QDialog):
         sf.addRow("Elevation Thresh:", self._smrf_elev)
         layout.addWidget(self._smrf_group)
 
-        # TIN params
-        self._tin_group = QGroupBox("TIN Densification Parameters")
+        # EP-PTD params
+        self._tin_group = QGroupBox("EP-PTD Parameters")
         tf = QFormLayout(self._tin_group)
         self._tin_dist = QDoubleSpinBox()
         self._tin_dist.setRange(0.1, 10.0)
@@ -303,19 +601,174 @@ class GroundClassifyDialog(QDialog):
         self._tin_group.setVisible(False)
         layout.addWidget(self._tin_group)
 
+        # APTD (AGPTD) params
+        self._aptd_group = QGroupBox("APTD (Adaptive Grid PTD) Parameters")
+        af = QFormLayout(self._aptd_group)
+        self._aptd_k = QSpinBox()
+        self._aptd_k.setRange(2, 32)
+        self._aptd_k.setValue(4)
+        self._aptd_k.setToolTip("Neighbours for the Kd-tree elevation-outlier check")
+        af.addRow("K Neighbours:", self._aptd_k)
+        self._aptd_radius_factor = QDoubleSpinBox()
+        self._aptd_radius_factor.setRange(1.0, 20.0)
+        self._aptd_radius_factor.setDecimals(1)
+        self._aptd_radius_factor.setValue(4.0)
+        self._aptd_radius_factor.setToolTip("Radius = factor × max point spacing")
+        af.addRow("Radius Factor:", self._aptd_radius_factor)
+        self._aptd_min_neighbors = QSpinBox()
+        self._aptd_min_neighbors.setRange(1, 20)
+        self._aptd_min_neighbors.setValue(2)
+        self._aptd_min_neighbors.setToolTip("Min neighbours within radius (else outlier)")
+        af.addRow("Min Neighbours:", self._aptd_min_neighbors)
+        self._aptd_point_count = QSpinBox()
+        self._aptd_point_count.setRange(2, 100)
+        self._aptd_point_count.setValue(5)
+        self._aptd_point_count.setToolTip("Min points in a cell to consider grid refinement")
+        af.addRow("Refine If Points ≥:", self._aptd_point_count)
+        self._aptd_slope_threshold = QDoubleSpinBox()
+        self._aptd_slope_threshold.setRange(0.05, 5.0)
+        self._aptd_slope_threshold.setDecimals(2)
+        self._aptd_slope_threshold.setValue(0.5)
+        self._aptd_slope_threshold.setToolTip("Relative-slope threshold to refine a cell")
+        af.addRow("Slope Threshold:", self._aptd_slope_threshold)
+        self._aptd_angle = self._make_auto_spin(90.0, 1, "Auto")
+        af.addRow("Max Angle (Auto):", self._aptd_angle)
+        self._aptd_distance = self._make_auto_spin(10.0, 2, "Auto")
+        af.addRow("Max Distance (Auto):", self._aptd_distance)
+        self._aptd_terrain_angle = self._make_auto_spin(90.0, 1, "Auto")
+        af.addRow("Max Terrain Angle (Auto):", self._aptd_terrain_angle)
+        self._aptd_exclude_single_returns_water = QCheckBox(
+            "Exclude single returns in water (bathy bed-only)"
+        )
+        af.addRow(self._aptd_exclude_single_returns_water)
+        self._aptd_group.setVisible(False)
+        layout.addWidget(self._aptd_group)
+
+        # H-PTD (FPTD) params
+        self._hptd_group = QGroupBox("H-PTD (Fast PTD) Parameters")
+        hf = QFormLayout(self._hptd_group)
+        self._hptd_window = self._make_auto_spin(200.0, 1, "Auto")
+        hf.addRow("Window Size (Auto):", self._hptd_window)
+        self._hptd_step_factor = QDoubleSpinBox()
+        self._hptd_step_factor.setRange(0.1, 1.0)
+        self._hptd_step_factor.setDecimals(2)
+        self._hptd_step_factor.setValue(0.5)
+        self._hptd_step_factor.setToolTip("Sliding-window step as a fraction of window size")
+        hf.addRow("Step Factor:", self._hptd_step_factor)
+        self._hptd_angle = QDoubleSpinBox()
+        self._hptd_angle.setRange(1.0, 45.0)
+        self._hptd_angle.setDecimals(1)
+        self._hptd_angle.setValue(6.0)
+        self._hptd_angle.setSuffix("°")
+        hf.addRow("Max Angle:", self._hptd_angle)
+        self._hptd_distance = self._make_auto_spin(10.0, 2, "Auto")
+        hf.addRow("Max Distance (Auto):", self._hptd_distance)
+        self._hptd_rel_elev = QDoubleSpinBox()
+        self._hptd_rel_elev.setRange(0.0, 10.0)
+        self._hptd_rel_elev.setDecimals(2)
+        self._hptd_rel_elev.setValue(1.0)
+        self._hptd_rel_elev.setToolTip("Relative elevation threshold grows with facet slope")
+        hf.addRow("Relative Elev. Factor:", self._hptd_rel_elev)
+        self._hptd_signed = QCheckBox("Signed computation (reject below-surface points)")
+        self._hptd_signed.setChecked(True)
+        hf.addRow(self._hptd_signed)
+        self._hptd_below = QDoubleSpinBox()
+        self._hptd_below.setRange(0.05, 10.0)
+        self._hptd_below.setDecimals(2)
+        self._hptd_below.setValue(0.5)
+        self._hptd_below.setSuffix(" m")
+        self._hptd_below.setToolTip("Reject points this far below the local TIN surface")
+        hf.addRow("Below Tolerance:", self._hptd_below)
+        self._hptd_terrain_angle = QDoubleSpinBox()
+        self._hptd_terrain_angle.setRange(10.0, 90.0)
+        self._hptd_terrain_angle.setDecimals(1)
+        self._hptd_terrain_angle.setValue(88.0)
+        self._hptd_terrain_angle.setSuffix("°")
+        self._hptd_terrain_angle.setToolTip(
+            "Max allowed slope of TIN triangles. "
+            "Keep 88-90° to classify steep natural embankments and riverbanks; "
+            "lower it only to exclude man-made vertical walls."
+        )
+        hf.addRow("Max Terrain Angle:", self._hptd_terrain_angle)
+        self._hptd_follow_trend = QCheckBox("Follow surface trend (adapt to local slope)")
+        self._hptd_follow_trend.setChecked(True)
+        self._hptd_follow_trend.setToolTip(
+            "Relaxes the iteration angle on steep facets for points above "
+            "the TIN, so embankments and cliffs are climbed reliably."
+        )
+        hf.addRow(self._hptd_follow_trend)
+        self._hptd_exclude_single_returns_water = QCheckBox(
+            "Exclude single returns in water (bathy bed-only)"
+        )
+        hf.addRow(self._hptd_exclude_single_returns_water)
+        self._hptd_group.setVisible(False)
+        layout.addWidget(self._hptd_group)
+
+        # DL-Hybrid PTD params
+        self._dlhybrid_group = QGroupBox("DL-Hybrid PTD Parameters")
+        df = QFormLayout(self._dlhybrid_group)
+        self._dl_conf_threshold = QDoubleSpinBox()
+        self._dl_conf_threshold.setRange(0.0, 1.0)
+        self._dl_conf_threshold.setDecimals(2)
+        self._dl_conf_threshold.setValue(0.5)
+        self._dl_conf_threshold.setToolTip("Min DL confidence to treat a point as DL ground")
+        df.addRow("DL Confidence Threshold:", self._dl_conf_threshold)
+        self._dl_seed_weight = QDoubleSpinBox()
+        self._dl_seed_weight.setRange(0.0, 10.0)
+        self._dl_seed_weight.setDecimals(2)
+        self._dl_seed_weight.setValue(1.0)
+        self._dl_seed_weight.setToolTip("How strongly DL confidence relaxes the distance threshold")
+        df.addRow("DL Seed Weight:", self._dl_seed_weight)
+        self._dl_distance = QDoubleSpinBox()
+        self._dl_distance.setRange(0.1, 10.0)
+        self._dl_distance.setDecimals(2)
+        self._dl_distance.setValue(1.4)
+        self._dl_distance.setSuffix(" m")
+        df.addRow("Max Distance:", self._dl_distance)
+        self._dl_angle = QDoubleSpinBox()
+        self._dl_angle.setRange(1.0, 45.0)
+        self._dl_angle.setDecimals(1)
+        self._dl_angle.setValue(6.0)
+        self._dl_angle.setSuffix("°")
+        df.addRow("Max Angle:", self._dl_angle)
+        self._dl_terrain_angle = QDoubleSpinBox()
+        self._dl_terrain_angle.setRange(10.0, 90.0)
+        self._dl_terrain_angle.setDecimals(1)
+        self._dl_terrain_angle.setValue(88.0)
+        self._dl_terrain_angle.setSuffix("°")
+        df.addRow("Max Terrain Angle:", self._dl_terrain_angle)
+        self._dl_only_upward = QCheckBox("Only add points above initial surface")
+        df.addRow(self._dl_only_upward)
+        self._dl_follow_trend = QCheckBox("Follow surface trend (adapt to local slope)")
+        self._dl_follow_trend.setChecked(True)
+        df.addRow(self._dl_follow_trend)
+        self._dl_exclude_single_returns_water = QCheckBox(
+            "Exclude single returns in water (bathy bed-only)"
+        )
+        df.addRow(self._dl_exclude_single_returns_water)
+        self._dlhybrid_group.setVisible(False)
+        layout.addWidget(self._dlhybrid_group)
+
         # Info
         info = QLabel(
             "<b>SMRF</b> (PDAL): fast, good for most terrain. "
             "Uses progressive morphological opening.\n\n"
-            "<b>TIN Densification</b> (Axelsson): iterative, "
-            "preserves sharp terrain breaks (cliffs, riverbanks). "
-            "Slower but more precise on complex terrain.\n\n"
-            "<b>TIN tips:</b> keep <i>Max Terrain Angle</i> at 88-90° to "
-            "classify steep embankments and riverbanks. "
-            "Enable <i>Only Upward</i> if low-error points "
-            "are pulling the surface down. "
-            "<i>Follow surface trend</i> helps climb slopes. "
-            "Edge controls are optional — leave off for faster processing."
+            "<b>EP-PTD</b> (Axelsson + edge controls): iterative, "
+            "preserves sharp terrain breaks (cliffs, riverbanks).\n\n"
+            "<b>APTD</b> (AGPTD): adaptive two-level grid + outlier removal, "
+            "good for low points and disconnected/steep terrain. "
+            "<i>Slowest method on large tiles — prefer H-PTD or SMRF when "
+            "processing speed matters.</i>\n\n"
+            "<b>H-PTD</b> (FPTD): sliding-window seeds + signed/relative "
+            "criteria — faster, robust on steep slopes.\n\n"
+            "<b>DL-Hybrid PTD</b>: seeds the TIN from Pointcept's ground "
+            "predictions (class 2) and refines geometrically — use after "
+            "Pointcept classification with source class <b>1 &amp; 2</b> "
+            "(selected automatically).\n\n"
+            "<b>River data:</b> keep <i>Max Terrain Angle</i> at 88-90° to "
+            "classify steep embankments and riverbanks. Enable "
+            "<i>Exclude single returns in water</i> for bathy bed-only "
+            "classification."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -341,41 +794,37 @@ class GroundClassifyDialog(QDialog):
         btn_layout.addWidget(btn_box)
         layout.addLayout(btn_layout)
 
+    @staticmethod
+    def _make_auto_spin(maximum: float, decimals: int, auto_text: str = "Auto") -> QDoubleSpinBox:
+        """A spin box where value 0 means 'Auto' (returns None in params)."""
+        spin = QDoubleSpinBox()
+        spin.setRange(0.0, maximum)
+        spin.setDecimals(decimals)
+        spin.setValue(0.0)
+        spin.setSpecialValueText(auto_text)
+        return spin
+
     def _on_method_changed(self):
         method = self._method_combo.currentData()
         self._smrf_group.setVisible(method == "smrf")
-        self._tin_group.setVisible(method == "tin")
+        self._tin_group.setVisible(method == "epptd")
+        self._aptd_group.setVisible(method == "aptd")
+        self._hptd_group.setVisible(method == "hptd")
+        self._dlhybrid_group.setVisible(method == "dl_hybrid")
 
-    def _on_run(self):
-        method = self._method_combo.currentData()
-        source_class = self._source_class_combo.currentData()
+        # DL-Hybrid needs both class 1 and class 2 in the source set:
+        # class 2 is the DL ground prior, class 1 are the candidates that
+        # are densified against it.  Auto-switch the default class-2-only
+        # selection so the hybrid does not silently degenerate to EP-PTD.
+        if method == "dl_hybrid" and self._source_class_combo.currentData() == 2:
+            idx = self._source_class_combo.findData(-2)
+            if idx >= 0:
+                self._source_class_combo.setCurrentIndex(idx)
 
-        # ── Filter to source class(es) ────────────────────────────
-        cls_all = self._data["classification"]
-        if source_class == -2:
-            source_mask = (cls_all == 1) | (cls_all == 2)
-        elif source_class >= 0:
-            source_mask = (cls_all == source_class)
-        else:
-            source_mask = np.ones(len(cls_all), dtype=bool)
-
-        n_source = source_mask.sum()
-        if n_source == 0:
-            self._status.setText("No points match the selected source class(es)")
-            return
-
-        xs_sub = self._data["x"][source_mask]
-        ys_sub = self._data["y"][source_mask]
-        zs_sub = self._data["z"][source_mask]
-        rn_sub = (self._data.get("return_number")[source_mask]
-                  if self._data.get("return_number") is not None else None)
-        nr_sub = (self._data.get("num_returns")[source_mask]
-                  if self._data.get("num_returns") is not None else None)
-        st_sub = (self._data.get("sensor_type")[source_mask]
-                  if self._data.get("sensor_type") is not None else None)
-
+    def _collect_params(self, method: str) -> dict:
+        """Build the algorithm parameter dict from the current widgets."""
         if method == "smrf":
-            params = {
+            return {
                 "slope_threshold": self._smrf_slope.value(),
                 "max_window": self._smrf_maxw.value(),
                 "elevation_threshold": self._smrf_elev.value(),
@@ -383,52 +832,100 @@ class GroundClassifyDialog(QDialog):
                 "window_growth": 1.5,
                 "cell_size": None,
             }
-        else:
-            params = {
-                "max_distance": self._tin_dist.value(),
-                "max_angle": self._tin_angle.value(),
-                "max_terrain_angle": self._tin_terrain_angle.value(),
-                "reduce_iter_angle_when_edge": (
-                    self._tin_reduce_edge.value()
-                    if self._tin_reduce_edge.value() > 0
-                    else None
-                ),
-                "stop_tri_when_edge": (
-                    self._tin_stop_edge.value()
-                    if self._tin_stop_edge.value() > 0
-                    else None
-                ),
-                "only_upward": self._tin_only_upward.isChecked(),
-                "follow_surface_trend": self._tin_follow_trend.isChecked(),
-                "remove_low_outliers": self._tin_remove_low_outliers.isChecked(),
-                "low_outlier_neighbors": 8,
-                "low_outlier_threshold": self._tin_low_outlier_threshold.value(),
-                "exclude_single_returns_in_water": self._tin_exclude_single_returns_water.isChecked(),
-                "cell_size": None,
+        if method == "aptd":
+            return {
+                "k_neighbors": self._aptd_k.value(),
+                "radius_factor": self._aptd_radius_factor.value(),
+                "min_neighbors": self._aptd_min_neighbors.value(),
+                "primary_grid_size": None,
+                "point_count_threshold": self._aptd_point_count.value(),
+                "slope_threshold": self._aptd_slope_threshold.value(),
+                "max_angle": self._aptd_angle.value() if self._aptd_angle.value() > 0 else None,
+                "max_distance": self._aptd_distance.value() if self._aptd_distance.value() > 0 else None,
+                "max_terrain_angle": self._aptd_terrain_angle.value() if self._aptd_terrain_angle.value() > 0 else None,
+                "exclude_single_returns_in_water": self._aptd_exclude_single_returns_water.isChecked(),
             }
+        if method == "hptd":
+            return {
+                "window_size": self._hptd_window.value() if self._hptd_window.value() > 0 else None,
+                "step_factor": self._hptd_step_factor.value(),
+                "max_angle": self._hptd_angle.value(),
+                "max_distance": self._hptd_distance.value() if self._hptd_distance.value() > 0 else None,
+                "relative_elevation_factor": self._hptd_rel_elev.value(),
+                "signed": self._hptd_signed.isChecked(),
+                "below_tolerance": self._hptd_below.value(),
+                "max_terrain_angle": self._hptd_terrain_angle.value(),
+                "follow_surface_trend": self._hptd_follow_trend.isChecked(),
+                "exclude_single_returns_in_water": self._hptd_exclude_single_returns_water.isChecked(),
+            }
+        if method == "dl_hybrid":
+            return {
+                "dl_confidence_threshold": self._dl_conf_threshold.value(),
+                "dl_seed_weight": self._dl_seed_weight.value(),
+                "max_distance": self._dl_distance.value(),
+                "max_angle": self._dl_angle.value(),
+                "max_terrain_angle": self._dl_terrain_angle.value(),
+                "only_upward": self._dl_only_upward.isChecked(),
+                "follow_surface_trend": self._dl_follow_trend.isChecked(),
+                "exclude_single_returns_in_water": self._dl_exclude_single_returns_water.isChecked(),
+            }
+        # epptd (and legacy "tin")
+        return {
+            "max_distance": self._tin_dist.value(),
+            "max_angle": self._tin_angle.value(),
+            "max_terrain_angle": self._tin_terrain_angle.value(),
+            "reduce_iter_angle_when_edge": (
+                self._tin_reduce_edge.value()
+                if self._tin_reduce_edge.value() > 0
+                else None
+            ),
+            "stop_tri_when_edge": (
+                self._tin_stop_edge.value()
+                if self._tin_stop_edge.value() > 0
+                else None
+            ),
+            "only_upward": self._tin_only_upward.isChecked(),
+            "follow_surface_trend": self._tin_follow_trend.isChecked(),
+            "remove_low_outliers": self._tin_remove_low_outliers.isChecked(),
+            "low_outlier_neighbors": 8,
+            "low_outlier_threshold": self._tin_low_outlier_threshold.value(),
+            "exclude_single_returns_in_water": self._tin_exclude_single_returns_water.isChecked(),
+            "cell_size": None,
+        }
 
-        self._source_mask = source_mask
-        self._source_class = source_class
+    def _on_run(self):
+        method = self._method_combo.currentData()
+        source_class = self._source_class_combo.currentData()
+        params = self._collect_params(method)
+
+        from ..gui.settings_dialog import load_general_settings
+        settings = load_general_settings()
+        workers = settings.get("ground_workers", 4)
 
         self._run_btn.setEnabled(False)
         self._status.setText(
-            f"Classifying ground on {n_source:,} points "
-            f"(out of {len(cls_all):,} total)…"
+            f"Classifying ground on {len(self._jobs)} tile(s) "
+            f"with {workers} worker process(es)…"
         )
         self._progress.setValue(0)
 
-        self._worker = _GroundClassifyWorker(
-            xs_sub, ys_sub, zs_sub,
-            self._data["classification"][source_mask],
-            method=method, params=params,
-            tile_id=self._tile_id, db=self._db,
-            return_numbers=rn_sub,
-            num_returns=nr_sub,
-            sensor_type=st_sub,
+        self._worker = _GroundBatchWorker(
+            self._jobs,
+            method=method,
+            params=params,
+            source_class=source_class,
+            workers=workers,
+            db=self._db,
             parent=self,
         )
         self._worker.progress.connect(self._on_progress)
-        self._worker.finished.connect(self._on_finished)
+        # BlockingQueuedConnection gives back-pressure so tile results are
+        # handled (status updates) before the next one is emitted.
+        self._worker.tile_done.connect(
+            self._on_tile_done,
+            Qt.ConnectionType.BlockingQueuedConnection,
+        )
+        self._worker.finished_all.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
@@ -436,28 +933,21 @@ class GroundClassifyDialog(QDialog):
         self._status.setText(msg)
         self._progress.setValue(int(pct))
 
-    def _on_finished(self, mask: np.ndarray):
-        # mask covers only source-class points — expand to full length
-        full_mask = np.zeros(len(self._data["x"]), dtype=bool)
-        # Non-source points that are already class 2 (ground) stay ground
-        cls_all = self._data["classification"]
-        non_source_ground = ~self._source_mask & (cls_all == 2)
-        full_mask[non_source_ground] = True
-        # Source-class points: use TIN result
-        full_mask[self._source_mask] = mask
-
-        self._ground_mask = full_mask
-        n_source = self._source_mask.sum()
-        n_ground = mask.sum()
-        n_total = len(full_mask)
+    def _on_tile_done(self, tile_id: str, result: dict):
+        n_ground = result.get("n_ground", 0)
+        n_affected = result.get("n_affected", 0)
         self._status.setText(
-            f"Done: {n_ground:,} ground / {n_source:,} source points "
-            f"({n_ground/max(n_source,1)*100:.1f}%) "
-            f"[{n_total:,} total]"
+            f"{tile_id}: {n_ground:,} ground / {n_affected:,} affected "
+            f"({n_ground/max(n_affected,1)*100:.1f}%)"
         )
+        self.tile_processed.emit(tile_id, result)
+
+    def _on_finished(self, n_processed: int):
+        self._status.setText(f"Done: {n_processed}/{len(self._jobs)} tiles")
         self._progress.setValue(100)
         self._run_btn.setEnabled(True)
         self._ok_btn.setEnabled(True)
+        self.ground_applied.emit()
 
     def _on_error(self, msg: str):
         self._status.setText(f"Error: {msg}")
@@ -471,11 +961,4 @@ class GroundClassifyDialog(QDialog):
         super().accept()
 
     def _on_accept(self):
-        if self._ground_mask is not None:
-            src_cls = self._source_class_combo.currentData()
-            self.ground_applied.emit(self._ground_mask, src_cls)
         self.accept()
-
-    @property
-    def ground_mask(self) -> Optional[np.ndarray]:
-        return self._ground_mask

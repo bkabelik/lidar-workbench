@@ -837,10 +837,11 @@ class View3D(QWidget):
         if self._marker_pt is None:
             return
 
-        # Size the marker relative to the camera distance so it stays clearly
-        # visible at any zoom level (min 0.2 m for very close zooms).
-        cam_dist = float(np.linalg.norm(self._cam_eye - self._cam_center))
-        radius = max(cam_dist * 0.008, 0.2)
+        # Size the marker as a fixed real-world object: 5 cm radius =
+        # 10 cm diameter, which is the size of a typical GCP marker/target.
+        # A camera-relative radius made the GCP look enormous and unusable
+        # for visual verification against the point cloud.
+        radius = 0.05
 
         sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
         sphere.translate(self._marker_pt)
