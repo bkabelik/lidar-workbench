@@ -318,6 +318,11 @@ class MainWindow(QMainWindow):
         bathy_action.triggered.connect(self._on_bathy_process)
         tools_menu.addAction(bathy_action)
 
+        wsm_action = QAction("&River Water Surface Model (Centerline)…", self)
+        wsm_action.setObjectName("river_water_surface_model")
+        wsm_action.triggered.connect(self._on_water_surface_generator)
+        tools_menu.addAction(wsm_action)
+
         tools_menu.addSeparator()
 
         ground_control_action = QAction("&Ground Control…", self)
@@ -1061,6 +1066,46 @@ class MainWindow(QMainWindow):
                 self._multi_load_for_edit(reload_data)
         self._refresh_tile_list()
         self._regenerate_dtm()
+
+    def _on_water_surface_generator(self) -> None:
+        """Open the interactive river centerline water surface generator dialog."""
+        if not self._project:
+            QMessageBox.information(self, "No Project", "Please open a project first.")
+            return
+
+        selected = self._tile_list_widget.get_selected_tile_ids()
+        if not selected:
+            selected = self._tm.tile_ids
+        if not selected:
+            QMessageBox.information(self, "No Tiles", "No tiles available in project.")
+            return
+
+        tile_info = self._db.get_tile(selected[0])
+        data_epsg = tile_info.get("crs_epsg") if tile_info else None
+
+        def _loader():
+            combined = {}
+            for tid in selected[:8]:
+                data = self._tm.load_tile_points_full(tid)
+                if data is not None and "x" in data and len(data["x"]) > 0:
+                    if not combined:
+                        combined = {k: [v] for k, v in data.items() if isinstance(v, np.ndarray)}
+                    else:
+                        for k in combined:
+                            if k in data and isinstance(data[k], np.ndarray):
+                                combined[k].append(data[k])
+            if not combined:
+                return {}
+            return {k: np.concatenate(v) for k, v in combined.items()}
+
+        from .water_surface_dialog import WaterSurfaceDialog
+        dlg = WaterSurfaceDialog(
+            project_dir=self._project.root_dir,
+            load_points_func=_loader,
+            data_epsg=data_epsg,
+            parent=self,
+        )
+        dlg.exec()
 
     def _save_bathy_tile(self, tile_id: str, result: dict) -> None:
         """Write bathy-processed data back to a tile's LAS file."""
@@ -2462,21 +2507,34 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
         # Refresh profile view if a profile exists in the editor
         profile = self._editor.profile
         if profile is not None and len(profile.distances) > 0:
-            new_cls = point_data["classification"][profile.indices]
-            self._multi_view._view_profile.set_profile_data(
-                profile.distances,
-                profile.elevations,
-                new_cls,
-                intensities=profile.intensities,
-                indices=profile.indices,
-                xs=profile.xs,
-                ys=profile.ys,
-                zs=profile.elevations,
-            )
-            self._multi_view._apply_class_visibility("profile")
-            if self._dtm_ref_distances is not None:
-                self._multi_view._view_profile.set_dtm_reference(
-                    self._dtm_ref_distances, self._dtm_ref_elevations
+            profile_indices = np.asarray(profile.indices)
+            n_class = len(point_data["classification"])
+            if (
+                profile_indices.size == len(profile.distances)
+                and profile_indices.size > 0
+                and int(profile_indices.max()) < n_class
+            ):
+                new_cls = point_data["classification"][profile_indices]
+                self._multi_view._view_profile.set_profile_data(
+                    profile.distances,
+                    profile.elevations,
+                    new_cls,
+                    intensities=profile.intensities,
+                    indices=profile_indices,
+                    xs=profile.xs,
+                    ys=profile.ys,
+                    zs=profile.elevations,
+                )
+                self._multi_view._apply_class_visibility("profile")
+                if self._dtm_ref_distances is not None:
+                    self._multi_view._view_profile.set_dtm_reference(
+                        self._dtm_ref_distances, self._dtm_ref_elevations
+                    )
+            else:
+                logger.warning(
+                    "Profile indices are stale after edit (max=%s, data has %d) — keeping previous profile view",
+                    int(profile_indices.max()) if profile_indices.size else 0,
+                    n_class,
                 )
 
     def _start_import(self, directory: str) -> None:

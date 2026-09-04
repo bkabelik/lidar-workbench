@@ -409,6 +409,10 @@ class BathyDialog(QDialog):
         crop_geotiff_browse = QPushButton("Browse…")
         crop_geotiff_browse.clicked.connect(self._on_browse_crop_geotiff)
         crop_geotiff_row.addWidget(crop_geotiff_browse)
+        crop_centerline_btn = QPushButton("Centerline WSM…")
+        crop_centerline_btn.setToolTip("Generate a 3D water surface model from a river centerline")
+        crop_centerline_btn.clicked.connect(self._on_generate_centerline_wsm)
+        crop_geotiff_row.addWidget(crop_centerline_btn)
         cf.addRow("Water Surface:", crop_geotiff_row)
         self._crop_geotiff_info = QLabel("")
         self._crop_geotiff_info.setWordWrap(True)
@@ -492,6 +496,10 @@ class BathyDialog(QDialog):
         geotiff_browse = QPushButton("Browse…")
         geotiff_browse.clicked.connect(self._on_browse_geotiff)
         geotiff_row.addWidget(geotiff_browse)
+        geotiff_centerline_btn = QPushButton("Centerline WSM…")
+        geotiff_centerline_btn.setToolTip("Generate a 3D water surface model from a river centerline")
+        geotiff_centerline_btn.clicked.connect(self._on_generate_centerline_wsm)
+        geotiff_row.addWidget(geotiff_centerline_btn)
         ws_layout.addLayout(geotiff_row)
 
         self._geotiff_info = QLabel("")
@@ -874,6 +882,71 @@ class BathyDialog(QDialog):
         except Exception as exc:
             self._crop_geotiff_info.setText(f"⚠ Error: {exc}")
             self._crop_geotiff_info.setVisible(True)
+
+    def _load_active_points_for_wsm(self) -> dict:
+        parent = self.parent()
+        tm = parent._tm if parent and hasattr(parent, '_tm') else None
+        if tm is None or not self._tile_ids:
+            return {}
+        combined = {}
+        for tid in self._tile_ids[:6]:
+            data = tm.load_tile_points_full(tid)
+            if data is not None and "x" in data and len(data["x"]) > 0:
+                if not combined:
+                    combined = {k: [v] for k, v in data.items() if isinstance(v, np.ndarray)}
+                else:
+                    for k in combined:
+                        if k in data and isinstance(data[k], np.ndarray):
+                            combined[k].append(data[k])
+        if not combined:
+            return {}
+        return {k: np.concatenate(v) for k, v in combined.items()}
+
+    def _on_generate_centerline_wsm(self):
+        from .water_surface_dialog import WaterSurfaceDialog
+        parent = self.parent()
+        project_dir = parent._project.root_dir if parent and hasattr(parent, '_project') and parent._project else Path.cwd()
+        dlg = WaterSurfaceDialog(
+            project_dir=project_dir,
+            load_points_func=self._load_active_points_for_wsm,
+            data_epsg=self._data_epsg,
+            parent=self,
+        )
+        dlg.wsm_generated.connect(self._on_centerline_wsm_ready)
+        dlg.exec()
+
+    def _on_centerline_wsm_ready(self, tif_path: str):
+        # Load for crop
+        try:
+            surface, georef = load_water_surface_geotiff(tif_path)
+            self._crop_surface = surface
+            self._crop_georef = georef
+            self._crop_geotiff_edit.setText(tif_path)
+            self._ws_crop_enabled.setChecked(True)
+            self._crop_geotiff_info.setText(f"Loaded: {surface.shape[1]}×{surface.shape[0]} px, range [{np.nanmin(surface):.2f}, {np.nanmax(surface):.2f}] m")
+            self._crop_geotiff_info.setVisible(True)
+        except Exception:
+            pass
+
+        # Load for refraction
+        try:
+            surface, georef = load_water_surface_geotiff(tif_path)
+            self._geotiff_surface = surface
+            self._geotiff_georef = georef
+            self._geotiff_path_edit.setText(tif_path)
+            self._ws_geotiff_radio.setChecked(True)
+            self._snells_enabled.setChecked(True)
+            geotiff_epsg = georef.get("epsg")
+            info = (
+                f"Loaded: {surface.shape[1]}×{surface.shape[0]} px, "
+                f"range [{np.nanmin(surface):.2f}, {np.nanmax(surface):.2f}] m"
+            )
+            if geotiff_epsg:
+                info += f", EPSG:{geotiff_epsg}"
+            self._geotiff_info.setText(info)
+            self._geotiff_info.setVisible(True)
+        except Exception:
+            pass
 
     # ── Run ────────────────────────────────────────────────────────
 

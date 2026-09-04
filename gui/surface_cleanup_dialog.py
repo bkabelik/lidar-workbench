@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..noise_filter import surface_noise_removal
+from ..tile_manager import subset_point_data
 
 logger = logging.getLogger("lidar_workbench.gui.surface_cleanup_dialog")
 
@@ -208,7 +209,7 @@ class SurfaceCleanupDialog(QDialog):
 
             dists = (data["x"] - cx)**2 + (data["y"] - cy)**2
             indices = np.argpartition(dists, TARGET)[:TARGET]
-            self._sample = {k: v[indices] for k, v in data.items()}
+            self._sample = subset_point_data(data, indices)
         self._update_preview()
 
     def _update_preview(self):

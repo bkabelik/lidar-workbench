@@ -374,7 +374,7 @@ def apply_snells_correction_nadir(
     out_z = zs.copy()
     submerged = zs < water_surface_z
     apparent_depth = water_surface_z - zs[submerged]
-    true_depth = apparent_depth * n_water
+    true_depth = apparent_depth / n_water
     out_z[submerged] = water_surface_z - true_depth
     n_corrected = submerged.sum()
     logger.info(

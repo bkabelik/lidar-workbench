@@ -61,7 +61,7 @@ from ..noise_filter import (
     bilateral_filter,
     thin_points_average,
 )
-from ..tile_manager import TileManager
+from ..tile_manager import TileManager, subset_point_data
 from .view_3d import View3D
 
 logger = logging.getLogger("lidar_workbench.gui.filter_dialog")
@@ -550,7 +550,7 @@ class FilterDialog(QDialog):
             # spherical 3D distance.
             dists = (data["x"] - cx)**2 + (data["y"] - cy)**2
             indices = np.argpartition(dists, TARGET)[:TARGET]
-            data = {k: v[indices] for k, v in data.items()}
+            data = subset_point_data(data, indices)
         self._preview_points = data
         self._update_preview()
 

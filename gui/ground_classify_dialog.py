@@ -39,6 +39,8 @@ from ..ground import (
     ground_classify_aptd,
     ground_classify_hptd,
     ground_classify_dl_hybrid_ptd,
+    ground_classify_multiscale_alpha_shape,
+    ground_classify_egs_csf,
 )
 from ..tile_manager import _read_las_header_template, _write_las_file
 
@@ -236,6 +238,34 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
             return_numbers=rn_sub,
             num_returns=nr_sub,
         )
+    elif method == "alpha_shape":
+        mask = ground_classify_multiscale_alpha_shape(
+            xs_sub, ys_sub, zs_sub,
+            coarse_alpha=params.get("coarse_alpha", 20.0),
+            medium_alpha=params.get("medium_alpha", 6.0),
+            fine_alpha=params.get("fine_alpha", 2.0),
+            max_distance=params.get("max_distance", 1.0),
+            max_angle=params.get("max_angle", 8.0),
+            max_terrain_angle=params.get("max_terrain_angle", 88.0),
+            exclude_single_returns_in_water=params.get("exclude_single_returns_in_water", True),
+            sensor_type=st_sub,
+            return_numbers=rn_sub,
+            num_returns=nr_sub,
+        )
+    elif method == "egs_csf":
+        mask = ground_classify_egs_csf(
+            xs_sub, ys_sub, zs_sub,
+            cloth_resolution=params.get("cloth_resolution", 1.0),
+            rigidness=params.get("rigidness", 2.0),
+            time_step=params.get("time_step", 0.65),
+            class_threshold=params.get("class_threshold", 0.30),
+            gradient_factor=params.get("gradient_factor", 0.50),
+            max_iterations=params.get("max_iterations", 50),
+            exclude_single_returns_in_water=params.get("exclude_single_returns_in_water", True),
+            sensor_type=st_sub,
+            return_numbers=rn_sub,
+            num_returns=nr_sub,
+        )
     else:  # "epptd" (and legacy "tin")
         existing_ground = None
         if sc == -3:
@@ -243,55 +273,19 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
             # points are the trusted initial TIN and must not be re-tested.
             existing_ground = (cls_all[source_mask] == 2)
 
-        extra_dim_filters = params.get("extra_dim_filters")
-        if params.get("two_pass") and existing_ground is None:
-            mask = ground_classify_epptd_two_pass(
-                xs_sub, ys_sub, zs_sub,
-                pass1_cell_size=params.get("pass1_cell_size", 60.0),
-                pass1_max_distance=params.get("pass1_max_distance", 1.0),
-                pass1_max_angle=params.get("pass1_max_angle", 12.0),
-                pass2_max_distance=params.get("pass2_max_distance", 1.0),
-                pass2_max_angle=params.get("pass2_max_angle", 6.0),
-                max_terrain_angle=params.get("max_terrain_angle", 88.0),
-                reduce_iter_angle_when_edge=params.get("pass2_reduce_edge"),
-                stop_tri_when_edge=params.get("pass2_stop_edge"),
-                only_upward=False,
-                follow_surface_trend=params.get("pass2_follow_trend", False),
-                remove_low_outliers_after_pass1=params.get(
-                    "pass2_remove_low_outliers", True
-                ),
-                low_outlier_threshold=params.get("low_outlier_threshold", 1.0),
-                exclude_single_returns_in_water=params.get(
-                    "pass2_exclude_single", True
-                ),
-                sensor_type=st_sub,
-                return_numbers=rn_sub,
-                num_returns=nr_sub,
-                extra_dims=exd_sub,
-                extra_dim_filters=extra_dim_filters,
-            )
-        else:
-            mask = ground_classify_epptd(
-                xs_sub, ys_sub, zs_sub,
-                max_distance=params["max_distance"],
-                max_angle=params["max_angle"],
-                max_terrain_angle=params.get("max_terrain_angle", 88.0),
-                reduce_iter_angle_when_edge=params.get("reduce_iter_angle_when_edge"),
-                stop_tri_when_edge=params.get("stop_tri_when_edge"),
-                only_upward=params.get("only_upward", False),
-                follow_surface_trend=params.get("follow_surface_trend", True),
-                remove_low_outliers=params.get("remove_low_outliers", False),
-                low_outlier_neighbors=params.get("low_outlier_neighbors", 8),
-                low_outlier_threshold=params.get("low_outlier_threshold", 1.0),
-                exclude_single_returns_in_water=params.get("exclude_single_returns_in_water", False),
-                sensor_type=st_sub,
-                cell_size=params.get("cell_size"),
-                existing_ground_mask=existing_ground,
-                return_numbers=rn_sub,
-                num_returns=nr_sub,
-                extra_dims=exd_sub,
-                extra_dim_filters=extra_dim_filters,
-            )
+        mask = ground_classify_epptd(
+            xs_sub, ys_sub, zs_sub,
+            max_distance=params.get("max_distance", 1.6),
+            max_angle=params.get("max_angle", 25.0),
+            seed_resolution=params.get("seed_resolution", 2.0),
+            spacing=params.get("spacing"),
+            follow_surface_trend=params.get("follow_surface_trend", True),
+            dense=params.get("dense", True),
+            dense_tolerance=params.get("dense_tolerance", 0.40),
+            remove_low_outliers=params.get("remove_low_outliers", True),
+            low_outlier_threshold=params.get("low_outlier_threshold", 1.0),
+            existing_ground_mask=existing_ground,
+        )
 
     # Expand the source-only mask back to the full tile.
     full_mask = np.zeros(n_total, dtype=bool)
@@ -383,6 +377,23 @@ class _GroundBatchWorker(QThread):
         self._source_class = source_class
         self._workers = max(1, int(workers))
         self._db = db
+        self._cancelled = False
+        self._pool = None
+
+    def cancel(self):
+        """Signal cancellation and terminate child processes cleanly."""
+        self._cancelled = True
+        if self._pool is not None:
+            try:
+                self._pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            try:
+                for p in list(self._pool._processes.values()):
+                    if p.is_alive():
+                        p.terminate()
+            except Exception:
+                pass
 
     def run(self):
         from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -399,8 +410,11 @@ class _GroundBatchWorker(QThread):
 
         try:
             with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                self._pool = pool
                 futures = {}
                 for job in self._jobs:
+                    if self._cancelled:
+                        break
                     fut = pool.submit(
                         _ground_process_tile,
                         job["tile_id"], job["las_path"],
@@ -410,31 +424,39 @@ class _GroundBatchWorker(QThread):
                     futures[fut] = job["tile_id"]
 
                 for fut in as_completed(futures):
+                    if self._cancelled:
+                        break
                     tid = futures[fut]
                     try:
                         result = fut.result()
                         processed += 1
-                        self._record_time(tid, result)
-                        self.tile_done.emit(tid, result)
-                        self.progress.emit(
-                            f"Done {processed}/{n_total} tiles",
-                            processed / n_total * 100,
-                        )
+                        if not self._cancelled:
+                            self._record_time(tid, result)
+                            self.tile_done.emit(tid, result)
+                            self.progress.emit(
+                                f"Done {processed}/{n_total} tiles",
+                                processed / n_total * 100,
+                            )
                     except Exception as exc:
                         processed += 1
                         logger.error(
                             "Ground classification error on %s: %s", tid, exc
                         )
-                        self.error.emit(f"{tid}: {exc}")
+                        if not self._cancelled:
+                            self.error.emit(f"{tid}: {exc}")
 
-            elapsed = time.time() - t_start
-            self.progress.emit(
-                f"Done: {processed}/{n_total} tiles in {elapsed:.1f}s", 100.0
-            )
-            self.finished_all.emit(processed)
+            if not self._cancelled:
+                elapsed = time.time() - t_start
+                self.progress.emit(
+                    f"Done: {processed}/{n_total} tiles in {elapsed:.1f}s", 100.0
+                )
+                self.finished_all.emit(processed)
         except Exception as exc:
-            logger.exception("Ground classification failed")
-            self.error.emit(str(exc))
+            if not self._cancelled:
+                logger.exception("Ground classification failed")
+                self.error.emit(str(exc))
+        finally:
+            self._pool = None
 
     def _record_time(self, tile_id: str, result: dict) -> None:
         """Record per-tile processing time (thread-local SQLite connection)."""
@@ -479,11 +501,33 @@ class GroundClassifyDialog(QDialog):
         self._setup_ui()
 
     def reject(self):
-        """Cancel: wait for worker thread before closing."""
+        """Cancel: safely terminate background worker and child processes before closing."""
         if self._worker is not None and self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait(3000)  # 3 s timeout
+            self._status.setText("Cancelling worker processes…")
+            self._worker.cancel()
+            try:
+                self._worker.tile_done.disconnect()
+            except Exception:
+                pass
+            try:
+                self._worker.progress.disconnect()
+            except Exception:
+                pass
+            try:
+                self._worker.finished_all.disconnect()
+            except Exception:
+                pass
+            try:
+                self._worker.error.disconnect()
+            except Exception:
+                pass
+            self._worker.wait(5000)
         super().reject()
+
+    def closeEvent(self, event):
+        """Handle window close button (X) cleanly."""
+        self.reject()
+        event.accept()
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -493,10 +537,12 @@ class GroundClassifyDialog(QDialog):
         mf = QFormLayout(method_group)
         self._method_combo = QComboBox()
         self._method_combo.addItem("SMRF — Simple Morphological Filter (PDAL)", "smrf")
-        self._method_combo.addItem("EP-PTD — Edge-Preserving PTD (Axelsson)", "epptd")
+        self._method_combo.addItem("EP-PTD — Progressive TIN Densification (Axelsson)", "epptd")
         self._method_combo.addItem("APTD — Adaptive Grid PTD (AGPTD)", "aptd")
         self._method_combo.addItem("H-PTD — Hierarchical/Fast PTD (FPTD)", "hptd")
         self._method_combo.addItem("DL-Hybrid PTD — Pointcept + PTD", "dl_hybrid")
+        self._method_combo.addItem("M-AlphaShape — Multiscale 3D Alpha Shape (MDPI 2024)", "alpha_shape")
+        self._method_combo.addItem("EGS-CSF — Evolutionary Gradient Cloth Simulation (IJDE 2025)", "egs_csf")
         self._method_combo.currentIndexChanged.connect(self._on_method_changed)
         mf.addRow("Method:", self._method_combo)
 
@@ -515,9 +561,9 @@ class GroundClassifyDialog(QDialog):
             "Only reclassify points matching the selected source class(es). "
             "Other classes are left unchanged.\n\n"
             "'1 → 2' uses existing Class 2 ground as the initial TIN and only "
-            "reclassifies Class 1 points against it (TerraScan densify). "
-            "Existing ground is left untouched.  Most useful with the "
-            "EP-PTD method."
+            "reclassifies Class 1 points against it (densify onto existing "
+            "ground). Existing ground is left untouched.  Most useful with "
+            "the EP-PTD method."
         )
         mf.addRow("Source Class:", self._source_class_combo)
         layout.addWidget(method_group)
@@ -547,233 +593,79 @@ class GroundClassifyDialog(QDialog):
         sf.addRow("Elevation Thresh:", self._smrf_elev)
         layout.addWidget(self._smrf_group)
 
-        # EP-PTD params
-        self._tin_group = QGroupBox("EP-PTD Parameters")
+        # EP-PTD params (Axelsson PTD)
+        self._tin_group = QGroupBox("EP-PTD Parameters (Axelsson)")
         tf = QFormLayout(self._tin_group)
+
         self._tin_dist = QDoubleSpinBox()
         self._tin_dist.setRange(0.1, 10.0)
         self._tin_dist.setDecimals(2)
-        self._tin_dist.setValue(1.4)
+        self._tin_dist.setValue(1.6)
         self._tin_dist.setSuffix(" m")
-        self._tin_dist.setToolTip("Max distance from point to TIN surface")
+        self._tin_dist.setToolTip("Max perpendicular distance from candidate point to TIN surface")
         tf.addRow("Max Distance:", self._tin_dist)
+
         self._tin_angle = QDoubleSpinBox()
         self._tin_angle.setRange(1.0, 45.0)
         self._tin_angle.setDecimals(1)
-        self._tin_angle.setValue(6.0)
+        self._tin_angle.setValue(25.0)
         self._tin_angle.setSuffix("°")
-        self._tin_angle.setToolTip("Max angle between point and TIN vertices")
+        self._tin_angle.setToolTip("Max angle between point and TIN vertices (iteration angle)")
         tf.addRow("Max Angle:", self._tin_angle)
 
-        # Seed grid / cell size (0 = auto from point spacing)
-        self._tin_cell_size = self._make_auto_spin(200.0, 1, "Auto")
-        self._tin_cell_size.setToolTip(
-            "Seed grid cell size. Auto derives it from point spacing; "
-            "a coarse value (e.g. 60 m) guarantees the seed is the true "
-            "terrain/riverbed minimum in river valleys."
+        self._tin_seed_res = QDoubleSpinBox()
+        self._tin_seed_res.setRange(1.0, 200.0)
+        self._tin_seed_res.setDecimals(1)
+        self._tin_seed_res.setValue(2.0)
+        self._tin_seed_res.setSuffix(" m")
+        self._tin_seed_res.setToolTip(
+            "Initial coarse seed grid size (seed resolution). In river corridors, "
+            "values between 2 - 5 m ensure seeds land directly on the embankment "
+            "faces and crests. For flatter terrain, 15 - 20 m is typical."
         )
-        tf.addRow("Seed Grid (Auto):", self._tin_cell_size)
+        tf.addRow("Seed Resolution:", self._tin_seed_res)
 
-        # Terrain angle
-        self._tin_terrain_angle = QDoubleSpinBox()
-        self._tin_terrain_angle.setRange(10.0, 90.0)
-        self._tin_terrain_angle.setDecimals(1)
-        self._tin_terrain_angle.setValue(88.0)
-        self._tin_terrain_angle.setSuffix("°")
-        self._tin_terrain_angle.setToolTip(
-            "Max allowed slope of TIN triangles. "
-            "Keep 88-90° to classify steep natural embankments and riverbanks; "
-            "lower it only to exclude man-made vertical walls."
+        self._tin_follow_terrain = QCheckBox("Follow terrain trend (embankments & steep slopes)")
+        self._tin_follow_terrain.setChecked(True)
+        self._tin_follow_terrain.setToolTip(
+            "Relaxes iteration angle and distance thresholds on steep facets so the "
+            "TIN can climb river embankments, steep banks, and cliffs without getting stuck."
         )
-        tf.addRow("Max Terrain Angle:", self._tin_terrain_angle)
+        tf.addRow(self._tin_follow_terrain)
 
-        # Two-pass TerraScan-style workflow (opt-in; single pass unchanged)
-        self._tin_two_pass = QCheckBox(
-            "Two-Pass TerraScan workflow (12° → 6°, densify)"
+        self._tin_spacing = self._make_auto_spin(20.0, 2, "Auto")
+        self._tin_spacing.setValue(0.0)
+        self._tin_spacing.setToolTip(
+            "Point spacing for candidate pre-thinning (spacing). Only the single "
+            "lowest point per spacing cell is evaluated for densification, automatically "
+            "filtering out water surface and canopy echoes. Auto derives it from point density."
         )
-        self._tin_two_pass.setToolTip(
-            "Pass 1: coarse seed grid + 12° angle + 1.0 m distance to "
-            "establish the base terrain/riverbed, then remove low outliers. "
-            "Pass 2: densify against pass-1 ground with 6° angle + 1.0 m "
-            "distance + edge damping.  Recommended for river/bathy corridors; "
-            "leave off for standard topographic LiDAR."
-        )
-        tf.addRow(self._tin_two_pass)
+        tf.addRow("Candidate Spacing (Auto):", self._tin_spacing)
 
-        self._tin_two_pass_group = QGroupBox("Two-Pass Parameters")
-        tpf = QFormLayout(self._tin_two_pass_group)
-        self._tp_cell = QDoubleSpinBox()
-        self._tp_cell.setRange(5.0, 200.0)
-        self._tp_cell.setDecimals(1)
-        self._tp_cell.setValue(60.0)
-        self._tp_cell.setSuffix(" m")
-        self._tp_cell.setToolTip(
-            "Pass-1 seed grid cell size. 60 m puts the seed at the true "
-            "riverbed minimum in river valleys narrower than the cell."
+        self._tin_dense = QCheckBox("Dense Pass (project all points against final TIN)")
+        self._tin_dense.setChecked(True)
+        self._tin_dense.setToolTip(
+            "When checked, all original points are tested against the final frozen TIN: "
+            "points on or below become ground; points above only within the tolerance below."
         )
-        tpf.addRow("Pass 1 Seed Grid:", self._tp_cell)
-        self._tp_angle1 = QDoubleSpinBox()
-        self._tp_angle1.setRange(1.0, 45.0)
-        self._tp_angle1.setDecimals(1)
-        self._tp_angle1.setValue(12.0)
-        self._tp_angle1.setSuffix("°")
-        tpf.addRow("Pass 1 Max Angle:", self._tp_angle1)
-        self._tp_angle2 = QDoubleSpinBox()
-        self._tp_angle2.setRange(1.0, 45.0)
-        self._tp_angle2.setDecimals(1)
-        self._tp_angle2.setValue(6.0)
-        self._tp_angle2.setSuffix("°")
-        tpf.addRow("Pass 2 Max Angle:", self._tp_angle2)
-        self._tp_dist = QDoubleSpinBox()
-        self._tp_dist.setRange(0.1, 10.0)
-        self._tp_dist.setDecimals(2)
-        self._tp_dist.setValue(1.0)
-        self._tp_dist.setSuffix(" m")
-        self._tp_dist.setToolTip(
-            "Iteration distance for both passes. 1.0 m keeps the water "
-            "surface (~3 m above the bed) strictly outside the tolerance "
-            "envelope."
-        )
-        tpf.addRow("Pass 1 & 2 Max Distance:", self._tp_dist)
-        self._tp_reduce_edge = QDoubleSpinBox()
-        self._tp_reduce_edge.setRange(0.0, 20.0)
-        self._tp_reduce_edge.setDecimals(1)
-        self._tp_reduce_edge.setValue(5.0)
-        self._tp_reduce_edge.setSuffix(" m")
-        self._tp_reduce_edge.setSpecialValueText("Off")
-        self._tp_reduce_edge.setToolTip(
-            "Pass-2 edge damping: reduce iteration angle in triangles with "
-            "edges shorter than this, preventing dense water-surface "
-            "reflections from expanding upward."
-        )
-        tpf.addRow("Reduce Iter. Angle < Edge:", self._tp_reduce_edge)
-        self._tp_stop_edge = QDoubleSpinBox()
-        self._tp_stop_edge.setRange(0.0, 10.0)
-        self._tp_stop_edge.setDecimals(2)
-        self._tp_stop_edge.setValue(2.0)
-        self._tp_stop_edge.setSuffix(" m")
-        self._tp_stop_edge.setSpecialValueText("Off")
-        self._tp_stop_edge.setToolTip(
-            "Pass-2 stop: stop processing in triangles with edges shorter "
-            "than this."
-        )
-        tpf.addRow("Stop Triang. < Edge:", self._tp_stop_edge)
-        self._tp_remove_low_outliers = QCheckBox(
-            "Remove low outliers after pass 1"
-        )
-        self._tp_remove_low_outliers.setChecked(True)
-        tpf.addRow(self._tp_remove_low_outliers)
-        self._tp_follow_trend = QCheckBox(
-            "Follow surface trend (adapt to local slope)"
-        )
-        self._tp_follow_trend.setChecked(False)
-        self._tp_follow_trend.setToolTip(
-            "Standard Axelsson PTD keeps this off so the TIN cannot ramp "
-            "uphill onto the water surface. Enable only if riverbanks are "
-            "under-classified."
-        )
-        tpf.addRow(self._tp_follow_trend)
-        self._tp_exclude_single_water = QCheckBox(
-            "Exclude single returns in water (bathy bed-only)"
-        )
-        self._tp_exclude_single_water.setChecked(True)
-        tpf.addRow(self._tp_exclude_single_water)
-        self._tin_two_pass_group.setVisible(False)
-        self._tin_two_pass.toggled.connect(
-            self._tin_two_pass_group.setVisible
-        )
-        tf.addRow(self._tin_two_pass_group)
+        tf.addRow(self._tin_dense)
 
-        # Extra-byte (extra dimension) filter — opt-in, bathy-only
-        self._tin_extra_group = QGroupBox(
-            "Extra-Byte Filter (bathy points only)"
+        self._tin_dense_tol = QDoubleSpinBox()
+        self._tin_dense_tol.setRange(0.0, 2.0)
+        self._tin_dense_tol.setDecimals(2)
+        self._tin_dense_tol.setValue(0.40)
+        self._tin_dense_tol.setSuffix(" m")
+        self._tin_dense_tol.setToolTip(
+            "Max perpendicular distance above the final TIN for unclassified points to be accepted."
         )
-        ef = QFormLayout(self._tin_extra_group)
-        self._tin_extra_enabled = QCheckBox("Enable extra-byte filter")
-        self._tin_extra_enabled.setToolTip(
-            "Exclude bathymetric points (sensor_type == 2) whose selected "
-            "extra dimension falls outside the given bounds.  Typical use: "
-            "drop water-column turbidity scatter with high RIEGL deviation "
-            "or low amplitude before the TIN is built.  Topo points are "
-            "never affected."
-        )
-        ef.addRow(self._tin_extra_enabled)
-        self._tin_extra_dim = QLineEdit()
-        self._tin_extra_dim.setPlaceholderText(
-            "extra dim name, e.g. deviation or amplitude"
-        )
-        ef.addRow("Dimension Name:", self._tin_extra_dim)
-        self._tin_extra_min = self._make_auto_spin(1e9, 3, "Off")
-        self._tin_extra_min.setToolTip(
-            "Reject bathy points below this value (0 = no lower bound)."
-        )
-        ef.addRow("Reject Below:", self._tin_extra_min)
-        self._tin_extra_max = self._make_auto_spin(1e9, 3, "Off")
-        self._tin_extra_max.setToolTip(
-            "Reject bathy points above this value (0 = no upper bound)."
-        )
-        ef.addRow("Reject Above:", self._tin_extra_max)
-        self._tin_extra_dim.setEnabled(False)
-        self._tin_extra_min.setEnabled(False)
-        self._tin_extra_max.setEnabled(False)
-        self._tin_extra_enabled.toggled.connect(self._tin_extra_dim.setEnabled)
-        self._tin_extra_enabled.toggled.connect(self._tin_extra_min.setEnabled)
-        self._tin_extra_enabled.toggled.connect(self._tin_extra_max.setEnabled)
-        tf.addRow(self._tin_extra_group)
+        tf.addRow("Dense Tolerance:", self._tin_dense_tol)
 
-        # Edge-based iteration control (optional, off by default)
-        self._tin_reduce_edge = QDoubleSpinBox()
-        self._tin_reduce_edge.setRange(0.0, 20.0)
-        self._tin_reduce_edge.setDecimals(1)
-        self._tin_reduce_edge.setValue(0.0)
-        self._tin_reduce_edge.setSuffix(" m")
-        self._tin_reduce_edge.setSpecialValueText("Off")
-        self._tin_reduce_edge.setToolTip(
-            "When triangle edges are shorter than this, reduce "
-            "iteration angle to avoid over-densification. "
-            "0 = disabled."
-        )
-        tf.addRow("Reduce Iter. Angle < Edge:", self._tin_reduce_edge)
-
-        self._tin_stop_edge = QDoubleSpinBox()
-        self._tin_stop_edge.setRange(0.0, 10.0)
-        self._tin_stop_edge.setDecimals(2)
-        self._tin_stop_edge.setValue(0.0)
-        self._tin_stop_edge.setSuffix(" m")
-        self._tin_stop_edge.setSpecialValueText("Off")
-        self._tin_stop_edge.setToolTip(
-            "Stop processing in triangles with edges shorter than "
-            "this. 0 = disabled."
-        )
-        tf.addRow("Stop Triang. < Edge:", self._tin_stop_edge)
-
-        # Only upward
-        self._tin_only_upward = QCheckBox("Only add points above initial surface")
-        self._tin_only_upward.setToolTip(
-            "If checked, only points ABOVE the initial seed surface "
-            "are added. Prevents low-error noise from pulling the "
-            "TIN downward."
-        )
-        tf.addRow(self._tin_only_upward)
-
-        # Follow surface trend
-        self._tin_follow_trend = QCheckBox("Follow surface trend (adapt to local slope)")
-        self._tin_follow_trend.setChecked(True)
-        self._tin_follow_trend.setToolTip(
-            "If checked, the iteration angle is locally relaxed on "
-            "steep natural slopes (riverbanks, cliffs). This helps "
-            "the TIN climb slopes where the terrain angle changes "
-            "rapidly. Disable for flat urban areas."
-        )
-        tf.addRow(self._tin_follow_trend)
-
-        # Low-outlier removal (lidR-style)
         low_outlier_row = QHBoxLayout()
         self._tin_remove_low_outliers = QCheckBox("Remove low outliers")
+        self._tin_remove_low_outliers.setChecked(True)
         self._tin_remove_low_outliers.setToolTip(
             "Post-densification cleanup that drops ground points sitting far "
-            "below their local neighbourhood (low outliers that become seeds "
-            "and spike the DTM). Mirrors lidR's internal outlier removal."
+            "below their nearest ground neighbours. Automatically adapts to local slope."
         )
         low_outlier_row.addWidget(self._tin_remove_low_outliers)
         self._tin_low_outlier_threshold = QDoubleSpinBox()
@@ -783,23 +675,11 @@ class GroundClassifyDialog(QDialog):
         self._tin_low_outlier_threshold.setSuffix(" m")
         self._tin_low_outlier_threshold.setToolTip(
             "A point is a low outlier when it is more than this far below the "
-            "median Z of its 8 nearest ground neighbours."
+            "local terrain trend of its nearest ground neighbours (slope-adjusted)."
         )
         low_outlier_row.addWidget(self._tin_low_outlier_threshold)
         low_outlier_row.addStretch()
         tf.addRow(low_outlier_row)
-
-        # Exclude single returns in water (bathy bed-only)
-        self._tin_exclude_single_returns_water = QCheckBox(
-            "Exclude single returns in water (bathy bed-only)"
-        )
-        self._tin_exclude_single_returns_water.setToolTip(
-            "In bathymetry, single returns (num_returns == 1) are usually the "
-            "water surface, not the riverbed.  When checked, they are excluded "
-            "so the shallow-water surface isn't classified as ground alongside "
-            "the bed.  Land points are unaffected."
-        )
-        tf.addRow(self._tin_exclude_single_returns_water)
 
         self._tin_group.setVisible(False)
         layout.addWidget(self._tin_group)
@@ -952,6 +832,95 @@ class GroundClassifyDialog(QDialog):
         self._dlhybrid_group.setVisible(False)
         layout.addWidget(self._dlhybrid_group)
 
+        # M-AlphaShape params
+        self._alpha_shape_group = QGroupBox("M-AlphaShape Parameters (MDPI 2024)")
+        asf = QFormLayout(self._alpha_shape_group)
+        self._as_coarse_alpha = QDoubleSpinBox()
+        self._as_coarse_alpha.setRange(5.0, 100.0)
+        self._as_coarse_alpha.setDecimals(1)
+        self._as_coarse_alpha.setValue(20.0)
+        self._as_coarse_alpha.setSuffix(" m")
+        self._as_coarse_alpha.setToolTip("Coarse rolling sphere radius for large-scale terrain seeds (bridges roofs & tree canopies)")
+        asf.addRow("Coarse Scale (α₁):", self._as_coarse_alpha)
+        self._as_med_alpha = QDoubleSpinBox()
+        self._as_med_alpha.setRange(2.0, 50.0)
+        self._as_med_alpha.setDecimals(1)
+        self._as_med_alpha.setValue(6.0)
+        self._as_med_alpha.setSuffix(" m")
+        asf.addRow("Medium Scale (α₂):", self._as_med_alpha)
+        self._as_fine_alpha = QDoubleSpinBox()
+        self._as_fine_alpha.setRange(0.5, 20.0)
+        self._as_fine_alpha.setDecimals(1)
+        self._as_fine_alpha.setValue(2.0)
+        self._as_fine_alpha.setSuffix(" m")
+        asf.addRow("Fine Scale (α₃):", self._as_fine_alpha)
+        self._as_dist = QDoubleSpinBox()
+        self._as_dist.setRange(0.1, 10.0)
+        self._as_dist.setDecimals(2)
+        self._as_dist.setValue(1.0)
+        self._as_dist.setSuffix(" m")
+        asf.addRow("Max Distance:", self._as_dist)
+        self._as_angle = QDoubleSpinBox()
+        self._as_angle.setRange(1.0, 45.0)
+        self._as_angle.setDecimals(1)
+        self._as_angle.setValue(8.0)
+        self._as_angle.setSuffix("°")
+        asf.addRow("Max Angle:", self._as_angle)
+        self._as_terrain_angle = QDoubleSpinBox()
+        self._as_terrain_angle.setRange(10.0, 90.0)
+        self._as_terrain_angle.setDecimals(1)
+        self._as_terrain_angle.setValue(88.0)
+        self._as_terrain_angle.setSuffix("°")
+        asf.addRow("Max Terrain Angle:", self._as_terrain_angle)
+        self._as_exclude_single_returns_water = QCheckBox(
+            "Exclude single returns in water (bathy bed-only)"
+        )
+        self._as_exclude_single_returns_water.setChecked(True)
+        asf.addRow(self._as_exclude_single_returns_water)
+        self._alpha_shape_group.setVisible(False)
+        layout.addWidget(self._alpha_shape_group)
+
+        # EGS-CSF params
+        self._egs_csf_group = QGroupBox("EGS-CSF Parameters (IJDE 2025)")
+        csff = QFormLayout(self._egs_csf_group)
+        self._egs_cloth_res = QDoubleSpinBox()
+        self._egs_cloth_res.setRange(0.2, 10.0)
+        self._egs_cloth_res.setDecimals(2)
+        self._egs_cloth_res.setValue(1.0)
+        self._egs_cloth_res.setSuffix(" m")
+        self._egs_cloth_res.setToolTip("Cloth particle grid resolution")
+        csff.addRow("Cloth Resolution:", self._egs_cloth_res)
+        self._egs_rigidness = QDoubleSpinBox()
+        self._egs_rigidness.setRange(0.5, 10.0)
+        self._egs_rigidness.setDecimals(1)
+        self._egs_rigidness.setValue(2.0)
+        self._egs_rigidness.setToolTip("Base cloth rigidness (stiff in flat areas, automatically relaxed on steep slopes)")
+        csff.addRow("Base Rigidness:", self._egs_rigidness)
+        self._egs_class_thresh = QDoubleSpinBox()
+        self._egs_class_thresh.setRange(0.05, 5.0)
+        self._egs_class_thresh.setDecimals(2)
+        self._egs_class_thresh.setValue(0.30)
+        self._egs_class_thresh.setSuffix(" m")
+        self._egs_class_thresh.setToolTip("Base distance threshold to cloth surface")
+        csff.addRow("Classification Threshold:", self._egs_class_thresh)
+        self._egs_grad_factor = QDoubleSpinBox()
+        self._egs_grad_factor.setRange(0.0, 5.0)
+        self._egs_grad_factor.setDecimals(2)
+        self._egs_grad_factor.setValue(0.50)
+        self._egs_grad_factor.setToolTip("Gradient adaptation factor (widens threshold on steep riverbanks)")
+        csff.addRow("Gradient Factor (β):", self._egs_grad_factor)
+        self._egs_max_iter = QSpinBox()
+        self._egs_max_iter.setRange(10, 500)
+        self._egs_max_iter.setValue(50)
+        csff.addRow("Max Iterations:", self._egs_max_iter)
+        self._egs_exclude_single_returns_water = QCheckBox(
+            "Exclude single returns in water (bathy bed-only)"
+        )
+        self._egs_exclude_single_returns_water.setChecked(True)
+        csff.addRow(self._egs_exclude_single_returns_water)
+        self._egs_csf_group.setVisible(False)
+        layout.addWidget(self._egs_csf_group)
+
         # Info
         info = QLabel(
             "<b>SMRF</b> (PDAL): fast, good for most terrain. "
@@ -1014,6 +983,8 @@ class GroundClassifyDialog(QDialog):
         self._aptd_group.setVisible(method == "aptd")
         self._hptd_group.setVisible(method == "hptd")
         self._dlhybrid_group.setVisible(method == "dl_hybrid")
+        self._alpha_shape_group.setVisible(method == "alpha_shape")
+        self._egs_csf_group.setVisible(method == "egs_csf")
 
         # DL-Hybrid needs both class 1 and class 2 in the source set:
         # class 2 is the DL ground prior, class 1 are the candidates that
@@ -1072,64 +1043,36 @@ class GroundClassifyDialog(QDialog):
                 "follow_surface_trend": self._dl_follow_trend.isChecked(),
                 "exclude_single_returns_in_water": self._dl_exclude_single_returns_water.isChecked(),
             }
+        if method == "alpha_shape":
+            return {
+                "coarse_alpha": self._as_coarse_alpha.value(),
+                "medium_alpha": self._as_med_alpha.value(),
+                "fine_alpha": self._as_fine_alpha.value(),
+                "max_distance": self._as_dist.value(),
+                "max_angle": self._as_angle.value(),
+                "max_terrain_angle": self._as_terrain_angle.value(),
+                "exclude_single_returns_in_water": self._as_exclude_single_returns_water.isChecked(),
+            }
+        if method == "egs_csf":
+            return {
+                "cloth_resolution": self._egs_cloth_res.value(),
+                "rigidness": self._egs_rigidness.value(),
+                "class_threshold": self._egs_class_thresh.value(),
+                "gradient_factor": self._egs_grad_factor.value(),
+                "max_iterations": self._egs_max_iter.value(),
+                "exclude_single_returns_in_water": self._egs_exclude_single_returns_water.isChecked(),
+            }
         # epptd (and legacy "tin")
-        extra_dim_name = self._tin_extra_dim.text().strip()
-        extra_dim_filters = None
-        if (self._tin_extra_enabled.isChecked() and extra_dim_name
-                and (self._tin_extra_min.value() > 0
-                     or self._tin_extra_max.value() > 0)):
-            extra_dim_filters = [(
-                extra_dim_name,
-                self._tin_extra_min.value()
-                if self._tin_extra_min.value() > 0 else None,
-                self._tin_extra_max.value()
-                if self._tin_extra_max.value() > 0 else None,
-            )]
         return {
             "max_distance": self._tin_dist.value(),
             "max_angle": self._tin_angle.value(),
-            "max_terrain_angle": self._tin_terrain_angle.value(),
-            "cell_size": (
-                self._tin_cell_size.value()
-                if self._tin_cell_size.value() > 0
-                else None
-            ),
-            "reduce_iter_angle_when_edge": (
-                self._tin_reduce_edge.value()
-                if self._tin_reduce_edge.value() > 0
-                else None
-            ),
-            "stop_tri_when_edge": (
-                self._tin_stop_edge.value()
-                if self._tin_stop_edge.value() > 0
-                else None
-            ),
-            "only_upward": self._tin_only_upward.isChecked(),
-            "follow_surface_trend": self._tin_follow_trend.isChecked(),
+            "seed_resolution": self._tin_seed_res.value(),
+            "spacing": self._tin_spacing.value() if self._tin_spacing.value() > 0 else None,
+            "follow_surface_trend": self._tin_follow_terrain.isChecked(),
+            "dense": self._tin_dense.isChecked(),
+            "dense_tolerance": self._tin_dense_tol.value(),
             "remove_low_outliers": self._tin_remove_low_outliers.isChecked(),
-            "low_outlier_neighbors": 8,
             "low_outlier_threshold": self._tin_low_outlier_threshold.value(),
-            "exclude_single_returns_in_water": self._tin_exclude_single_returns_water.isChecked(),
-            "two_pass": self._tin_two_pass.isChecked(),
-            "pass1_cell_size": self._tp_cell.value(),
-            "pass1_max_distance": self._tp_dist.value(),
-            "pass1_max_angle": self._tp_angle1.value(),
-            "pass2_max_distance": self._tp_dist.value(),
-            "pass2_max_angle": self._tp_angle2.value(),
-            "pass2_reduce_edge": (
-                self._tp_reduce_edge.value()
-                if self._tp_reduce_edge.value() > 0
-                else None
-            ),
-            "pass2_stop_edge": (
-                self._tp_stop_edge.value()
-                if self._tp_stop_edge.value() > 0
-                else None
-            ),
-            "pass2_follow_trend": self._tp_follow_trend.isChecked(),
-            "pass2_remove_low_outliers": self._tp_remove_low_outliers.isChecked(),
-            "pass2_exclude_single": self._tp_exclude_single_water.isChecked(),
-            "extra_dim_filters": extra_dim_filters,
         }
 
     def _on_run(self):
@@ -1158,11 +1101,9 @@ class GroundClassifyDialog(QDialog):
             parent=self,
         )
         self._worker.progress.connect(self._on_progress)
-        # BlockingQueuedConnection gives back-pressure so tile results are
-        # handled (status updates) before the next one is emitted.
         self._worker.tile_done.connect(
             self._on_tile_done,
-            Qt.ConnectionType.BlockingQueuedConnection,
+            Qt.ConnectionType.QueuedConnection,
         )
         self._worker.finished_all.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
@@ -1195,8 +1136,7 @@ class GroundClassifyDialog(QDialog):
     def accept(self):
         """OK: wait for worker thread before closing."""
         if self._worker is not None and self._worker.isRunning():
-            self._worker.quit()
-            self._worker.wait(3000)
+            self._worker.wait(5000)
         super().accept()
 
     def _on_accept(self):

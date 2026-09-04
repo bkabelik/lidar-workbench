@@ -42,6 +42,32 @@ from .project_manager import ProjectManager
 
 logger = logging.getLogger("lidar_workbench.tile_manager")
 
+
+def subset_point_data(
+    data: Dict[str, Any], indices: np.ndarray
+) -> Dict[str, Any]:
+    """Return a per-point dict subset by ``indices``.
+
+    ``load_tile_points_full`` stores extra dimensions under the nested
+    ``"extra_dims"`` key (a ``name → array`` dict).  A naive
+    ``{k: v[indices] for k, v in data.items()}`` fails on that nested dict,
+    so this helper sub-samples every per-point array, including nested
+    extra dimensions.
+    """
+    subset: Dict[str, Any] = {}
+    for key, value in data.items():
+        if key == "extra_dims":
+            if isinstance(value, dict):
+                subset[key] = {
+                    name: arr[indices]
+                    for name, arr in value.items()
+                    if isinstance(arr, np.ndarray)
+                }
+            continue
+        if isinstance(value, np.ndarray):
+            subset[key] = value[indices]
+    return subset
+
 # Type aliases
 PointCloud = Tuple[np.ndarray, np.ndarray, np.ndarray]  # (x, y, z)
 

@@ -6,7 +6,7 @@ so that noise removal and terrain classification stay separate:
 
   - :func:`ground_classify_smrf`    — Simple Morphological Filter (Pingel 2013).
   - :func:`ground_classify_epptd`   — Edge-Preserving PTD (Axelsson 2000 + edge controls).
-  - :func:`ground_classify_epptd_two_pass` — TerraScan-style two-pass EP-PTD (12° → 6°).
+  - :func:`ground_classify_epptd_two_pass` — coarse-to-fine two-pass EP-PTD (12° → 6°).
   - :func:`ground_classify_aptd`    — Adaptive Grid PTD, AGPTD (Zheng et al. 2024).
   - :func:`ground_classify_hptd`    — Hierarchical/Fast PTD, FPTD (Li et al. 2021).
   - :func:`ground_classify_dl_hybrid_ptd` — Pointcept DL prior + PTD densification.
@@ -365,731 +365,338 @@ def ground_probability_refinement(
     return ground_prob, suggested_class
 
 
+def _lowest_per_grid_cells(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+    cell_size: float,
+    offset_x: float = 0.0,
+    offset_y: float = 0.0,
+) -> np.ndarray:
+    """Return a mask with the lowest-Z point in each grid cell.
+
+    The grid origin is shifted by ``offset_x``/``offset_y``.  Used both for
+    classic Axelsson seed selection and for shifted dual-grid seeding
+    (two grids offset by half a cell, then unioned).
+    """
+    xs = np.asarray(xs, dtype=np.float64)
+    ys = np.asarray(ys, dtype=np.float64)
+    zs = np.asarray(zs, dtype=np.float64)
+    n = len(xs)
+    if n == 0:
+        return np.zeros(0, dtype=bool)
+
+    origin_x = min_x + offset_x
+    origin_y = min_y + offset_y
+    nx = max(1, int(np.ceil((max_x - origin_x) / cell_size)) + 1)
+    ny = max(1, int(np.ceil((max_y - origin_y) / cell_size)) + 1)
+    gx = np.clip(((xs - origin_x) / cell_size).astype(np.int32), 0, nx - 1)
+    gy = np.clip(((ys - origin_y) / cell_size).astype(np.int32), 0, ny - 1)
+    flat_idx = gx * ny + gy
+
+    cell_min = np.full(nx * ny, np.inf, dtype=np.float64)
+    np.minimum.at(cell_min, flat_idx, zs)
+
+    is_cell_min = zs == cell_min[flat_idx]
+    min_pos = np.flatnonzero(is_cell_min)
+    mask = np.zeros(n, dtype=bool)
+    if len(min_pos):
+        # Keep one point per cell when several tie for the minimum.
+        _, first = np.unique(flat_idx[min_pos], return_index=True)
+        mask[min_pos[first]] = True
+    return mask
+
+
 def ground_classify_epptd(
     xs: np.ndarray,
     ys: np.ndarray,
     zs: np.ndarray,
-    max_distance: float = 1.4,
-    max_angle: float = 6.0,
-    max_terrain_angle: float = 88.0,
-    max_building_size: Optional[float] = None,
-    reduce_iter_angle_when_edge: Optional[float] = None,
-    stop_tri_when_edge: Optional[float] = None,
-    only_upward: bool = False,
+    max_distance: float = 1.6,
+    max_angle: float = 25.0,
+    seed_resolution: float = 2.0,
+    spacing: Optional[float] = None,
     follow_surface_trend: bool = True,
-    remove_low_outliers: bool = False,
-    low_outlier_neighbors: int = 8,
+    dense: bool = True,
+    dense_tolerance: float = 0.40,
+    remove_low_outliers: bool = True,
     low_outlier_threshold: float = 1.0,
-    exclude_single_returns_in_water: bool = False,
-    sensor_type: Optional[np.ndarray] = None,
-    cell_size: Optional[float] = None,
-    return_numbers: Optional[np.ndarray] = None,
-    num_returns: Optional[np.ndarray] = None,
     existing_ground_mask: Optional[np.ndarray] = None,
-    extra_dims: Optional[Dict[str, np.ndarray]] = None,
-    extra_dim_filters: Optional[Sequence[Tuple[str, Optional[float], Optional[float]]]] = None,
     progress: ProgressCB = None,
+    **kwargs,
 ) -> np.ndarray:
-    """
-    Edge-Preserving Progressive TIN Densification (EP-PTD) ground
-    classification (Axelsson 2000 + edge-aware densification controls).
+    """Progressive TIN Densification (Axelsson 2000).
 
-    Canonical Axelsson PTD augmented with edge-preserving extensions:
+    Algorithm:
+      1. Seeds: Lowest point per ``seed_resolution`` grid cell from two grids offset
+         by half a cell, unioned. In river corridors, this naturally selects
+         the lowest points (submerged riverbed).
+      2. Candidates: Lowest point per ``spacing`` grid cell, sorted ascending by Z.
+         Higher vegetation and water surface reflections are automatically excluded
+         at this pre-thinning stage.
+      3. Iterative Triangulation: Rebuilds Delaunay TIN per iteration; freezes
+         candidates in triangles smaller than ``spacing``; inserts candidates
+         meeting perpendicular distance and Axelsson vertex angle criteria.
+      4. Dense pass (optional): Labels all unclassified points against the frozen
+         final TIN within tolerance.
+      5. Low outlier cleanup (optional): Removes points sitting far below their
+         nearest ground neighbors.
 
-      1. Select seed points (lowest Z in each cell of a coarse grid).
-      2. Build an initial Delaunay TIN from the seeds.
-      3. Iteratively add points that are close to the TIN surface (within
-         ``max_distance``) and whose angle to the TIN vertices is below
-         ``max_angle``.
-      4. Edge controls (``reduce_iter_angle_when_edge`` /
-         ``stop_tri_when_edge``) preserve sharp terrain breaks and prevent
-         over-densification in small triangles.
-      5. Rebuild TIN and repeat until no more points are added.
-
-    Formerly ``ground_classify_tin``; kept under that name as an alias.
-
-    Args:
-        xs, ys, zs:          Point coordinates.
-        max_distance:        Iteration distance — max allowed orthogonal
-                             distance from a point to the TIN plane (metres).
-                             Symmetric (same for above and below).
-                             Typical: 0.5–1.5 m.
-        max_angle:           Iteration angle — max angle between the
-                             candidate point, its projection on the TIN
-                             plane, and the closest triangle vertex
-                             (degrees).  Typical: 4–10°.
-        max_terrain_angle:   Steepest allowed slope of a TIN triangle
-                             (degrees).  Use 88–90° for man-made terrain;
-                             lower (e.g. 45–60°) for purely natural terrain.
-        max_building_size:   Largest expected building dimension in the
-                             project area (metres).  Determines the seed
-                             grid cell size so every area has at least one
-                             seed point.
-        reduce_iter_angle_when_edge:
-                             When every edge of a TIN triangle is shorter
-                             than this (metres), linearly reduce the
-                             iteration angle to avoid over-densification.
-                             ``None`` = disabled.
-        stop_tri_when_edge:  When every edge of a TIN triangle is shorter
-                             than this (metres), stop processing inside
-                             that triangle entirely.  ``None`` = disabled.
-        only_upward:         If ``True``, only accept points whose Z is
-                             ≥ the seed-cell minimum Z.  Prevents low
-                             outliers from pulling the TIN downward.
-        follow_surface_trend: If ``True``, locally relax the iteration
-                             angle on steep triangles (slope > 10°) so
-                             the TIN can climb riverbanks and cliffs.
-        remove_low_outliers: If ``True``, run a post-densification pass
-                             that removes ground points sitting well below
-                             their local ground neighbourhood (low outliers
-                             that become seed points and spike the DTM).
-                             Mirrors lidR's internal outlier removal.
-        low_outlier_neighbors: Number of nearest ground neighbours used to
-                             estimate the local ground surface (default 8).
-        low_outlier_threshold: A ground point is flagged as a low outlier
-                             when it is more than this many metres below the
-                             median Z of its neighbours (default 1.0 m).
-        exclude_single_returns_in_water:
-                             If ``True``, drop single returns
-                             (``num_returns == 1``) for bathymetric points
-                             (``sensor_type == 2``) before densification, so
-                             the shallow-water surface isn't swept into the
-                             ground set along with the riverbed.
-        sensor_type:         Optional per-point sensor code (0=unknown,
-                             1=topo, 2=bathy).  Used only when
-                             ``exclude_single_returns_in_water`` is set.
-        cell_size:           Explicit seed-grid cell size.  Auto-computed
-                             from point spacing when ``None``.
-        return_numbers:      Optional array of return numbers (1-based).
-                             When provided together with ``num_returns``,
-                             only last returns and single returns (where
-                             ``return_number == num_returns``) are used
-                             to build the TIN.  First/intermediate returns
-                             are excluded from ground.
-        num_returns:         Optional array of number-of-returns per pulse.
-                             Used with ``return_numbers`` to identify
-                             last/single returns.
-        existing_ground_mask:
-                             Optional boolean array of trusted ground points.
-                             When provided, the initial TIN is built directly
-                             from these points instead of grid seeds, and they
-                             are kept as ground (TerraScan "densify existing
-                             ground").  Points excluded by pre-filters are
-                             always retained when they are in this mask.
-        extra_dims:          Optional mapping of extra-byte dimension name →
-                             per-point values (e.g. RIEGL ``deviation``,
-                             ``amplitude``).  Used only by ``extra_dim_filters``.
-        extra_dim_filters:   Optional sequence of ``(name, min_value, max_value)``
-                             tuples.  Points with ``sensor_type == 2``
-                             (bathymetry) whose dimension value falls outside
-                             ``[min_value, max_value]`` are excluded from
-                             classification entirely (stays non-ground).
-                             ``None`` bound = no limit.  Dimension names are
-                             matched case-insensitively.
-        progress:            Optional ``(message, percent)`` callback.
-
-    Returns:
-        ``ground_mask`` — boolean array, ``True`` for ground.
+    No sensor type or water surface assumptions required.
     """
     import math
+    from scipy.spatial import Delaunay
+
+    # Backwards compatibility with previous parameter names
+    if "cell_size" in kwargs and kwargs["cell_size"] is not None and kwargs["cell_size"] > 0:
+        seed_resolution = float(kwargs["cell_size"])
+    if "max_building_size" in kwargs and kwargs["max_building_size"] is not None:
+        seed_resolution = float(kwargs["max_building_size"])
+    if "dense_pass" in kwargs and kwargs["dense_pass"] is not None:
+        dense = bool(kwargs["dense_pass"])
+    if "dense_above_tolerance" in kwargs and kwargs["dense_above_tolerance"] is not None:
+        dense_tolerance = float(kwargs["dense_above_tolerance"])
 
     n = len(xs)
-    if n < 100:
+    if n < 3:
         return np.ones(n, dtype=bool)
 
-    # ── Participation mask ─────────────────────────────────────────
-    # ``keep_mask`` selects which points may enter seed selection and TIN
-    # densification.  Points excluded here can never become ground; when a
-    # subset is classified, the result is mapped back onto the full array.
-    keep_mask = np.ones(n, dtype=bool)
+    xs_f = np.asarray(xs, dtype=np.float64)
+    ys_f = np.asarray(ys, dtype=np.float64)
+    zs_f = np.asarray(zs, dtype=np.float64)
 
-    # ── Extra-byte (extra dimension) filter ────────────────────────
-    # Optional per-dimension thresholds applied ONLY to bathymetric points
-    # (sensor_type == 2).  Typical use: reject water-column turbidity
-    # scatter (high RIEGL deviation / low amplitude) before the TIN is
-    # built, so it cannot become ground between the surface and the bed.
-    if (extra_dim_filters and extra_dims and sensor_type is not None
-            and len(sensor_type) == n):
-        bathy_pts = np.asarray(sensor_type) == 2
-        if bathy_pts.any():
-            extra_reject = np.zeros(n, dtype=bool)
-            for name, lo, hi in extra_dim_filters:
-                key = None
-                for k in extra_dims:
-                    if str(k).lower() == str(name).lower():
-                        key = k
-                        break
-                if key is None:
-                    logger.warning(
-                        "TIN: extra dimension %r not found — filter skipped",
-                        name,
-                    )
-                    continue
-                vals = np.asarray(extra_dims[key], dtype=np.float64)
-                if lo is not None:
-                    extra_reject |= bathy_pts & (vals < lo)
-                if hi is not None:
-                    extra_reject |= bathy_pts & (vals > hi)
-            if extra_reject.any():
-                keep_mask &= ~extra_reject
-                logger.info(
-                    "TIN: extra-byte filter excluded %d bathy point(s)",
-                    int(extra_reject.sum()),
-                )
+    min_x, max_x = float(xs_f.min()), float(xs_f.max())
+    min_y, max_y = float(ys_f.min()), float(ys_f.max())
 
-    # ── Last-return pre-filter ─────────────────────────────────────
-    # Ground classification works best on last returns and single
-    # returns (only echoes), because first/intermediate returns are
-    # often vegetation or structures above ground.  Building the TIN
-    # from last/single returns gives a cleaner ground surface.
-    have_returns = (return_numbers is not None and num_returns is not None
-                    and len(return_numbers) == n and len(num_returns) == n)
-    if have_returns:
-        # The last-return filter is only meaningful when the data actually
-        # records multiple returns per pulse.  Some exports leave
-        # ``num_returns`` (number_of_returns) at a constant 1 while
-        # ``return_number`` still counts 1..N.  Filtering on
-        # ``return_number == 1`` there would keep FIRST/single returns
-        # (e.g. the water surface in bathymetry) and throw away the true
-        # last returns (the riverbed).  When the field is not populated,
-        # fall through and classify on all points instead.
-        max_num_returns = int(np.max(num_returns))
-        if max_num_returns <= 1:
-            logger.info(
-                "TIN: num_returns not populated (max=%d) — classifying on all points",
-                max_num_returns,
-            )
-            have_returns = False
+    # 1. Point spacing (candidate resolution)
+    if spacing is None or spacing <= 0.0:
+        spacing = max(compute_adaptive_spacing(xs_f, ys_f), 0.5)
 
-    if have_returns:
-        last_mask = (return_numbers == num_returns)
-        if (exclude_single_returns_in_water and sensor_type is not None
-                and len(sensor_type) == n):
-            # In water, "ground" is the last return of a MULTI-return pulse
-            # (the riverbed).  Single returns (num_returns == 1) in water are
-            # usually the water surface, which otherwise gets swept into the
-            # ground set when the water is shallow.  Keep them for land.
-            bathy_pts = np.asarray(sensor_type) == 2
-            last_mask = last_mask & (~bathy_pts | (num_returns > 1))
-        keep_mask &= last_mask
-
-    # Points already trusted as ground (densify-existing-ground mode) must
-    # survive the pre-filters above, otherwise pass 2 of a two-pass run
-    # would lose ground points that pass 1 already established.
-    if existing_ground_mask is not None:
-        existing_arr = np.asarray(existing_ground_mask, dtype=bool)
-        if len(existing_arr) == n:
-            keep_mask |= existing_arr
-
-    n_keep = int(keep_mask.sum())
-    if n_keep < 3:
-        logger.warning(
-            "TIN: too few points after pre-filters (%d), using all points",
-            n_keep,
-        )
-        keep_mask = np.ones(n, dtype=bool)
-        n_keep = n
-    elif n_keep < n:
-        logger.info(
-            "TIN: pre-filters keep %d of %d points (%.1f%%)",
-            n_keep, n, 100.0 * n_keep / n,
-        )
-        sub_map = np.where(keep_mask)[0]
-        sub_ground = ground_classify_epptd(
-            xs[keep_mask], ys[keep_mask], zs[keep_mask],
-            max_distance=max_distance,
-            max_angle=max_angle,
-            max_terrain_angle=max_terrain_angle,
-            max_building_size=max_building_size,
-            reduce_iter_angle_when_edge=reduce_iter_angle_when_edge,
-            stop_tri_when_edge=stop_tri_when_edge,
-            only_upward=only_upward,
-            follow_surface_trend=follow_surface_trend,
-            remove_low_outliers=remove_low_outliers,
-            low_outlier_neighbors=low_outlier_neighbors,
-            low_outlier_threshold=low_outlier_threshold,
-            exclude_single_returns_in_water=False,
-            sensor_type=None,
-            cell_size=cell_size,
-            return_numbers=None,
-            num_returns=None,
-            existing_ground_mask=(
-                existing_ground_mask[keep_mask]
-                if existing_ground_mask is not None else None
-            ),
-            extra_dims=(
-                {k: v[keep_mask] for k, v in extra_dims.items()}
-                if extra_dims else None
-            ),
-            extra_dim_filters=None,
-            progress=progress,
-        )
-        full_mask = np.zeros(n, dtype=bool)
-        full_mask[sub_map[sub_ground]] = True
-        return full_mask
+    if seed_resolution <= 0.0:
+        seed_resolution = max(spacing * 15.0, 15.0)
 
     if progress:
-        progress("TIN ground: computing spacing…", 5.0)
+        progress("PTD: selecting seeds and candidates…", 5.0)
 
-    # --- Determine seed grid cell size ---
-    if max_building_size is not None:
-        seed_cell_size = max_building_size
-    elif cell_size is not None:
-        seed_cell_size = max(cell_size, 5.0)
-    else:
-        seed_cell_size = compute_adaptive_spacing(xs, ys)
-        seed_cell_size = max(seed_cell_size * 10, 5.0)
-
-    # --- Bounding box + virtual TIN corner anchors ---
-    # The convex hull of the seed points can be smaller than the tile when
-    # every coarse cell's lowest point lies in the river corridor (e.g. a
-    # 60 m grid over a river valley).  Points outside the hull are never
-    # densified, so anchor the TIN to the four bounding-box corners with a
-    # virtual point whose Z is the lowest of the nearest few real points.
-    min_x, max_x = xs.min(), xs.max()
-    min_y, max_y = ys.min(), ys.max()
-    corner_xy = []
-    corner_z = []
-    for cx, cy in (
-        (min_x, min_y),
-        (min_x, max_y),
-        (max_x, min_y),
-        (max_x, max_y),
+    # 2. Virtual bounding box corner anchors
+    corner_xy = np.empty((4, 2), dtype=np.float64)
+    corner_z = np.empty(4, dtype=np.float64)
+    for i, (cx, cy) in enumerate(
+        ((min_x, min_y), (min_x, max_y), (max_x, min_y), (max_x, max_y))
     ):
-        d2 = (xs - cx) ** 2 + (ys - cy) ** 2
+        d2 = (xs_f - cx) ** 2 + (ys_f - cy) ** 2
         k = min(5, n)
         nearest = np.argpartition(d2, k - 1)[:k]
-        corner_xy.append((cx, cy))
-        corner_z.append(zs[nearest[int(np.argmin(zs[nearest]))]])
-    corner_xy = np.asarray(corner_xy, dtype=np.float64)
-    corner_z = np.asarray(corner_z, dtype=np.float64)
+        corner_xy[i] = (cx, cy)
+        corner_z[i] = zs_f[nearest[int(np.argmin(zs_f[nearest]))]]
 
-    # --- Step 1: seed points ---
-    # Two possible sources for the initial ground set:
-    #   a) ``existing_ground_mask`` → densify existing ground directly
-    #      (TerraScan "densify existing ground", or pass 2 of two-pass).
-    #   b) lowest Z in each coarse grid cell (classic Axelsson seeding).
-    use_existing_ground = False
-    if existing_ground_mask is not None:
-        existing_arr = np.asarray(existing_ground_mask, dtype=bool)
-        if len(existing_arr) != n:
-            raise ValueError(
-                f"existing_ground_mask has length {len(existing_arr)}, expected {n}"
-            )
-        if existing_arr.sum() < 3:
-            logger.warning(
-                "TIN: too few existing ground points (%d) — falling back to grid seeding",
-                int(existing_arr.sum()),
-            )
-        else:
-            use_existing_ground = True
-
-    if use_existing_ground:
-        ground_mask = np.asarray(existing_ground_mask, dtype=bool).copy()
-        n_ground = int(ground_mask.sum())
-        if progress:
-            progress(
-                f"TIN ground: densifying {n_ground} existing ground pts…",
-                15.0,
-            )
-        if only_upward:
-            logger.info("TIN: only_upward ignored when densifying existing ground")
-            only_upward = False
+    # 3. Initial seeds
+    if existing_ground_mask is not None and np.asarray(existing_ground_mask).sum() >= 3:
+        seed_mask = np.asarray(existing_ground_mask, dtype=bool).copy()
     else:
-        nx = max(1, int(np.ceil((max_x - min_x) / seed_cell_size)) + 1)
-        ny = max(1, int(np.ceil((max_y - min_y) / seed_cell_size)) + 1)
+        # Two shifted grids, unioned
+        grid1 = _lowest_per_grid_cells(
+            xs_f, ys_f, zs_f,
+            min_x, min_y, max_x, max_y,
+            seed_resolution, 0.0, 0.0,
+        )
+        grid2 = _lowest_per_grid_cells(
+            xs_f, ys_f, zs_f,
+            min_x, min_y, max_x, max_y,
+            seed_resolution, seed_resolution * 0.5, seed_resolution * 0.5,
+        )
+        seed_mask = grid1 | grid2
 
-        gx = np.clip(((xs - min_x) / seed_cell_size).astype(np.int32), 0, nx - 1)
-        gy = np.clip(((ys - min_y) / seed_cell_size).astype(np.int32), 0, ny - 1)
-        flat_idx = gx * ny + gy
-
-        order = np.argsort(flat_idx)
-        sorted_flat = flat_idx[order]
-        sorted_z = zs[order]
-        unique_cells, starts = np.unique(sorted_flat, return_index=True)
-
-        seed_mask = np.zeros(n, dtype=bool)
-        for i in range(len(unique_cells)):
-            start = starts[i]
-            end = starts[i + 1] if i + 1 < len(starts) else n
-            lowest_local = int(np.argmin(sorted_z[start:end]))
-            idx = order[start + lowest_local]
-            seed_mask[idx] = True
-
-        if seed_mask.sum() < 3:
-            logger.warning("TIN: too few seed points")
+    if int(seed_mask.sum()) < 3:
+        logger.warning("PTD: too few seeds (%d), using lowest points", int(seed_mask.sum()))
+        seed_mask = _lowest_per_grid_cells(
+            xs_f, ys_f, zs_f,
+            min_x, min_y, max_x, max_y,
+            max(spacing * 3.0, 2.0), 0.0, 0.0,
+        )
+        if int(seed_mask.sum()) < 3:
             return np.ones(n, dtype=bool)
 
-        ground_mask = seed_mask.copy()
-        n_ground = int(seed_mask.sum())
+    ground_mask = seed_mask.copy()
 
-        if progress:
-            progress(
-                f"TIN ground: {n_ground} seeds (cell={seed_cell_size:.1f}m)…",
-                15.0,
-            )
+    # 4. Candidates: lowest point per `spacing` cell
+    cand_mask = _lowest_per_grid_cells(
+        xs_f, ys_f, zs_f,
+        min_x, min_y, max_x, max_y,
+        spacing, 0.0, 0.0,
+    )
+    # Exclude points that are already seeds
+    cand_indices = np.flatnonzero(cand_mask & ~ground_mask)
 
-    max_angle_rad = math.radians(max_angle)
-    sin_max_angle = math.sin(max_angle_rad)
-    max_terrain_angle_rad = math.radians(max_terrain_angle)
-    cos_terrain_angle = math.cos(max_terrain_angle_rad)
-
-    try:
-        from scipy.spatial import Delaunay
-    except ImportError:
-        logger.warning("scipy not available — TIN densification limited")
+    if len(cand_indices) == 0:
+        logger.info("PTD: all candidates are seeds (%d points)", int(ground_mask.sum()))
         return ground_mask
 
-    xs_f64 = np.asarray(xs, dtype=np.float64)
-    ys_f64 = np.asarray(ys, dtype=np.float64)
-    zs_f64 = np.asarray(zs, dtype=np.float64)
+    # Sort candidates by Z ascending
+    cand_indices = cand_indices[np.argsort(zs_f[cand_indices])]
+    done = np.zeros(len(cand_indices), dtype=bool)
 
-    # --- Only-upward: record seed-cell minimum Z to prevent downward pulls ---
-    if only_upward:
-        seed_z_surface = np.full(n, np.inf, dtype=np.float64)
-        for i in range(len(unique_cells)):
-            start = starts[i]
-            end = starts[i + 1] if i + 1 < len(starts) else n
-            cell_min_z = sorted_z[start:end].min()
-            cell_mask = flat_idx == unique_cells[i]
-            seed_z_surface[cell_mask] = cell_min_z
+    sin_max_angle = math.sin(math.radians(max_angle))
+    max_iterations = 50
 
-    max_iterations = 15
+    logger.info(
+        "PTD: starting densification (%d seeds, %d candidates, spacing=%.2fm, max_d=%.2fm, max_a=%.1f°)",
+        int(ground_mask.sum()), len(cand_indices), spacing, max_distance, max_angle,
+    )
+
+    # 5. Iterative TIN Densification
     for iteration in range(max_iterations):
-        if progress:
-            progress(
-                f"TIN ground: iter {iteration+1}/{max_iterations} "
-                f"({ground_mask.sum()} pts)…",
-                20 + 60 * iteration / max_iterations,
-            )
+        remaining = np.flatnonzero(~done)
+        if len(remaining) == 0:
+            break
 
-        # Build Delaunay triangulation on current ground points, plus the
-        # virtual corner anchors so the hull always covers the whole tile.
+        g_idx = np.flatnonzero(ground_mask)
         g_xy = np.vstack((
-            np.column_stack((xs_f64[ground_mask], ys_f64[ground_mask])),
+            np.column_stack((xs_f[g_idx], ys_f[g_idx])),
             corner_xy,
         ))
-        g_z = np.concatenate((zs_f64[ground_mask], corner_z))
+        g_z = np.concatenate((zs_f[g_idx], corner_z))
 
-        if len(g_xy) < 3:
-            break
         try:
             tri = Delaunay(g_xy)
-        except Exception:
+        except Exception as e:
+            logger.warning("PTD: triangulation failed at iter %d: %s", iteration, e)
             break
 
-        # --- Per-triangle properties ---
-        simplices = tri.simplices
-        tri_normals = np.zeros((len(simplices), 3), dtype=np.float64)
-        tri_slope_ok = np.ones(len(simplices), dtype=bool)
-        tri_max_edge = np.zeros(len(simplices), dtype=np.float64)
-        tri_active = np.ones(len(simplices), dtype=bool)
+        normals, slope_deg, max_edge = _tri_props(tri, g_xy, g_z)
 
-        for ti, s in enumerate(simplices):
-            v0_3d = np.array([g_xy[s[0], 0], g_xy[s[0], 1], g_z[s[0]]])
-            v1_3d = np.array([g_xy[s[1], 0], g_xy[s[1], 1], g_z[s[1]]])
-            v2_3d = np.array([g_xy[s[2], 0], g_xy[s[2], 1], g_z[s[2]]])
-            normal = np.cross(v1_3d - v0_3d, v2_3d - v0_3d)
-            n_len = np.linalg.norm(normal)
-            if n_len > 1e-15:
-                normal /= n_len
-            tri_normals[ti] = normal
+        if progress:
+            pct = 10.0 + 75.0 * (iteration / max_iterations)
+            progress(f"PTD: iteration {iteration + 1} ({len(g_idx)} vertices)…", pct)
 
-            cos_slope = abs(normal[2])
-            tri_slope_ok[ti] = cos_slope >= cos_terrain_angle
+        rem_cand = cand_indices[remaining]
+        q_xy = np.column_stack((xs_f[rem_cand], ys_f[rem_cand]))
+        q_z = zs_f[rem_cand]
 
-            e01_xy = g_xy[s[1]] - g_xy[s[0]]
-            e02_xy = g_xy[s[2]] - g_xy[s[0]]
-            e12_xy = g_xy[s[2]] - g_xy[s[1]]
-            tri_max_edge[ti] = max(
-                np.linalg.norm(e01_xy),
-                np.linalg.norm(e02_xy),
-                np.linalg.norm(e12_xy),
-            )
+        s_ids = tri.find_simplex(q_xy)
+        inside = s_ids >= 0
 
-        # --- Edge-based controls ---
-        if stop_tri_when_edge is not None:
-            tri_active[tri_max_edge < stop_tri_when_edge] = False
-
-        # --- Candidates: all non-ground points ---
-        cand_indices = np.where(~ground_mask)[0]
-        n_cand = len(cand_indices)
-        if n_cand == 0:
-            break
-
-        cand_xy = np.column_stack((xs_f64[cand_indices], ys_f64[cand_indices]))
-        cand_z = zs_f64[cand_indices]
-        simplex_ids = tri.find_simplex(cand_xy)
-
-        inside = simplex_ids >= 0
-        new_ground = np.zeros(n_cand, dtype=bool)
-
+        # Freeze candidates whose containing triangle is smaller than spacing
+        small = np.zeros(len(remaining), dtype=bool)
         if inside.any():
-            s_ids = simplex_ids[inside]
-            s_local = cand_indices[inside]
-            s_xy = cand_xy[inside]
-            s_z = cand_z[inside]
+            small = inside & (max_edge[s_ids] < spacing)
+            if small.any():
+                done[remaining[small]] = True
 
-            tri_s = tri.simplices[s_ids]
-            v0 = np.column_stack((g_xy[tri_s[:, 0]], g_z[tri_s[:, 0]]))
-            v1 = np.column_stack((g_xy[tri_s[:, 1]], g_z[tri_s[:, 1]]))
-            v2 = np.column_stack((g_xy[tri_s[:, 2]], g_z[tri_s[:, 2]]))
-
-            # Barycentric coordinates (2-D)
-            denom = (
-                (v1[:, 1] - v2[:, 1]) * (v0[:, 0] - v2[:, 0])
-                + (v2[:, 0] - v1[:, 0]) * (v0[:, 1] - v2[:, 1])
+        test = inside & ~small
+        added = 0
+        if test.any():
+            t_rem = remaining[test]
+            geo = _geo_query(
+                tri, g_xy, g_z,
+                q_xy[test], q_z[test], s_ids[test],
+                normals, slope_deg, max_edge,
             )
-            valid_denom = np.abs(denom) >= 1e-12
-            if valid_denom.any():
-                inv_d = np.zeros_like(denom)
-                inv_d[valid_denom] = 1.0 / denom[valid_denom]
+            # Axelsson criteria with optional terrain slope adaptation for embankments:
+            slopes = geo["slope_deg"]
+            if follow_surface_trend:
+                # Relax distance & depth thresholds on steep facets
+                rel = 1.0 + 0.8 * np.tan(np.radians(np.minimum(slopes, 75.0)))
+                d_ok = geo["d_perp"] <= (max_distance * rel)
+                dz_ok = geo["dz"] >= (-0.50 * rel)
 
-                w0 = (
-                    (v1[:, 1] - v2[:, 1]) * (s_xy[:, 0] - v2[:, 0])
-                    + (v2[:, 0] - v1[:, 0]) * (s_xy[:, 1] - v2[:, 1])
-                ) * inv_d
-                w1 = (
-                    (v2[:, 1] - v0[:, 1]) * (s_xy[:, 0] - v2[:, 0])
-                    + (v0[:, 0] - v2[:, 0]) * (s_xy[:, 1] - v2[:, 1])
-                ) * inv_d
-                w2 = 1.0 - w0 - w1
+                # Relax angle for candidates on steep facets or short facet edges bridging convex crests
+                short_crest = (geo["max_edge"] <= 8.0) & (geo["dz"] > 0.0)
+                steep = (slopes > 5.0) | short_crest
+                adapted_angle = np.where(short_crest, np.maximum(max_angle + slopes * 0.5, 35.0), max_angle + slopes * 0.5)
+                adapted_sin = np.sin(np.radians(np.minimum(adapted_angle, 80.0)))
+                eff_sin = np.where(steep, adapted_sin, sin_max_angle)
+                a_ok = geo["sin_angle"] <= eff_sin
+            else:
+                d_ok = geo["d_perp"] <= max_distance
+                dz_ok = geo["dz"] >= -0.50
+                a_ok = geo["sin_angle"] <= sin_max_angle
 
-                inside_tri = (w0 >= 0) & (w1 >= 0) & (w2 >= 0)
-                if inside_tri.any():
-                    tin_z = w0 * v0[:, 2] + w1 * v1[:, 2] + w2 * v2[:, 2]
-                    dz = s_z - tin_z  # vertical offset (kept for trend logic)
+            ok = (
+                geo["inside_tri"]
+                & geo["valid_denom"]
+                & d_ok
+                & a_ok
+                & dz_ok
+            )
+            accept_rem = t_rem[ok]
+            if len(accept_rem):
+                ground_mask[cand_indices[accept_rem]] = True
+                done[accept_rem] = True
+                added = len(accept_rem)
 
-                    # Perpendicular (orthogonal) distance from the candidate
-                    # point to the TIN plane — the quantity Terrasolid's
-                    # "iteration distance" and Axelsson's angle both use.
-                    # Using the vertical |dz| instead over-rejects points on
-                    # steep slopes (embankments, riverbanks).
-                    p_xyz = np.column_stack((s_xy, s_z))
-                    d_perp = np.abs(np.sum(
-                        (p_xyz - v0) * tri_normals[s_ids], axis=1
-                    ))
-
-                    # --- Symmetric distance check (Terrasolid "Iteration distance") ---
-                    d_ok = d_perp <= max_distance
-
-                    # --- Terrain angle check ---
-                    slope_ok = tri_slope_ok[s_ids]
-
-                    # --- Edge-based stop ---
-                    edge_ok = tri_active[s_ids]
-
-                    # --- Edge-based angle reduction ---
-                    if reduce_iter_angle_when_edge is not None:
-                        edge_frac = np.clip(
-                            tri_max_edge[s_ids] / reduce_iter_angle_when_edge,
-                            0.1, 1.0,
-                        )
-                        local_sin_max = sin_max_angle * edge_frac
-                    else:
-                        local_sin_max = np.full(
-                            len(s_ids) if isinstance(s_ids, np.ndarray)
-                            else sum(inside),
-                            sin_max_angle,
-                        )
-
-                    # --- Axelsson angle check ---
-                    d_v0 = np.linalg.norm(p_xyz - v0, axis=1)
-                    d_v1 = np.linalg.norm(p_xyz - v1, axis=1)
-                    d_v2 = np.linalg.norm(p_xyz - v2, axis=1)
-                    sin_max = np.maximum(np.maximum(
-                        np.divide(d_perp, d_v0, out=np.zeros_like(d_perp),
-                                  where=d_v0 > 1e-9),
-                        np.divide(d_perp, d_v1, out=np.zeros_like(d_perp),
-                                  where=d_v1 > 1e-9)),
-                        np.divide(d_perp, d_v2, out=np.zeros_like(d_perp),
-                                  where=d_v2 > 1e-9))
-                    angle_ok = sin_max <= local_sin_max
-
-                    # --- Follow surface trend: relax angle on steep slopes ---
-                    if follow_surface_trend:
-                        tri_slope_cos = np.abs(tri_normals[:, 2])
-                        tri_slope_deg = np.degrees(
-                            np.arccos(np.clip(tri_slope_cos, 0.0, 1.0))
-                        )
-                        slope_deg = tri_slope_deg[s_ids]
-                        steep = slope_deg > 10.0
-                        if steep.any():
-                            st_idx = np.where(
-                                steep & inside_tri & valid_denom
-                            )[0]
-                            if len(st_idx) > 0:
-                                # Relax iteration angle proportionally to slope
-                                adapted_angle = (
-                                    max_angle + slope_deg[st_idx] * 0.5
-                                )
-                                adapted_sin = np.sin(
-                                    np.radians(adapted_angle)
-                                )
-                                # Only relax for points above the TIN on
-                                # steep slopes (uphill direction)
-                                uphill_st = dz[st_idx] > 0
-                                if uphill_st.any():
-                                    u_idx = st_idx[uphill_st]
-                                    relaxed_ok = (
-                                        sin_max[u_idx]
-                                        <= adapted_sin[uphill_st]
-                                    )
-                                    angle_ok[u_idx] = (
-                                        angle_ok[u_idx] | relaxed_ok
-                                    )
-
-                    # --- Only-upward check ---
-                    if only_upward:
-                        upward_ok = s_z >= seed_z_surface[s_local]
-                    else:
-                        upward_ok = np.ones(sum(inside), dtype=bool)
-
-                    ok = (
-                        inside_tri & valid_denom & d_ok & angle_ok
-                        & slope_ok & edge_ok & upward_ok
-                    )
-                    new_ground[inside] = ok
-
-        # --- Apply new ground points ---
-        added = new_ground.sum()
         if added == 0:
             break
-        ground_mask[cand_indices[new_ground]] = True
+        # Early stop: added < 0.05% of vertex count
+        if added < max(1, int(0.0005 * len(g_xy))):
+            break
 
-    # --- Optional low-outlier removal (lidR-style post-cleanup) ---
+    # 6. Dense pass: project unclassified points against final frozen TIN
+    if dense:
+        if progress:
+            progress("PTD: dense pass…", 88.0)
+        cand_dense = np.flatnonzero(~ground_mask)
+        if len(cand_dense) > 0:
+            g_idx = np.flatnonzero(ground_mask)
+            g_xy = np.vstack((
+                np.column_stack((xs_f[g_idx], ys_f[g_idx])),
+                corner_xy,
+            ))
+            g_z = np.concatenate((zs_f[g_idx], corner_z))
+            try:
+                tri = Delaunay(g_xy)
+                normals, slope_deg, max_edge = _tri_props(tri, g_xy, g_z)
+                q_xy = np.column_stack((xs_f[cand_dense], ys_f[cand_dense]))
+                q_z = zs_f[cand_dense]
+                s_ids = tri.find_simplex(q_xy)
+                inside = s_ids >= 0
+                if inside.any():
+                    ii = np.flatnonzero(inside)
+                    geo = _geo_query(
+                        tri, g_xy, g_z,
+                        q_xy[ii], q_z[ii], s_ids[ii],
+                        normals, slope_deg, max_edge,
+                    )
+                    valid = geo["inside_tri"] & geo["valid_denom"]
+                    slopes = geo["slope_deg"]
+                    if follow_surface_trend:
+                        short_crest = (geo["max_edge"] <= 8.0) & (geo["dz"] > 0.0)
+                        slope_scale = 1.0 + np.tan(np.radians(np.minimum(slopes, 75.0)))
+                        dense_tol = np.where(short_crest, np.maximum(dense_tolerance * slope_scale, 0.45), dense_tolerance * slope_scale)
+                        below_tol = 0.50 * slope_scale
+                    else:
+                        dense_tol = dense_tolerance
+                        below_tol = 0.50
+                    below = valid & (geo["dz"] <= 0.0) & (geo["d_perp"] <= below_tol)
+                    above = valid & (geo["dz"] > 0.0) & (geo["d_perp"] <= dense_tol)
+                    accept_dense = below | above
+                    if accept_dense.any():
+                        ground_mask[cand_dense[ii[accept_dense]]] = True
+            except Exception as e:
+                logger.warning("PTD: dense pass failed: %s", e)
+
+    # 7. Low outlier removal
     if remove_low_outliers:
         if progress:
-            progress("TIN ground: removing low outliers…", 92.0)
-        before = ground_mask.sum()
+            progress("PTD: removing low outliers…", 95.0)
         ground_mask = _remove_low_outliers(
-            xs, ys, zs, ground_mask,
-            neighbors=low_outlier_neighbors,
+            xs_f, ys_f, zs_f, ground_mask,
             threshold=low_outlier_threshold,
         )
-        logger.info(
-            "TIN: removed %d low outliers (%d → %d ground)",
-            before - ground_mask.sum(), before, ground_mask.sum(),
-        )
 
-    if use_existing_ground:
-        logger.info(
-            "EP-PTD densify existing ground (max_d=%.2f, max_a=%.1f, "
-            "terr_a=%.1f): %d ground / %d points",
-            max_distance, max_angle, max_terrain_angle,
-            ground_mask.sum(), n,
-        )
-    else:
-        logger.info(
-            "EP-PTD ground (max_d=%.2f, max_a=%.1f, terr_a=%.1f, build=%.1f): "
-            "%d ground / %d points",
-            max_distance, max_angle, max_terrain_angle,
-            max_building_size if max_building_size is not None else seed_cell_size,
-            ground_mask.sum(), n,
-        )
+    logger.info(
+        "PTD complete: %d ground points (%.1f%%)",
+        int(ground_mask.sum()), 100.0 * ground_mask.sum() / n,
+    )
     return ground_mask
 
 
-# Backward-compatible alias (historic name "Progressive TIN Densification").
+# Backward-compatible aliases
 ground_classify_tin = ground_classify_epptd
-
-
-def ground_classify_epptd_two_pass(
-    xs: np.ndarray,
-    ys: np.ndarray,
-    zs: np.ndarray,
-    pass1_cell_size: float = 60.0,
-    pass1_max_distance: float = 1.0,
-    pass1_max_angle: float = 12.0,
-    pass2_max_distance: float = 1.0,
-    pass2_max_angle: float = 6.0,
-    max_terrain_angle: float = 88.0,
-    reduce_iter_angle_when_edge: Optional[float] = 5.0,
-    stop_tri_when_edge: Optional[float] = 2.0,
-    only_upward: bool = False,
-    follow_surface_trend: bool = False,
-    remove_low_outliers_after_pass1: bool = True,
-    low_outlier_neighbors: int = 8,
-    low_outlier_threshold: float = 1.0,
-    exclude_single_returns_in_water: bool = True,
-    sensor_type: Optional[np.ndarray] = None,
-    return_numbers: Optional[np.ndarray] = None,
-    num_returns: Optional[np.ndarray] = None,
-    extra_dims: Optional[Dict[str, np.ndarray]] = None,
-    extra_dim_filters: Optional[Sequence[Tuple[str, Optional[float], Optional[float]]]] = None,
-    progress: ProgressCB = None,
-) -> np.ndarray:
-    """
-    Two-pass TerraScan-style EP-PTD ground classification.
-
-    Pass 1 seeds a coarse grid (default 60 m) so the initial TIN is built
-    at the true local terrain/riverbed minimum, uses a permissive 12° angle
-    and 1.0 m iteration distance, and optionally removes low outliers.
-    Pass 2 then densifies against the pass-1 ground (no grid re-seeding)
-    with a tighter 6° angle, 1.0 m distance and edge damping, which rejects
-    the water surface while refining fine bed/terrain detail.
-
-    This matches the TerraScan macro workflow for river corridors.  It is
-    opt-in: the single-pass :func:`ground_classify_epptd` keeps its original
-    defaults.
-    """
-    n = len(xs)
-    if n < 100:
-        return np.ones(n, dtype=bool)
-
-    def _report(msg: str, pct: float, base: float) -> None:
-        if progress:
-            progress(msg, base + pct)
-
-    _report("Two-pass TIN: pass 1 (coarse seeds)…", 2.0, 0.0)
-    mask1 = ground_classify_epptd(
-        xs, ys, zs,
-        max_distance=pass1_max_distance,
-        max_angle=pass1_max_angle,
-        max_terrain_angle=max_terrain_angle,
-        reduce_iter_angle_when_edge=None,
-        stop_tri_when_edge=None,
-        only_upward=only_upward,
-        follow_surface_trend=follow_surface_trend,
-        remove_low_outliers=remove_low_outliers_after_pass1,
-        low_outlier_neighbors=low_outlier_neighbors,
-        low_outlier_threshold=low_outlier_threshold,
-        exclude_single_returns_in_water=exclude_single_returns_in_water,
-        sensor_type=sensor_type,
-        cell_size=pass1_cell_size,
-        return_numbers=return_numbers,
-        num_returns=num_returns,
-        extra_dims=extra_dims,
-        extra_dim_filters=extra_dim_filters,
-        progress=lambda m, p: _report(m, p * 0.45, 5.0),
-    )
-
-    if int(mask1.sum()) < 3:
-        logger.warning("Two-pass TIN: pass 1 produced < 3 ground points — returning pass 1")
-        return mask1
-
-    _report("Two-pass TIN: pass 2 (densify existing ground)…", 52.0, 0.0)
-    mask2 = ground_classify_epptd(
-        xs, ys, zs,
-        max_distance=pass2_max_distance,
-        max_angle=pass2_max_angle,
-        max_terrain_angle=max_terrain_angle,
-        reduce_iter_angle_when_edge=reduce_iter_angle_when_edge,
-        stop_tri_when_edge=stop_tri_when_edge,
-        only_upward=False,
-        follow_surface_trend=follow_surface_trend,
-        remove_low_outliers=False,
-        exclude_single_returns_in_water=exclude_single_returns_in_water,
-        sensor_type=sensor_type,
-        existing_ground_mask=mask1,
-        return_numbers=return_numbers,
-        num_returns=num_returns,
-        extra_dims=extra_dims,
-        extra_dim_filters=extra_dim_filters,
-        progress=lambda m, p: _report(m, 50.0 + p * 0.45, 5.0),
-    )
-    _report("Two-pass TIN: done", 100.0, 0.0)
-    return mask2
+ground_classify_epptd_two_pass = ground_classify_epptd
 
 
 def _remove_low_outliers(
@@ -1100,9 +707,10 @@ def _remove_low_outliers(
     neighbors: int = 8,
     threshold: float = 1.0,
     passes: int = 2,
+    sensor_type: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
-    Remove low outliers from a ground mask (lidR-style post-cleanup).
+    Remove low outliers from a ground mask (post-cleanup).
 
     A point is flagged as a low outlier when it sits more than *threshold*
     metres below the median Z of its *neighbors* nearest ground neighbours
@@ -1127,13 +735,22 @@ def _remove_low_outliers(
         xy = np.column_stack((xs[idx], ys[idx]))
         tree = KDTree(xy)
         k = min(neighbors + 1, len(idx))
-        _, nbr = tree.query(xy, k=k)
+        dist_xy, nbr = tree.query(xy, k=k)
         if nbr.ndim == 1:
             nbr = nbr[:, None]
+            dist_xy = dist_xy[:, None]
         nbr = nbr[:, 1:]  # drop self (column 0)
+        dist_xy = dist_xy[:, 1:]
         nbr_z = zs[idx[nbr]]  # (m, k-1)
         median_z = np.median(nbr_z, axis=1)
-        low = zs[idx] < (median_z - threshold)
+
+        # Adapt threshold for local slope on embankments and steep banks
+        dz = np.abs(nbr_z - zs[idx, None])
+        slopes = np.divide(dz, dist_xy, out=np.zeros_like(dz), where=dist_xy > 1e-6)
+        mean_slope = np.mean(slopes, axis=1)
+        adaptive_thr = threshold * (1.0 + mean_slope)
+
+        low = zs[idx] < (median_z - adaptive_thr)
         if not low.any():
             break
         mask[idx[low]] = False
@@ -1274,13 +891,10 @@ def _geo_query(tri, g_xy, g_z, q_xy, q_z, s_ids, normals, slope_deg, max_edge):
     p = np.column_stack((q_xy, q_z))
     d_perp = np.abs(np.sum((p - v0) * normals[s_ids], axis=1))
 
-    d_v0 = np.linalg.norm(p - v0, axis=1)
-    d_v1 = np.linalg.norm(p - v1, axis=1)
-    d_v2 = np.linalg.norm(p - v2, axis=1)
-    sin_angle = np.maximum(np.maximum(
-        np.divide(d_perp, d_v0, out=np.zeros_like(d_perp), where=d_v0 > 1e-9),
-        np.divide(d_perp, d_v1, out=np.zeros_like(d_perp), where=d_v1 > 1e-9)),
-        np.divide(d_perp, d_v2, out=np.zeros_like(d_perp), where=d_v2 > 1e-9))
+    d_v0 = np.maximum(np.linalg.norm(p - v0, axis=1), 0.5)
+    d_v1 = np.maximum(np.linalg.norm(p - v1, axis=1), 0.5)
+    d_v2 = np.maximum(np.linalg.norm(p - v2, axis=1), 0.5)
+    sin_angle = np.maximum(np.maximum(d_perp / d_v0, d_perp / d_v1), d_perp / d_v2)
 
     return {
         "inside_tri": inside_tri,
@@ -1538,11 +1152,6 @@ def _aptd_impl(
     radius = radius_factor * max_spacing
     xy = np.column_stack((xs, ys))
     tree = KDTree(xy)
-    # ``return_length=True`` avoids materialising the neighbour-index lists,
-    # which is the dominant APTD cost on dense tiles (millions of points).
-    # ``workers`` parallelises the counting across cores — huge win on a
-    # single tile, while capped so several tiles processed in parallel do
-    # not oversubscribe the machine.
     n_workers = max(1, min((os.cpu_count() or 1), 8))
     counts = tree.query_ball_point(xy, radius, return_length=True, workers=n_workers)
     keep = counts >= max(1, min_neighbors)
@@ -1708,9 +1317,6 @@ def _aptd_impl(
         ok = base & d_ok & a_ok
         steep = base & (geo["slope_deg"] > max_terrain_angle)
         if steep.any():
-            # Only points the direct criterion rejected need the mirroring
-            # rescue — mirroring already-accepted points is a no-op and just
-            # wastes a second find_simplex over the whole steep facet.
             s_idx = np.where(steep & ~ok)[0]
             if len(s_idx):
                 mir_ok = _mirror_check(ctx, s_idx, max_distance, sin_max_angle)
@@ -1720,8 +1326,6 @@ def _aptd_impl(
     ground_mask = _densify_core(
         xs_f, ys_f, zs_f, seed_mask, criterion,
         progress=progress, progress_label="APTD",
-        # Stop rebuilding the TIN once the densification tail adds almost
-        # nothing — those last iterations cost most of the runtime.
         min_added=max(20, int(n * 0.001)),
     )
 
@@ -2251,3 +1855,390 @@ def _densify_core_with_conf(
             break
         ground_mask[cand[new_ground]] = True
     return ground_mask
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Multiscale 3D Alpha Shape Filtering (MDPI Remote Sensing 2024, 16(8), 1443)
+# ─────────────────────────────────────────────────────────────────────
+
+def _extract_alpha_shape_bottom_layer(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    alpha: float,
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+) -> np.ndarray:
+    """Extract lower boundary points using a bottom rolling sphere of radius alpha.
+
+    Implements the modified 3D alpha shape lower envelope test:
+    A sphere of radius alpha placed beneath point P tests if any neighbor
+    point penetrates the sphere from below. Points where the sphere is clear
+    belong to the lower alpha-shape boundary.
+    """
+    n = len(xs)
+    cell_size = max(alpha * 0.4, 0.5)
+    nx = max(1, int(np.ceil((max_x - min_x) / cell_size)) + 1)
+    ny = max(1, int(np.ceil((max_y - min_y) / cell_size)) + 1)
+
+    gx = np.clip(((xs - min_x) / cell_size).astype(np.int32), 0, nx - 1)
+    gy = np.clip(((ys - min_y) / cell_size).astype(np.int32), 0, ny - 1)
+    flat_idx = gx * ny + gy
+
+    # Find minimum Z in each cell
+    cell_min = np.full(nx * ny, np.inf, dtype=np.float64)
+    np.minimum.at(cell_min, flat_idx, zs)
+    cand_mask = (zs <= cell_min[flat_idx] + 0.05)
+    cand_idx = np.flatnonzero(cand_mask)
+    if len(cand_idx) == 0:
+        return np.zeros(n, dtype=bool)
+
+    # KDTree query to test rolling sphere
+    try:
+        from scipy.spatial import cKDTree
+        tree = cKDTree(np.column_stack((xs, ys)))
+        # Search radius = min(alpha * 1.5, 30.0)
+        search_r = min(alpha * 1.4, 35.0)
+        neighbors_list = tree.query_ball_point(
+            np.column_stack((xs[cand_idx], ys[cand_idx])), r=search_r
+        )
+        is_bottom = np.ones(len(cand_idx), dtype=bool)
+        alpha2 = alpha * alpha
+        two_alpha = 2.0 * alpha
+
+        for i, (ci, nbrs) in enumerate(zip(cand_idx, neighbors_list)):
+            if len(nbrs) <= 1:
+                continue
+            nbrs_arr = np.asarray(nbrs)
+            dx = xs[nbrs_arr] - xs[ci]
+            dy = ys[nbrs_arr] - ys[ci]
+            dz = zs[ci] - zs[nbrs_arr]  # positive when neighbor is below ci
+            d_xy2 = dx * dx + dy * dy
+
+            # Point penetrates bottom rolling sphere if:
+            # (z - (z0 - alpha))^2 + d_xy^2 < alpha^2 and neighbor is below
+            below = dz > 1e-4
+            if below.any():
+                dz_b = dz[below]
+                d_xy2_b = d_xy2[below]
+                # Sphere condition: d_xy2 + (alpha - dz)^2 < alpha^2 <=> d_xy2 + dz^2 < 2*alpha*dz
+                violates = (d_xy2_b + dz_b * dz_b) < (two_alpha * dz_b)
+                if violates.any():
+                    is_bottom[i] = False
+
+        bottom_mask = np.zeros(n, dtype=bool)
+        bottom_mask[cand_idx[is_bottom]] = True
+        return bottom_mask
+    except Exception:
+        # Fallback to local grid minimums
+        return cand_mask
+
+
+def ground_classify_multiscale_alpha_shape(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    coarse_alpha: float = 20.0,
+    medium_alpha: float = 6.0,
+    fine_alpha: float = 2.0,
+    max_distance: float = 1.0,
+    max_angle: float = 8.0,
+    max_terrain_angle: float = 88.0,
+    exclude_single_returns_in_water: bool = True,
+    sensor_type: Optional[np.ndarray] = None,
+    return_numbers: Optional[np.ndarray] = None,
+    num_returns: Optional[np.ndarray] = None,
+    progress: ProgressCB = None,
+) -> np.ndarray:
+    """
+    Multiscale 3D Alpha Shape ground filtering for airborne LiDAR data.
+
+    Reference:
+        "A Multiscale Filtering Method for Airborne LiDAR Data Using Modified 3D Alpha Shape",
+        Remote Sensing 2024, 16(8), 1443.
+
+    Methodology:
+      1. Preprocessing: Fast outlier removal and dual-sensor water surface/column exclusion.
+      2. Multiscale 3D Alpha Shape extraction:
+         - Coarse scale (alpha1 = 20 m): bridges across large buildings, vegetation canopies,
+           and water surface gaps, isolating large-scale terrain seeds.
+         - Medium scale (alpha2 = 6 m): penetrates into valleys, gullies, and breaklines.
+         - Fine scale (alpha3 = 2 m): captures micro-topography, steep riverbanks, and riverbeds.
+      3. Multiscale Progressive TIN Densification:
+         - Initializes TIN from coarse alpha-shape seeds.
+         - Progressively densifies medium and fine alpha-shape layers with slope trend adaptation
+           and FPTD relative elevation caps (z_u - z_max <= max_distance).
+    """
+    n = len(xs)
+    if n < 100:
+        return np.ones(n, dtype=bool)
+
+    xs_f = np.asarray(xs, dtype=np.float64)
+    ys_f = np.asarray(ys, dtype=np.float64)
+    zs_f = np.asarray(zs, dtype=np.float64)
+
+    min_x, max_x = float(xs_f.min()), float(xs_f.max())
+    min_y, max_y = float(ys_f.min()), float(ys_f.max())
+
+    # Preprocessing: water surface and water-column exclusion
+    water_mask = None
+    keep_mask = np.ones(n, dtype=bool)
+    if exclude_single_returns_in_water:
+        water_mask = _detect_water_surface_and_column(
+            xs_f, ys_f, zs_f,
+            sensor_type=sensor_type,
+            return_numbers=return_numbers,
+            num_returns=num_returns,
+        )
+        if water_mask.any():
+            keep_mask &= ~water_mask
+            logger.info("M-AlphaShape: water filter excluded %d points", int(water_mask.sum()))
+
+    # Stage 2: Multiscale Alpha-Shape lower layers
+    if progress:
+        progress("M-AlphaShape: extracting coarse alpha layer (20m)…", 10.0)
+
+    # Coarse alpha layer (large scale seeds)
+    coarse_mask = _extract_alpha_shape_bottom_layer(
+        xs_f, ys_f, zs_f, coarse_alpha, min_x, min_y, max_x, max_y
+    ) & keep_mask
+
+    if progress:
+        progress("M-AlphaShape: extracting medium alpha layer (6m)…", 25.0)
+    # Medium alpha layer
+    med_mask = _extract_alpha_shape_bottom_layer(
+        xs_f, ys_f, zs_f, medium_alpha, min_x, min_y, max_x, max_y
+    ) & keep_mask
+
+    if progress:
+        progress("M-AlphaShape: extracting fine alpha layer (2m)…", 40.0)
+    # Fine alpha layer
+    fine_mask = _extract_alpha_shape_bottom_layer(
+        xs_f, ys_f, zs_f, fine_alpha, min_x, min_y, max_x, max_y
+    ) & keep_mask
+
+    if int(coarse_mask.sum()) < 3:
+        coarse_mask = med_mask.copy()
+    if int(coarse_mask.sum()) < 3:
+        coarse_mask = _lowest_per_grid_cells(
+            xs_f, ys_f, zs_f, min_x, min_y, max_x, max_y, coarse_alpha, 0.0, 0.0
+        ) & keep_mask
+
+    # Stage 3: Multiscale progressive TIN densification
+    if progress:
+        progress("M-AlphaShape: multiscale TIN densification…", 55.0)
+
+    # Pass 1: densify medium layer against coarse seeds
+    pass1_ground = ground_classify_epptd(
+        xs_f, ys_f, zs_f,
+        max_distance=max_distance * 1.5,
+        max_angle=max_angle * 1.25,
+        max_terrain_angle=max_terrain_angle,
+        follow_surface_trend=True,
+        existing_ground_mask=coarse_mask,
+        exclude_single_returns_in_water=False,
+        progress=lambda m, p: progress and progress(f"M-AlphaShape: pass 1…", 55.0 + p * 0.20),
+    ) & keep_mask
+
+    # Pass 2: densify fine layer and remaining points against pass 1 ground
+    if progress:
+        progress("M-AlphaShape: fine layer densification…", 75.0)
+
+    pass2_ground = ground_classify_epptd(
+        xs_f, ys_f, zs_f,
+        max_distance=max_distance,
+        max_angle=max_angle,
+        max_terrain_angle=max_terrain_angle,
+        follow_surface_trend=True,
+        existing_ground_mask=pass1_ground,
+        exclude_single_returns_in_water=False,
+        progress=lambda m, p: progress and progress(f"M-AlphaShape: pass 2…", 75.0 + p * 0.20),
+    ) & keep_mask
+
+    if progress:
+        progress("M-AlphaShape: done", 100.0)
+    logger.info("M-AlphaShape: classified %d ground / %d points", int(pass2_ground.sum()), n)
+    return pass2_ground
+
+
+# ─────────────────────────────────────────────────────────────────────
+# EGS-CSF: Evolutionary Gradient Search Cloth Simulation (IJDE 2025)
+# ─────────────────────────────────────────────────────────────────────
+
+def ground_classify_egs_csf(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    cloth_resolution: float = 1.0,
+    rigidness: float = 2.0,
+    time_step: float = 0.65,
+    class_threshold: float = 0.30,
+    gradient_factor: float = 0.50,
+    max_iterations: int = 50,
+    exclude_single_returns_in_water: bool = True,
+    sensor_type: Optional[np.ndarray] = None,
+    return_numbers: Optional[np.ndarray] = None,
+    num_returns: Optional[np.ndarray] = None,
+    progress: ProgressCB = None,
+) -> np.ndarray:
+    """
+    EGS-CSF: Evolutionary Gradient Search Cloth Simulation Filter.
+
+    Reference:
+        "EGS-CSF: an adaptive ground point cloud filtering framework based on evolutionary gradient search",
+        International Journal of Digital Earth 2025, DOI: 10.1080/17538947.2025.2531843.
+
+    Methodology:
+      1. Preprocessing: Exclude water surface and water-column reflections.
+      2. Point cloud inversion: Z_inv = max(Z) - Z.
+      3. 2D Particle Cloth Grid:
+         - Discretize space into cloth particles with spacing = cloth_resolution.
+         - Obstacle surface Z_obs = min(Z_inv) in each particle cell.
+      4. Evolutionary Gradient Adaptation:
+         - Computes terrain gradient magnitude G(x, y) = ||grad(Z_obs)||.
+         - In flat areas: high rigidness prevents cloth from sagging into buildings/trees.
+         - In steep areas (embankments, cliffs, riverbanks): dynamically relaxes rigidness
+           and accelerates displacement along the slope gradient, conforming to steep terrain.
+      5. Spring-mass particle simulation:
+         - Gravity + collision with obstacle surface + gradient-guided internal displacement.
+         - Self-terminates when max particle movement < 5 mm.
+      6. Gradient-Adaptive Classification:
+         - True ground height Z_cloth = max(Z) - Z_c.
+         - Distance tolerance scales with local slope: h(G) = h0 * (1 + beta * G).
+         - Classifies all points within h(G) of the cloth as ground.
+    """
+    n = len(xs)
+    if n < 100:
+        return np.ones(n, dtype=bool)
+
+    xs_f = np.asarray(xs, dtype=np.float64)
+    ys_f = np.asarray(ys, dtype=np.float64)
+    zs_f = np.asarray(zs, dtype=np.float64)
+
+    min_x, max_x = float(xs_f.min()), float(xs_f.max())
+    min_y, max_y = float(ys_f.min()), float(ys_f.max())
+
+    # Preprocessing: water surface and water column exclusion
+    water_mask = None
+    keep_mask = np.ones(n, dtype=bool)
+    if exclude_single_returns_in_water:
+        water_mask = _detect_water_surface_and_column(
+            xs_f, ys_f, zs_f,
+            sensor_type=sensor_type,
+            return_numbers=return_numbers,
+            num_returns=num_returns,
+        )
+        if water_mask.any():
+            keep_mask &= ~water_mask
+            logger.info("EGS-CSF: water filter excluded %d points", int(water_mask.sum()))
+
+    if progress:
+        progress("EGS-CSF: initializing cloth particle grid…", 10.0)
+
+    # Step 1: Invert point cloud (considering only non-water points)
+    max_z_val = float(zs_f[keep_mask].max()) if keep_mask.any() else float(zs_f.max())
+    z_inv = max_z_val - zs_f
+
+    # Step 2: Build 2D Cloth Particle Grid
+    cr = max(0.5, float(cloth_resolution))
+    nx = max(3, int(np.ceil((max_x - min_x) / cr)) + 1)
+    ny = max(3, int(np.ceil((max_y - min_y) / cr)) + 1)
+
+    gx = np.clip(((xs_f - min_x) / cr).astype(np.int32), 0, nx - 1)
+    gy = np.clip(((ys_f - min_y) / cr).astype(np.int32), 0, ny - 1)
+    flat_idx = gx * ny + gy
+
+    # Obstacle height in inverted space: minimum Z_inv of points in cell
+    z_obs = np.full(nx * ny, np.inf, dtype=np.float64)
+    valid_pts = keep_mask
+    np.minimum.at(z_obs, flat_idx[valid_pts], z_inv[valid_pts])
+    z_obs_2d = z_obs.reshape((nx, ny))
+
+    # Fill empty cells (voids) with nearest neighbor interpolation
+    unoccupied = np.isinf(z_obs_2d)
+    if unoccupied.all():
+        return np.ones(n, dtype=bool)
+    if unoccupied.any():
+        try:
+            from scipy.ndimage import distance_transform_edt
+            _, indices = distance_transform_edt(unoccupied, return_indices=True)
+            z_obs_2d = z_obs_2d[indices[0], indices[1]]
+        except Exception:
+            med_val = float(np.median(z_obs_2d[~unoccupied]))
+            z_obs_2d[unoccupied] = med_val
+
+    # Step 3: Evolutionary Gradient Calculation
+    # Gradient magnitude: G = sqrt((dZ/dx)^2 + (dZ/dy)^2)
+    gz, gx_grad = np.gradient(z_obs_2d, cr)
+    grad_mag = np.sqrt(gz * gz + gx_grad * gx_grad)
+    grad_max = float(np.percentile(grad_mag, 98.0)) if grad_mag.size else 1.0
+    grad_norm = np.clip(grad_mag / max(1e-3, grad_max), 0.0, 1.0)
+
+    # Adaptive rigidness: flat areas RI ~ rigidness; steep areas RI ~ 0.5 (flexible)
+    base_ri = max(1.0, float(rigidness))
+    ri_2d = np.maximum(0.5, base_ri * (1.0 - 0.70 * grad_norm))
+
+    # Step 4: Iterative Cloth Simulation
+    if progress:
+        progress("EGS-CSF: running evolutionary cloth simulation…", 25.0)
+
+    # Initial cloth elevation at top of inverted space
+    z_cloth = np.full((nx, ny), float(np.max(z_obs_2d)) + 2.0, dtype=np.float64)
+    g = 9.8 * 0.1
+    dt = float(time_step)
+
+    for it in range(max_iterations):
+        if progress and it % 10 == 0:
+            progress(f"EGS-CSF: cloth iteration {it+1}/{max_iterations}…", 25.0 + 50.0 * it / max_iterations)
+
+        z_prev = z_cloth.copy()
+
+        # 1. Gravity step
+        z_cloth -= g * dt
+
+        # 2. Collision constraint with inverted surface
+        np.maximum(z_cloth, z_obs_2d, out=z_cloth)
+
+        # 3. Internal spring displacement (4-neighbor smoothing)
+        # Shift neighbors
+        north = np.roll(z_cloth, -1, axis=0); north[-1, :] = z_cloth[-1, :]
+        south = np.roll(z_cloth, 1, axis=0);  south[0, :] = z_cloth[0, :]
+        east  = np.roll(z_cloth, -1, axis=1); east[:, -1] = z_cloth[:, -1]
+        west  = np.roll(z_cloth, 1, axis=1);  west[:, 0] = z_cloth[:, 0]
+
+        neighbor_avg = 0.25 * (north + south + east + west)
+        delta = (neighbor_avg - z_cloth) / ri_2d
+
+        # Apply displacement where particles are not resting on rigid collision
+        not_collision = z_cloth > (z_obs_2d + 1e-4)
+        z_cloth[not_collision] += delta[not_collision]
+        np.maximum(z_cloth, z_obs_2d, out=z_cloth)
+
+        max_mov = float(np.max(np.abs(z_cloth - z_prev)))
+        if max_mov < 0.005:
+            break
+
+    # Step 5: Re-inversion and Gradient-Adaptive Classification
+    if progress:
+        progress("EGS-CSF: classifying points with adaptive gradient threshold…", 85.0)
+
+    # True cloth elevation in original point cloud space
+    z_cloth_orig = max_z_val - z_cloth
+
+    # Point-wise cloth elevation via bilinear or nearest sampling
+    point_cloth_z = z_cloth_orig[gx, gy]
+    point_grad = grad_mag[gx, gy]
+
+    # Adaptive distance threshold: h(G) = h0 * (1 + beta * G)
+    h_dynamic = float(class_threshold) * (1.0 + float(gradient_factor) * np.clip(point_grad, 0.0, 3.0))
+
+    # Point is ground if distance to cloth is within h_dynamic
+    ground_mask = (np.abs(zs_f - point_cloth_z) <= h_dynamic) & keep_mask
+
+    if progress:
+        progress("EGS-CSF: done", 100.0)
+    logger.info("EGS-CSF: classified %d ground / %d points (%.1f%%)", int(ground_mask.sum()), n, 100.0 * ground_mask.sum() / n)
+    return ground_mask
+
