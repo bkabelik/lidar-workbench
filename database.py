@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS tiles (
     crs_epsg        INTEGER,               -- EPSG code (e.g. 32633)
     crs_wkt         TEXT,                  -- OGC WKT string for the CRS
     status          TEXT    NOT NULL DEFAULT 'IMPORTED'
-                    CHECK(status IN ('IMPORTED','FILTERED','CLASSIFIED','EDITED','NOISE','ERROR')),
+                    CHECK(status IN ('IMPORTED','FILTERED','CLASSIFIED','GROUND','BATHY','EDITED','NOISE','ERROR')),
     qc_status       TEXT    DEFAULT NULL,   -- QC review status: NULL, 'QC_PASSED', 'IN_REVIEW', 'NEEDS_REWORK'
     qc_comment      TEXT    DEFAULT NULL,   -- optional comment (e.g. rework instructions)
     filter_params   TEXT,   -- JSON
@@ -200,15 +200,15 @@ class Database:
             logger.debug("Migrated: created %s", name)
 
     def _migrate_status_constraint(self, conn: sqlite3.Connection) -> None:
-        """Recreate the tiles table if the status CHECK constraint lacks 'NOISE'."""
-        # Check current constraint definition
+        """Recreate the tiles table if the status CHECK constraint is outdated."""
+        required = ("NOISE", "GROUND", "BATHY")
         row = conn.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='tiles'"
         ).fetchone()
-        if row and 'NOISE' in row[0]:
+        if row and all(s in row[0] for s in required):
             return  # already migrated
 
-        logger.info("Migrating tiles.status constraint to include NOISE…")
+        logger.info("Migrating tiles.status constraint to include %s…", ", ".join(required))
         conn.execute("PRAGMA foreign_keys = OFF")
         conn.execute("BEGIN")
         try:
@@ -229,7 +229,9 @@ class Database:
                     crs_epsg        INTEGER,
                     crs_wkt         TEXT,
                     status          TEXT    NOT NULL DEFAULT 'IMPORTED'
-                                    CHECK(status IN ('IMPORTED','FILTERED','CLASSIFIED','EDITED','NOISE','ERROR')),
+                                    CHECK(status IN ('IMPORTED','FILTERED','CLASSIFIED','GROUND','BATHY','EDITED','NOISE','ERROR')),
+                    qc_status       TEXT    DEFAULT NULL,
+                    qc_comment      TEXT    DEFAULT NULL,
                     filter_params   TEXT,
                     classification_model TEXT,
                     last_modified   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -349,6 +351,22 @@ class Database:
             conn.execute(
                 "UPDATE tiles SET status = ?, last_modified = CURRENT_TIMESTAMP WHERE id = ?",
                 (status, tile_id),
+            )
+
+    def update_filename(self, conn: sqlite3.Connection, tile_id: str,
+                        filename: str, status: str) -> None:
+        """
+        Update the LAS filename of a tile and move it to a new status.
+
+        Used when a processing step writes its result to a subfolder
+        (e.g. ``ground/`` or ``bathy/``) instead of overwriting the
+        original tile file in place.
+        """
+        with Database._write_lock:
+            conn.execute(
+                "UPDATE tiles SET filename = ?, status = ?, "
+                "last_modified = CURRENT_TIMESTAMP WHERE id = ?",
+                (filename, status, tile_id),
             )
 
     def update_tile_bbox(

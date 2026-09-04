@@ -209,6 +209,9 @@ my_project/
 ├── tile_database.sqlite   # Tile metadata + edit history
 ├── tiles/                 # LAS tile files
 │   ├── tile_0000.las
+│   ├── ground/            # Ground-classification results (per tile)
+│   ├── bathy/             # Bathymetry-processing results (per tile)
+│   ├── noise/             # Noise-filtered points (per tile)
 │   └── …
 └── dtm/                   # Exported DTM/DSM rasters (ESRI ASCII Grid)
     ├── tile_0000_dtm.asc

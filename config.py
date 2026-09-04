@@ -135,11 +135,13 @@ class TileStatus:
     IMPORTED: Final[str] = "IMPORTED"
     FILTERED: Final[str] = "FILTERED"
     CLASSIFIED: Final[str] = "CLASSIFIED"
+    GROUND: Final[str] = "GROUND"
+    BATHY: Final[str] = "BATHY"
     EDITED: Final[str] = "EDITED"
     NOISE: Final[str] = "NOISE"
     ERROR: Final[str] = "ERROR"
 
-    ALL: Final[Tuple[str, ...]] = (IMPORTED, FILTERED, CLASSIFIED, EDITED, NOISE, ERROR)
+    ALL: Final[Tuple[str, ...]] = (IMPORTED, FILTERED, CLASSIFIED, GROUND, BATHY, EDITED, NOISE, ERROR)
 
 
 class QCStatus:

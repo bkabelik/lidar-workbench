@@ -1022,8 +1022,21 @@ class MainWindow(QMainWindow):
         # Nothing changed for tiles without matching source-class points.
         if result.get("n_affected", 0) == 0:
             return
-        self._tm.update_tile_status(tile_id, TileStatus.EDITED)
-        self._tile_list_widget.update_tile_status(tile_id, TileStatus.EDITED)
+
+        out_path = result.get("out_path")
+        tiles_dir = self._pm.tiles_dir
+        if out_path and tiles_dir is not None:
+            rel_path = Path(out_path)
+            try:
+                rel_path = rel_path.relative_to(tiles_dir)
+            except ValueError:
+                pass
+            with self._db.connect() as conn:
+                self._db.update_filename(
+                    conn, tile_id, rel_path.as_posix(), TileStatus.GROUND
+                )
+
+        self._tile_list_widget.update_tile_status(tile_id, TileStatus.GROUND)
         self._mark_project_dirty()
 
     def _on_ground_all_saved(self) -> None:
@@ -1108,7 +1121,7 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _save_bathy_tile(self, tile_id: str, result: dict) -> None:
-        """Write bathy-processed data back to a tile's LAS file."""
+        """Write bathy-processed data to tiles/bathy/<tile>_bathy.las."""
         tile_info = self._db.get_tile(tile_id)
         if tile_info is None:
             return
@@ -1117,20 +1130,14 @@ class MainWindow(QMainWindow):
         if tiles_dir is None:
             return
 
-        las_path = tiles_dir / tile_info["filename"]
-        if not las_path.is_file():
+        source_path = tiles_dir / tile_info["filename"]
+        if not source_path.is_file():
             return
 
         import laspy
-        import shutil
 
-        # Backup original
-        backup_path = las_path.with_suffix(las_path.suffix + ".bak")
-        if not backup_path.exists():
-            shutil.copy2(las_path, backup_path)
-
-        # Read original file to get header template
-        with laspy.open(las_path) as reader:
+        # Read the source file to get a header template (VLRs / point format).
+        with laspy.open(source_path) as reader:
             extra_dims = []
             try:
                 extra_dims = list(reader.header.point_format.extra_dimensions)
@@ -1146,9 +1153,15 @@ class MainWindow(QMainWindow):
                 "z_scale": reader.header.z_scale,
             }
 
+        # Bathy results live in <tiles>/bathy — never overwrite the source tile.
+        bathy_dir = tiles_dir / "bathy"
+        bathy_dir.mkdir(parents=True, exist_ok=True)
+        bathy_name = Path(tile_info["filename"]).stem + "_bathy.las"
+        bathy_path = bathy_dir / bathy_name
+
         from ..tile_manager import _write_las_file
         _write_las_file(
-            las_path,
+            bathy_path,
             result["x"], result["y"], result["z"],
             classes=result.get("classification"),
             intensities=result.get("intensity"),
@@ -1174,8 +1187,11 @@ class MainWindow(QMainWindow):
         new_count = len(result["x"])
         with self._db.connect() as conn:
             self._db.update_point_count(conn, tile_id, new_count)
+            self._db.update_filename(
+                conn, tile_id, f"bathy/{bathy_name}", TileStatus.BATHY
+            )
 
-        self._tile_list_widget.update_tile_status(tile_id, TileStatus.EDITED)
+        self._tile_list_widget.update_tile_status(tile_id, TileStatus.BATHY)
         self._mark_project_dirty()
 
     def _write_tile_data_to_las(self, tile_id: str, data: dict) -> bool:
@@ -2202,7 +2218,7 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
 
         # Auto-generate DTM if tile is classified
         tile_info = self._db.get_tile(tile_id)
-        if tile_info and tile_info.get("status") in (TileStatus.CLASSIFIED, TileStatus.EDITED, TileStatus.FILTERED):
+        if tile_info and tile_info.get("status") in (TileStatus.CLASSIFIED, TileStatus.GROUND, TileStatus.BATHY, TileStatus.EDITED, TileStatus.FILTERED):
             self._multi_view._view_dtm.generate_dtm()
 
         # Populate metadata panel

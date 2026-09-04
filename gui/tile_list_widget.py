@@ -34,6 +34,8 @@ _STATUS_COLORS: Dict[str, QColor] = {
     TileStatus.IMPORTED:   QColor("#3498db"),  # blue
     TileStatus.FILTERED:   QColor("#f39c12"),  # orange
     TileStatus.CLASSIFIED: QColor("#2ecc71"),  # green
+    TileStatus.GROUND:     QColor("#8B4513"),  # saddle brown
+    TileStatus.BATHY:      QColor("#16a085"),  # teal
     TileStatus.EDITED:     QColor("#9b59b6"),  # purple
     TileStatus.NOISE:      QColor("#e74c3c"),  # red
     TileStatus.ERROR:      QColor("#e74c3c"),  # red
@@ -117,11 +119,17 @@ class TileListWidget(QWidget):
         self._tree.itemChanged.connect(self._on_item_changed)
 
         header = self._tree.header()
-        header.setStretchLastSection(True)
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setStretchLastSection(False)
+        header.setSectionsMovable(True)
+        header.setFirstSectionMovable(True)
+        # All columns user-resizable (Interactive) so they can be widened
+        # or narrowed in the GUI; give sensible initial widths below.
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        self._tree.setColumnWidth(0, 32)
+        self._tree.setColumnWidth(1, 220)
+        self._tree.setColumnWidth(2, 90)
+        self._tree.setColumnWidth(3, 150)
+        self._tree.setColumnWidth(4, 110)
 
         layout.addWidget(self._tree)
 

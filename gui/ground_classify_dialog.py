@@ -324,8 +324,17 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
         header_tmpl = _read_las_header_template(las_path)
     except Exception:
         header_tmpl = None
+
+    # Ground results live in <tiles>/ground — never overwrite the source tile.
+    base_dir = las_path.parent
+    if base_dir.name in ("ground", "bathy", "noise"):
+        base_dir = base_dir.parent
+    ground_dir = base_dir / "ground"
+    ground_dir.mkdir(parents=True, exist_ok=True)
+    out_path = ground_dir / f"{las_path.stem}_ground.las"
+
     _write_las_file(
-        las_path,
+        out_path,
         data["x"], data["y"], data["z"],
         classes=data["classification"],
         intensities=data.get("intensity"),
@@ -350,6 +359,7 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
 
     result["n_ground"] = int(mask.sum())
     result["n_affected"] = n_affected
+    result["out_path"] = str(out_path)
     result["duration"] = time.perf_counter() - t0
     return result
 
