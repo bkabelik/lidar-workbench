@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from ..ground import (
     ground_classify_smrf,
+    ground_classify_stepdown,
     ground_classify_epptd,
     ground_classify_epptd_two_pass,
     ground_classify_aptd,
@@ -135,19 +136,15 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
     sc = source_class
 
     if method == "dl_hybrid" and sc == 2:
-        # With source class 2 only, every source point is already a DL
-        # ground prediction and the DL prior carries no information —
-        # the result degenerates to EP-PTD.  Broaden the source set to
-        # classes 1 & 2 so class-2 points act as trusted DL seeds while
-        # class-1 points are densified geometrically against them.
-        source_mask = (cls_all == 1) | (cls_all == 2)
+        source_mask = (cls_all == 0) | (cls_all == 1) | (cls_all == 2)
         sc = -2
     elif sc == -2:
-        source_mask = (cls_all == 1) | (cls_all == 2)
+        # All unclassified (0, 1) and existing ground (2)
+        source_mask = (cls_all == 0) | (cls_all == 1) | (cls_all == 2)
     elif sc == -3:
-        # "1 → 2": densify unclassified (1) onto existing ground (2).
+        # "1 → 2": densify unclassified (0, 1) onto existing ground (2).
         # Class 2 is the trusted initial TIN and is left untouched.
-        source_mask = (cls_all == 1) | (cls_all == 2)
+        source_mask = (cls_all == 0) | (cls_all == 1) | (cls_all == 2)
     elif sc >= 0:
         source_mask = (cls_all == sc)
     else:
@@ -244,13 +241,8 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
             coarse_alpha=params.get("coarse_alpha", 20.0),
             medium_alpha=params.get("medium_alpha", 6.0),
             fine_alpha=params.get("fine_alpha", 2.0),
-            max_distance=params.get("max_distance", 1.0),
-            max_angle=params.get("max_angle", 8.0),
-            max_terrain_angle=params.get("max_terrain_angle", 88.0),
-            exclude_single_returns_in_water=params.get("exclude_single_returns_in_water", True),
-            sensor_type=st_sub,
-            return_numbers=rn_sub,
-            num_returns=nr_sub,
+            max_distance=params.get("max_distance", 0.5),
+            max_terrain_angle=params.get("max_terrain_angle", 60.0),
         )
     elif method == "egs_csf":
         mask = ground_classify_egs_csf(
@@ -261,29 +253,43 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
             class_threshold=params.get("class_threshold", 0.30),
             gradient_factor=params.get("gradient_factor", 0.50),
             max_iterations=params.get("max_iterations", 50),
-            exclude_single_returns_in_water=params.get("exclude_single_returns_in_water", True),
-            sensor_type=st_sub,
+        )
+    elif method == "stepdown":
+        existing_ground = None
+        if sc == -3:
+            existing_ground = (cls_all[source_mask] == 2)
+
+        mask = ground_classify_stepdown(
+            xs_sub, ys_sub, zs_sub,
+            step=params.get("step", 3.0),
+            sub_steps=params.get("sub_steps", 6),
+            bulge=params.get("bulge"),
+            offset=params.get("offset", 0.10),
+            spike=params.get("spike", 1.0),
+            spike_down=params.get("spike_down", 1.0),
+            refine_loops=params.get("refine_loops", 2),
+            all_returns=params.get("all_returns", False),
             return_numbers=rn_sub,
             num_returns=nr_sub,
+            existing_ground_mask=existing_ground,
         )
     else:  # "epptd" (and legacy "tin")
         existing_ground = None
         if sc == -3:
-            # Densify unclassified (1) onto existing ground (2): class 2
+            # Densify unclassified (0, 1) onto existing ground (2): class 2
             # points are the trusted initial TIN and must not be re-tested.
             existing_ground = (cls_all[source_mask] == 2)
 
         mask = ground_classify_epptd(
             xs_sub, ys_sub, zs_sub,
-            max_distance=params.get("max_distance", 1.6),
-            max_angle=params.get("max_angle", 25.0),
-            seed_resolution=params.get("seed_resolution", 2.0),
-            spacing=params.get("spacing"),
-            follow_surface_trend=params.get("follow_surface_trend", True),
+            seed_resolution_search=params.get("seed_resolution", 10.0),
+            max_iteration_angle=params.get("max_angle", 6.0),
+            max_iteration_distance=params.get("max_distance", 0.5),
+            spacing=params.get("spacing", 0.50),
+            buffer_size=params.get("buffer_size", 15.0),
+            max_iter=params.get("max_iter", 15),
             dense=params.get("dense", True),
-            dense_tolerance=params.get("dense_tolerance", 0.40),
-            remove_low_outliers=params.get("remove_low_outliers", True),
-            low_outlier_threshold=params.get("low_outlier_threshold", 1.0),
+            dense_tolerance=params.get("dense_tolerance", 0.10),
             existing_ground_mask=existing_ground,
         )
 
@@ -295,18 +301,18 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
 
     new_cls = cls_all.copy()
     if sc == -2:
-        in_source = (cls_all == 1) | (cls_all == 2)
+        in_source = (cls_all == 0) | (cls_all == 1) | (cls_all == 2)
         new_cls[in_source & full_mask] = 2
         new_cls[in_source & ~full_mask] = 1
         n_affected = int(in_source.sum())
     elif sc == -3:
-        in_source = (cls_all == 1) | (cls_all == 2)
+        in_source = (cls_all == 0) | (cls_all == 1) | (cls_all == 2)
         was_ground = cls_all == 2
-        # Existing ground stays untouched; only class-1 points are assigned.
+        # Existing ground stays untouched; only unclassified points are assigned.
         new_cls[in_source & was_ground] = 2
         new_cls[in_source & ~was_ground & full_mask] = 2
         new_cls[in_source & ~was_ground & ~full_mask] = 1
-        n_affected = int((cls_all == 1).sum())
+        n_affected = int(((cls_all == 0) | (cls_all == 1)).sum())
     elif sc >= 0:
         in_source = (cls_all == sc)
         new_cls[in_source & full_mask] = 2
@@ -331,7 +337,10 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
         base_dir = base_dir.parent
     ground_dir = base_dir / "ground"
     ground_dir.mkdir(parents=True, exist_ok=True)
-    out_path = ground_dir / f"{las_path.stem}_ground.las"
+    clean_stem = las_path.stem
+    while clean_stem.endswith("_ground"):
+        clean_stem = clean_stem[:-7]
+    out_path = ground_dir / f"{clean_stem}_ground.las"
 
     _write_las_file(
         out_path,
@@ -546,8 +555,9 @@ class GroundClassifyDialog(QDialog):
         method_group = QGroupBox("Algorithm")
         mf = QFormLayout(method_group)
         self._method_combo = QComboBox()
-        self._method_combo.addItem("SMRF — Simple Morphological Filter (PDAL)", "smrf")
+        self._method_combo.addItem("Step-Down PTD — Multi-Scale Bulged TIN", "stepdown")
         self._method_combo.addItem("EP-PTD — Progressive TIN Densification (Axelsson)", "epptd")
+        self._method_combo.addItem("SMRF — Simple Morphological Filter (PDAL)", "smrf")
         self._method_combo.addItem("APTD — Adaptive Grid PTD (AGPTD)", "aptd")
         self._method_combo.addItem("H-PTD — Hierarchical/Fast PTD (FPTD)", "hptd")
         self._method_combo.addItem("DL-Hybrid PTD — Pointcept + PTD", "dl_hybrid")
@@ -561,7 +571,7 @@ class GroundClassifyDialog(QDialog):
         self._source_class_combo.addItem("2: Ground (Pointcept default)", 2)
         self._source_class_combo.addItem("0: Created, Never Classified", 0)
         self._source_class_combo.addItem("1: Unclassified", 1)
-        self._source_class_combo.addItem("1 & 2: Unclassified + Ground", -2)
+        self._source_class_combo.addItem("0, 1 & 2: All Unclassified + Ground", -2)
         self._source_class_combo.addItem(
             "1 → 2: Densify Unclassified onto Existing Ground", -3
         )
@@ -570,10 +580,10 @@ class GroundClassifyDialog(QDialog):
         self._source_class_combo.setToolTip(
             "Only reclassify points matching the selected source class(es). "
             "Other classes are left unchanged.\n\n"
-            "'1 → 2' uses existing Class 2 ground as the initial TIN and only "
-            "reclassifies Class 1 points against it (densify onto existing "
-            "ground). Existing ground is left untouched.  Most useful with "
-            "the EP-PTD method."
+            "'0, 1 & 2' uses all unclassified points (classes 0 and 1) plus "
+            "existing ground (class 2) as input, re-classifying them.\n\n"
+            "'1 → 2' uses existing Class 2 ground as the trusted initial TIN and only "
+            "reclassifies unclassified points against it. Existing ground is left untouched."
         )
         mf.addRow("Source Class:", self._source_class_combo)
         layout.addWidget(method_group)
@@ -601,95 +611,95 @@ class GroundClassifyDialog(QDialog):
         self._smrf_elev.setSuffix(" m")
         self._smrf_elev.setToolTip("Max height above filtered surface for ground")
         sf.addRow("Elevation Thresh:", self._smrf_elev)
+        self._smrf_group.setVisible(False)
         layout.addWidget(self._smrf_group)
 
-        # EP-PTD params (Axelsson PTD)
-        self._tin_group = QGroupBox("EP-PTD Parameters (Axelsson)")
+        # EP-PTD params
+        self._tin_group = QGroupBox("EP-PTD Parameters (Progressive TIN Densification)")
         tf = QFormLayout(self._tin_group)
 
+        self._tin_preset_combo = QComboBox()
+        self._tin_preset_combo.addItem("Flat / Gentle Terrain (Default)", "flat")
+        self._tin_preset_combo.addItem("River Embankments & Levees", "embankment")
+        self._tin_preset_combo.addItem("Hilly / Steep Terrain", "steep")
+        self._tin_preset_combo.addItem("Urban / Large Buildings", "urban")
+        self._tin_preset_combo.currentIndexChanged.connect(self._on_tin_preset_changed)
+        tf.addRow("Terrain Preset:", self._tin_preset_combo)
+
         self._tin_dist = QDoubleSpinBox()
-        self._tin_dist.setRange(0.1, 10.0)
+        self._tin_dist.setRange(0.05, 5.0)
         self._tin_dist.setDecimals(2)
-        self._tin_dist.setValue(1.6)
+        self._tin_dist.setValue(0.50)
         self._tin_dist.setSuffix(" m")
-        self._tin_dist.setToolTip("Max perpendicular distance from candidate point to TIN surface")
+        self._tin_dist.setToolTip("Max perpendicular distance from candidate point to TIN surface (Axelsson iteration distance; default 0.50m).")
         tf.addRow("Max Distance:", self._tin_dist)
 
         self._tin_angle = QDoubleSpinBox()
         self._tin_angle.setRange(1.0, 45.0)
         self._tin_angle.setDecimals(1)
-        self._tin_angle.setValue(25.0)
+        self._tin_angle.setValue(6.0)
         self._tin_angle.setSuffix("°")
-        self._tin_angle.setToolTip("Max angle between point and TIN vertices (iteration angle)")
+        self._tin_angle.setToolTip("Max angle between point and TIN vertices (Axelsson iteration angle; 5°-6° flat, 20°-30° for riverbanks/hills).")
         tf.addRow("Max Angle:", self._tin_angle)
 
         self._tin_seed_res = QDoubleSpinBox()
         self._tin_seed_res.setRange(1.0, 200.0)
         self._tin_seed_res.setDecimals(1)
-        self._tin_seed_res.setValue(2.0)
+        self._tin_seed_res.setValue(10.0)
         self._tin_seed_res.setSuffix(" m")
         self._tin_seed_res.setToolTip(
-            "Initial coarse seed grid size (seed resolution). In river corridors, "
-            "values between 2 - 5 m ensure seeds land directly on the embankment "
-            "faces and crests. For flatter terrain, 15 - 20 m is typical."
+            "Initial coarse seed grid size (seed resolution). Evaluates two half-step shifted "
+            "grids to sample lowest points without cell-edge artifacts."
         )
         tf.addRow("Seed Resolution:", self._tin_seed_res)
 
-        self._tin_follow_terrain = QCheckBox("Follow terrain trend (embankments & steep slopes)")
-        self._tin_follow_terrain.setChecked(True)
-        self._tin_follow_terrain.setToolTip(
-            "Relaxes iteration angle and distance thresholds on steep facets so the "
-            "TIN can climb river embankments, steep banks, and cliffs without getting stuck."
-        )
-        tf.addRow(self._tin_follow_terrain)
-
         self._tin_spacing = self._make_auto_spin(20.0, 2, "Auto")
-        self._tin_spacing.setValue(0.0)
+        self._tin_spacing.setValue(0.50)
         self._tin_spacing.setToolTip(
-            "Point spacing for candidate pre-thinning (spacing). Only the single "
-            "lowest point per spacing cell is evaluated for densification, automatically "
-            "filtering out water surface and canopy echoes. Auto derives it from point density."
+            "Point spacing for candidate pre-thinning (spacing). Evaluates lowest point per spacing "
+            "cell and freezes triangles smaller than spacing."
         )
         tf.addRow("Candidate Spacing (Auto):", self._tin_spacing)
 
-        self._tin_dense = QCheckBox("Dense Pass (project all points against final TIN)")
-        self._tin_dense.setChecked(True)
-        self._tin_dense.setToolTip(
-            "When checked, all original points are tested against the final frozen TIN: "
-            "points on or below become ground; points above only within the tolerance below."
+        self._tin_buffer_size = QDoubleSpinBox()
+        self._tin_buffer_size.setRange(0.0, 200.0)
+        self._tin_buffer_size.setDecimals(1)
+        self._tin_buffer_size.setValue(15.0)
+        self._tin_buffer_size.setSuffix(" m")
+        self._tin_buffer_size.setToolTip(
+            "Boundary buffer width to prevent tile boundary edge distortion."
         )
-        tf.addRow(self._tin_dense)
+        tf.addRow("Buffer Size:", self._tin_buffer_size)
+
+        self._tin_max_iter = QSpinBox()
+        self._tin_max_iter.setRange(1, 200)
+        self._tin_max_iter.setValue(15)
+        self._tin_max_iter.setToolTip(
+            "Maximum progressive densification iterations."
+        )
+        tf.addRow("Max Iterations:", self._tin_max_iter)
+
+        self._tin_full_density = QCheckBox("Classify Full Density Ground (all points onto TIN)")
+        self._tin_full_density.setChecked(True)
+        self._tin_full_density.setToolTip(
+            "When unchecked (sparse mode), only the single lowest point per candidate cell "
+            "(the TIN vertices) is marked as ground, resulting in a thinned/sparse ground model. "
+            "When checked, all points sitting on the ground surface are classified so the ground "
+            "cloud retains 100% full density."
+        )
+        tf.addRow(self._tin_full_density)
 
         self._tin_dense_tol = QDoubleSpinBox()
-        self._tin_dense_tol.setRange(0.0, 2.0)
+        self._tin_dense_tol.setRange(0.02, 0.50)
         self._tin_dense_tol.setDecimals(2)
-        self._tin_dense_tol.setValue(0.40)
+        self._tin_dense_tol.setValue(0.10)
         self._tin_dense_tol.setSuffix(" m")
         self._tin_dense_tol.setToolTip(
-            "Max perpendicular distance above the final TIN for unclassified points to be accepted."
+            "Strict vertical tolerance to ground TIN facet for densification. "
+            "Vague, noisy, or elevated vegetation points are strictly left unclassified."
         )
+        self._tin_full_density.toggled.connect(self._tin_dense_tol.setEnabled)
         tf.addRow("Dense Tolerance:", self._tin_dense_tol)
-
-        low_outlier_row = QHBoxLayout()
-        self._tin_remove_low_outliers = QCheckBox("Remove low outliers")
-        self._tin_remove_low_outliers.setChecked(True)
-        self._tin_remove_low_outliers.setToolTip(
-            "Post-densification cleanup that drops ground points sitting far "
-            "below their nearest ground neighbours. Automatically adapts to local slope."
-        )
-        low_outlier_row.addWidget(self._tin_remove_low_outliers)
-        self._tin_low_outlier_threshold = QDoubleSpinBox()
-        self._tin_low_outlier_threshold.setRange(0.1, 20.0)
-        self._tin_low_outlier_threshold.setDecimals(2)
-        self._tin_low_outlier_threshold.setValue(1.0)
-        self._tin_low_outlier_threshold.setSuffix(" m")
-        self._tin_low_outlier_threshold.setToolTip(
-            "A point is a low outlier when it is more than this far below the "
-            "local terrain trend of its nearest ground neighbours (slope-adjusted)."
-        )
-        low_outlier_row.addWidget(self._tin_low_outlier_threshold)
-        low_outlier_row.addStretch()
-        tf.addRow(low_outlier_row)
 
         self._tin_group.setVisible(False)
         layout.addWidget(self._tin_group)
@@ -879,14 +889,9 @@ class GroundClassifyDialog(QDialog):
         self._as_terrain_angle = QDoubleSpinBox()
         self._as_terrain_angle.setRange(10.0, 90.0)
         self._as_terrain_angle.setDecimals(1)
-        self._as_terrain_angle.setValue(88.0)
+        self._as_terrain_angle.setValue(60.0)
         self._as_terrain_angle.setSuffix("°")
         asf.addRow("Max Terrain Angle:", self._as_terrain_angle)
-        self._as_exclude_single_returns_water = QCheckBox(
-            "Exclude single returns in water (bathy bed-only)"
-        )
-        self._as_exclude_single_returns_water.setChecked(True)
-        asf.addRow(self._as_exclude_single_returns_water)
         self._alpha_shape_group.setVisible(False)
         layout.addWidget(self._alpha_shape_group)
 
@@ -923,34 +928,103 @@ class GroundClassifyDialog(QDialog):
         self._egs_max_iter.setRange(10, 500)
         self._egs_max_iter.setValue(50)
         csff.addRow("Max Iterations:", self._egs_max_iter)
-        self._egs_exclude_single_returns_water = QCheckBox(
-            "Exclude single returns in water (bathy bed-only)"
-        )
-        self._egs_exclude_single_returns_water.setChecked(True)
-        csff.addRow(self._egs_exclude_single_returns_water)
         self._egs_csf_group.setVisible(False)
         layout.addWidget(self._egs_csf_group)
 
+        # Step-Down PTD params
+        self._stepdown_group = QGroupBox("Step-Down PTD Parameters")
+        lgf = QFormLayout(self._stepdown_group)
+
+        self._stepdown_preset_combo = QComboBox()
+        self._stepdown_preset_combo.addItem("Embankments & River Corridors (step 3m, sub 6, bulge 1.5m)", "river")
+        self._stepdown_preset_combo.addItem("Nature & Undulating (step 5m, sub 5, bulge 1.0m)", "nature")
+        self._stepdown_preset_combo.addItem("Steep Hills & Mountains (step 1.5m, sub 7, bulge 1.5m)", "steep")
+        self._stepdown_preset_combo.addItem("Town & Low Density (step 10m, sub 4, bulge 1.5m)", "town")
+        self._stepdown_preset_combo.addItem("City & Large Warehouses (step 25m, sub 4, bulge 1.5m)", "city")
+        self._stepdown_preset_combo.addItem("Custom", "custom")
+        self._stepdown_preset_combo.currentIndexChanged.connect(self._on_stepdown_preset_changed)
+        lgf.addRow("Terrain Preset:", self._stepdown_preset_combo)
+
+        self._stepdown_step = QDoubleSpinBox()
+        self._stepdown_step.setRange(0.5, 100.0)
+        self._stepdown_step.setDecimals(1)
+        self._stepdown_step.setValue(3.0)
+        self._stepdown_step.setSuffix(" m")
+        self._stepdown_step.setToolTip("Initial coarse grid resolution. 3m for riverbanks, 5m for nature, 25m for city.")
+        lgf.addRow("Initial Step Size:", self._stepdown_step)
+
+        self._stepdown_sub = QSpinBox()
+        self._stepdown_sub.setRange(1, 10)
+        self._stepdown_sub.setValue(6)
+        self._stepdown_sub.setToolTip("Number of multi-scale step-down substeps. Higher = finer detail on steep slopes.")
+        lgf.addRow("Substeps:", self._stepdown_sub)
+
+        bulge_box = QHBoxLayout()
+        self._stepdown_bulge = QDoubleSpinBox()
+        self._stepdown_bulge.setRange(0.0, 10.0)
+        self._stepdown_bulge.setDecimals(2)
+        self._stepdown_bulge.setValue(1.50)
+        self._stepdown_bulge.setSuffix(" m")
+        self._stepdown_bulge.setToolTip("Max allowable elevation rise when curving the TIN across ridges/slopes.")
+        bulge_box.addWidget(self._stepdown_bulge)
+
+        self._stepdown_bulge_auto = QCheckBox("Auto (step/10)")
+        self._stepdown_bulge_auto.setToolTip("When checked, bulge is automatically calculated as step / 10 clamped into [1.0, 2.0]m.")
+        self._stepdown_bulge_auto.toggled.connect(lambda checked: self._stepdown_bulge.setEnabled(not checked))
+        bulge_box.addWidget(self._stepdown_bulge_auto)
+        lgf.addRow("Bulge Allowance:", bulge_box)
+
+        self._stepdown_offset = QDoubleSpinBox()
+        self._stepdown_offset.setRange(0.01, 2.0)
+        self._stepdown_offset.setDecimals(2)
+        self._stepdown_offset.setValue(0.10)
+        self._stepdown_offset.setSuffix(" m")
+        self._stepdown_offset.setToolTip("Base elevation inclusion tolerance above bulged ground surface. Scales dynamically with slope.")
+        lgf.addRow("Offset Tolerance:", self._stepdown_offset)
+
+        self._stepdown_spike = QDoubleSpinBox()
+        self._stepdown_spike.setRange(0.0, 10.0)
+        self._stepdown_spike.setDecimals(2)
+        self._stepdown_spike.setValue(1.0)
+        self._stepdown_spike.setSuffix(" m")
+        self._stepdown_spike.setToolTip("Up-spike removal threshold. Filters building roofs and tree tops from coarse seeds.")
+        lgf.addRow("Up-Spike Threshold:", self._stepdown_spike)
+
+        self._stepdown_spike_down = QDoubleSpinBox()
+        self._stepdown_spike_down.setRange(0.0, 10.0)
+        self._stepdown_spike_down.setDecimals(2)
+        self._stepdown_spike_down.setValue(1.0)
+        self._stepdown_spike_down.setSuffix(" m")
+        self._stepdown_spike_down.setToolTip("Down-spike removal threshold. Filters low pits and multipath noise.")
+        lgf.addRow("Down-Spike Threshold:", self._stepdown_spike_down)
+
+        self._stepdown_refine = QSpinBox()
+        self._stepdown_refine.setRange(0, 20)
+        self._stepdown_refine.setValue(2)
+        self._stepdown_refine.setToolTip("Progressive refinement passes. Automatically early-terminates when surface converges.")
+        lgf.addRow("Refinement Loops:", self._stepdown_refine)
+
+        self._stepdown_all_returns = QCheckBox("Consider all returns")
+        self._stepdown_all_returns.setChecked(False)
+        self._stepdown_all_returns.setToolTip("Default behavior (unchecked) considers only last returns for bare-earth seeding, preventing water surface and tree crown infiltration.")
+        lgf.addRow("", self._stepdown_all_returns)
+
+        self._stepdown_group.setVisible(True)
+        layout.addWidget(self._stepdown_group)
+
         # Info
         info = QLabel(
-            "<b>SMRF</b> (PDAL): fast, good for most terrain. "
-            "Uses progressive morphological opening.\n\n"
-            "<b>EP-PTD</b> (Axelsson + edge controls): iterative, "
-            "preserves sharp terrain breaks (cliffs, riverbanks).\n\n"
-            "<b>APTD</b> (AGPTD): adaptive two-level grid + outlier removal, "
-            "good for low points and disconnected/steep terrain. "
-            "<i>Slowest method on large tiles — prefer H-PTD or SMRF when "
-            "processing speed matters.</i>\n\n"
-            "<b>H-PTD</b> (FPTD): sliding-window seeds + signed/relative "
-            "criteria — faster, robust on steep slopes.\n\n"
-            "<b>DL-Hybrid PTD</b>: seeds the TIN from Pointcept's ground "
-            "predictions (class 2) and refines geometrically — use after "
-            "Pointcept classification with source class <b>1 &amp; 2</b> "
-            "(selected automatically).\n\n"
-            "<b>River data:</b> keep <i>Max Terrain Angle</i> at 88-90° to "
-            "classify steep embankments and riverbanks. Enable "
-            "<i>Exclude single returns in water</i> for bathy bed-only "
-            "classification."
+            "<b>Step-Down PTD</b>: recommended bare-earth extractor. "
+            "Multi-scale step-down progressive TIN densification with normal bulge "
+            "and slope-adaptive offset tracking — captures river embankments, levee crests, "
+            "and complex topography without leaving true ground trapped in Class 1.\n\n"
+            "<b>EP-PTD</b> (Axelsson + edge controls): iterative progressive TIN densification, "
+            "preserves sharp terrain breaks.\n\n"
+            "<b>SMRF</b> (PDAL): fast, morphological opening filter for flat or gentle terrain.\n\n"
+            "<b>APTD</b> (AGPTD): adaptive two-level grid + outlier removal.\n\n"
+            "<b>H-PTD</b> (FPTD): sliding-window seeds + signed/relative criteria.\n\n"
+            "<b>DL-Hybrid PTD</b>: seeds the TIN from Pointcept's ground predictions (class 2) "
+            "and refines geometrically."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -986,8 +1060,79 @@ class GroundClassifyDialog(QDialog):
         spin.setSpecialValueText(auto_text)
         return spin
 
+    def _on_stepdown_preset_changed(self):
+        preset = self._stepdown_preset_combo.currentData()
+        if preset == "river":
+            self._stepdown_step.setValue(3.0)
+            self._stepdown_sub.setValue(6)
+            self._stepdown_bulge_auto.setChecked(False)
+            self._stepdown_bulge.setValue(1.50)
+            self._stepdown_offset.setValue(0.10)
+            self._stepdown_spike.setValue(1.0)
+            self._stepdown_spike_down.setValue(1.0)
+        elif preset == "nature":
+            self._stepdown_step.setValue(5.0)
+            self._stepdown_sub.setValue(5)
+            self._stepdown_bulge_auto.setChecked(False)
+            self._stepdown_bulge.setValue(1.00)
+            self._stepdown_offset.setValue(0.10)
+            self._stepdown_spike.setValue(1.0)
+            self._stepdown_spike_down.setValue(1.0)
+        elif preset == "steep":
+            self._stepdown_step.setValue(1.5)
+            self._stepdown_sub.setValue(7)
+            self._stepdown_bulge_auto.setChecked(False)
+            self._stepdown_bulge.setValue(1.50)
+            self._stepdown_offset.setValue(0.12)
+            self._stepdown_spike.setValue(1.0)
+            self._stepdown_spike_down.setValue(1.0)
+        elif preset == "town":
+            self._stepdown_step.setValue(10.0)
+            self._stepdown_sub.setValue(4)
+            self._stepdown_bulge_auto.setChecked(False)
+            self._stepdown_bulge.setValue(1.50)
+            self._stepdown_offset.setValue(0.10)
+            self._stepdown_spike.setValue(1.0)
+            self._stepdown_spike_down.setValue(1.0)
+        elif preset == "city":
+            self._stepdown_step.setValue(25.0)
+            self._stepdown_sub.setValue(4)
+            self._stepdown_bulge_auto.setChecked(False)
+            self._stepdown_bulge.setValue(1.50)
+            self._stepdown_offset.setValue(0.10)
+            self._stepdown_spike.setValue(1.5)
+            self._stepdown_spike_down.setValue(1.5)
+
+    def _on_tin_preset_changed(self):
+        preset = self._tin_preset_combo.currentData()
+        if preset == "flat":
+            self._tin_dist.setValue(0.50)
+            self._tin_angle.setValue(6.0)
+            self._tin_seed_res.setValue(10.0)
+            self._tin_spacing.setValue(0.50)
+            self._tin_dense_tol.setValue(0.10)
+        elif preset == "embankment":
+            self._tin_dist.setValue(1.50)
+            self._tin_angle.setValue(25.0)
+            self._tin_seed_res.setValue(5.0)
+            self._tin_spacing.setValue(0.50)
+            self._tin_dense_tol.setValue(0.20)
+        elif preset == "steep":
+            self._tin_dist.setValue(2.00)
+            self._tin_angle.setValue(30.0)
+            self._tin_seed_res.setValue(3.0)
+            self._tin_spacing.setValue(0.50)
+            self._tin_dense_tol.setValue(0.30)
+        elif preset == "urban":
+            self._tin_dist.setValue(0.50)
+            self._tin_angle.setValue(6.0)
+            self._tin_seed_res.setValue(25.0)
+            self._tin_spacing.setValue(0.50)
+            self._tin_dense_tol.setValue(0.10)
+
     def _on_method_changed(self):
         method = self._method_combo.currentData()
+        self._stepdown_group.setVisible(method == "stepdown")
         self._smrf_group.setVisible(method == "smrf")
         self._tin_group.setVisible(method == "epptd")
         self._aptd_group.setVisible(method == "aptd")
@@ -1007,6 +1152,17 @@ class GroundClassifyDialog(QDialog):
 
     def _collect_params(self, method: str) -> dict:
         """Build the algorithm parameter dict from the current widgets."""
+        if method == "stepdown":
+            return {
+                "step": self._stepdown_step.value(),
+                "sub_steps": self._stepdown_sub.value(),
+                "bulge": None if self._stepdown_bulge_auto.isChecked() else self._stepdown_bulge.value(),
+                "offset": self._stepdown_offset.value(),
+                "spike": self._stepdown_spike.value(),
+                "spike_down": self._stepdown_spike_down.value(),
+                "refine_loops": self._stepdown_refine.value(),
+                "all_returns": self._stepdown_all_returns.isChecked(),
+            }
         if method == "smrf":
             return {
                 "slope_threshold": self._smrf_slope.value(),
@@ -1059,9 +1215,7 @@ class GroundClassifyDialog(QDialog):
                 "medium_alpha": self._as_med_alpha.value(),
                 "fine_alpha": self._as_fine_alpha.value(),
                 "max_distance": self._as_dist.value(),
-                "max_angle": self._as_angle.value(),
                 "max_terrain_angle": self._as_terrain_angle.value(),
-                "exclude_single_returns_in_water": self._as_exclude_single_returns_water.isChecked(),
             }
         if method == "egs_csf":
             return {
@@ -1070,19 +1224,17 @@ class GroundClassifyDialog(QDialog):
                 "class_threshold": self._egs_class_thresh.value(),
                 "gradient_factor": self._egs_grad_factor.value(),
                 "max_iterations": self._egs_max_iter.value(),
-                "exclude_single_returns_in_water": self._egs_exclude_single_returns_water.isChecked(),
             }
         # epptd (and legacy "tin")
         return {
             "max_distance": self._tin_dist.value(),
             "max_angle": self._tin_angle.value(),
             "seed_resolution": self._tin_seed_res.value(),
-            "spacing": self._tin_spacing.value() if self._tin_spacing.value() > 0 else None,
-            "follow_surface_trend": self._tin_follow_terrain.isChecked(),
-            "dense": self._tin_dense.isChecked(),
+            "spacing": self._tin_spacing.value() if self._tin_spacing.value() > 0 else 0.50,
+            "buffer_size": self._tin_buffer_size.value(),
+            "max_iter": self._tin_max_iter.value(),
+            "dense": self._tin_full_density.isChecked(),
             "dense_tolerance": self._tin_dense_tol.value(),
-            "remove_low_outliers": self._tin_remove_low_outliers.isChecked(),
-            "low_outlier_threshold": self._tin_low_outlier_threshold.value(),
         }
 
     def _on_run(self):

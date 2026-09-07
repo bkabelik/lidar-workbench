@@ -16,13 +16,15 @@ from __future__ import annotations
 
 import numpy as np
 
-from ground import ground_classify_epptd, ground_classify_epptd_two_pass
+from ground import (
+    ground_classify_epptd,
+    ground_classify_epptd_two_pass,
+    ground_classify_stepdown,
+)
 
-RNG = np.random.default_rng(7)
-
-
-def _make_scene(include_scatter: bool = False):
+def _make_scene(include_scatter: bool = False, seed: int = 7):
     """Return points and per-point labels for a synthetic river valley."""
+    RNG = np.random.default_rng(seed)
     xs = []
     ys = []
     zs = []
@@ -101,7 +103,7 @@ def test_two_pass_rejects_water_and_keeps_bed():
         & (data["y"] >= 52.0) & (data["y"] <= 68.0)
     )
 
-    # Old-style fine seed grid with the lidR-faithful sparse core: a
+    # Old-style fine seed grid with sparse core: a
     # meaningful share of the water surface still becomes ground (seeded
     # from water cells), which is exactly what the two-pass workflow fixes.
     mask_old = ground_classify_epptd(
@@ -188,3 +190,154 @@ def test_extra_byte_filter_excludes_turbidity_scatter():
     topo_dry = (data["sensor_type"] == 1) & (data["label"] == "dry")
     assert mask_filtered[topo_dry].mean() > 0.9
     assert mask_no_filter[topo_dry].mean() > 0.9
+
+
+def test_stepdown_levee_and_embankment_capture():
+    """Verify that Step-Down PTD climbs steep riverbanks and levee crests while rejecting trees."""
+    rng = np.random.default_rng(42)
+
+    # 1. Flat floodplain (Z ~ 100m)
+    n_field = 600
+    x_field = rng.uniform(0.0, 30.0, n_field)
+    y_field = rng.uniform(0.0, 50.0, n_field)
+    z_field = 100.0 + rng.normal(0.0, 0.02, n_field)
+
+    # 2. Steep parabolic levee crest (X: [30, 35], rising 2.5m, slope ~55°)
+    n_crest = 300
+    x_crest = rng.uniform(30.0, 35.0, n_crest)
+    y_crest = rng.uniform(0.0, 50.0, n_crest)
+    z_crest = 100.0 + 2.5 * (1.0 - ((x_crest - 33.0) / 2.5)**2) + rng.normal(0.0, 0.02, n_crest)
+
+    # 3. Steep riverbank (X: [35, 45], dropping from 100m to 94m, slope ~31°)
+    n_bank = 500
+    x_bank = rng.uniform(35.0, 45.0, n_bank)
+    y_bank = rng.uniform(0.0, 50.0, n_bank)
+    u = (x_bank - 35.0) / 10.0
+    z_bank = 100.0 - 6.0 * u + rng.normal(0.0, 0.02, n_bank)
+
+    # 4. Riverbed (X: [45, 65], Z ~ 94m)
+    n_bed = 600
+    x_bed = rng.uniform(45.0, 65.0, n_bed)
+    y_bed = rng.uniform(0.0, 50.0, n_bed)
+    z_bed = 94.0 + rng.normal(0.0, 0.02, n_bed)
+
+    # 5. Non-ground tree canopy over the levee (Z: 105m to 120m)
+    n_trees = 250
+    x_trees = rng.uniform(31.0, 35.0, n_trees)
+    y_trees = rng.uniform(0.0, 50.0, n_trees)
+    z_trees = rng.uniform(105.0, 120.0, n_trees)
+
+    xs = np.concatenate([x_field, x_crest, x_bank, x_bed, x_trees])
+    ys = np.concatenate([y_field, y_crest, y_bank, y_bed, y_trees])
+    zs = np.concatenate([z_field, z_crest, z_bank, z_bed, z_trees])
+
+    is_crest = np.zeros(len(xs), dtype=bool)
+    is_crest[n_field:n_field + n_crest] = True
+
+    is_bank = np.zeros(len(xs), dtype=bool)
+    is_bank[n_field + n_crest:n_field + n_crest + n_bank] = True
+
+    is_trees = np.zeros(len(xs), dtype=bool)
+    is_trees[len(xs) - n_trees:] = True
+
+    mask = ground_classify_stepdown(
+        xs, ys, zs,
+        step=3.0,
+        sub_steps=5,
+        bulge=1.5,
+        offset=0.15,
+        spike=1.0,
+        spike_down=1.0,
+    )
+
+    crest_ratio = float(mask[is_crest].mean())
+    bank_ratio = float(mask[is_bank].mean())
+    tree_ratio = float(mask[is_trees].mean())
+
+    assert crest_ratio > 0.95, f"Levee crest missed by Step-Down PTD: {crest_ratio:.2%}"
+    assert bank_ratio > 0.95, f"Riverbank missed by Step-Down PTD: {bank_ratio:.2%}"
+    assert tree_ratio < 0.02, f"Tree points leaked into ground: {tree_ratio:.2%}"
+
+
+def test_stepdown_urban_building_rejection():
+    """Verify that Step-Down PTD with city setting (step=25m) strips large buildings."""
+    rng = np.random.default_rng(42)
+    n_ground = 2500
+    gx = rng.uniform(0.0, 100.0, n_ground)
+    gy = rng.uniform(0.0, 100.0, n_ground)
+    gz = 50.0 + rng.normal(0.0, 0.02, n_ground)
+
+    # Void beneath warehouse footprint (X: [30, 60], Y: [30, 60])
+    not_under = ~((gx >= 30.0) & (gx <= 60.0) & (gy >= 30.0) & (gy <= 60.0))
+    gx, gy, gz = gx[not_under], gy[not_under], gz[not_under]
+
+    # Warehouse roof at Z=58m (8m above ground)
+    n_bldg = 400
+    bx = rng.uniform(30.0, 60.0, n_bldg)
+    by = rng.uniform(30.0, 60.0, n_bldg)
+    bz = 58.0 + rng.normal(0.0, 0.02, n_bldg)
+
+    xs = np.concatenate([gx, bx])
+    ys = np.concatenate([gy, by])
+    zs = np.concatenate([gz, bz])
+    is_bldg = np.zeros(len(xs), dtype=bool)
+    is_bldg[len(gx):] = True
+
+    mask = ground_classify_stepdown(
+        xs, ys, zs,
+        step=25.0,
+        sub_steps=4,
+        bulge=1.5,
+        offset=0.15,
+    )
+
+    ground_ratio = float(mask[~is_bldg].mean())
+    bldg_ratio = float(mask[is_bldg].mean())
+
+    assert ground_ratio > 0.95, f"Bare earth ground lost: {ground_ratio:.2%}"
+    assert bldg_ratio == 0.0, f"Building points leaked into ground: {bldg_ratio:.2%}"
+
+
+def test_stepdown_bathy_channel_separation():
+    """Verify that Step-Down PTD correctly classifies riverbed and banks while excluding water reflections."""
+    data = _make_scene()
+    mask = ground_classify_stepdown(
+        data["x"], data["y"], data["z"],
+        step=25.0,
+        sub_steps=5,
+        bulge=1.5,
+        offset=0.15,
+    )
+    ratios = _ratios(data, mask)
+
+    assert ratios["bed"] > 0.95, f"Riverbed lost: {ratios['bed']:.2%}"
+    assert ratios["bank"] > 0.95, f"Riverbank lost: {ratios['bank']:.2%}"
+    assert ratios["dry"] > 0.95, f"Dry ground lost: {ratios['dry']:.2%}"
+    assert ratios["water"] < 0.05, f"Water surface classified as ground: {ratios['water']:.2%}"
+
+
+import unittest
+
+class TestGroundBathy(unittest.TestCase):
+    def test_two_pass(self):
+        test_two_pass_rejects_water_and_keeps_bed()
+
+    def test_densify(self):
+        test_densify_existing_ground_preserves_trusted_points()
+
+    def test_extra_byte(self):
+        test_extra_byte_filter_excludes_turbidity_scatter()
+
+    def test_stepdown_levee(self):
+        test_stepdown_levee_and_embankment_capture()
+
+    def test_stepdown_urban(self):
+        test_stepdown_urban_building_rejection()
+
+    def test_stepdown_bathy(self):
+        test_stepdown_bathy_channel_separation()
+
+
+if __name__ == "__main__":
+    unittest.main()
+

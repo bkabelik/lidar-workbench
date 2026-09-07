@@ -241,7 +241,7 @@ For Pointcept classification, a separate conda environment with PyTorch and Poin
 ## Key Design Decisions
 
 - **TIN interpolation for DTM** — preserves terrain discontinuities better than IDW-only methods, using Delaunay triangulation
-- **Max-Z for DSM** — industry standard (PDAL, LASTools) for surface models from LiDAR; avoids the "averaging" artefacts that smooth out building edges and vegetation
+- **Max-Z for DSM** — industry standard (PDAL) for surface models from LiDAR; avoids the "averaging" artefacts that smooth out building edges and vegetation
 - **ESRI ASCII Grid by default** — universal interchange format; every GIS package reads it; no GDAL dependency required
 - **Seamless tiling via master grid** — avoids the common pitfall of per-tile floating-point origin drift causing 1-pixel gaps
 - **QThread for all long operations** — import, filtering, Pointcept inference, and raster export never block the GUI
