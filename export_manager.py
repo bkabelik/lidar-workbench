@@ -12,7 +12,7 @@ DTM: Triangulated-Irregular-Network (Delaunay) interpolation of ground
      then nearest-neighbour as a last resort.
 
 DSM: Highest-point-per-cell (max-Z) from a user-selected set of ASPRS
-     classes, equivalent to PDAL ``writers.gdal`` binmode + max.
+     classes (grid binning mode: max elevation).
 
 Hillshade: Standard illumination model (azimuth 315°, altitude 45°)
      computed from the DTM or DSM raster, written as GeoTIFF (.tif).
@@ -174,7 +174,7 @@ def export_dsm(
     Export a DSM as one ESRI ASCII Grid per tile (+ optional hillshade).
 
     Each cell gets the *maximum* Z of all points from the selected
-    classes that fall inside it (PDAL binmode / max equivalent).
+    classes that fall inside it (max-elevation grid binning).
 
     Args:
         tile_points: ``{tile_id: {"x":..., "y":..., "z":..., "classification":...}}``.

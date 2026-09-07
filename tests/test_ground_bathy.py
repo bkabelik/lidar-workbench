@@ -21,6 +21,7 @@ from ground import (
     ground_classify_epptd_two_pass,
     ground_classify_stepdown,
     ground_classify_multiscale_alpha_shape,
+    ground_classify_egs_csf,
 )
 
 def _make_scene(include_scatter: bool = False, seed: int = 7):
@@ -339,6 +340,108 @@ def test_multiscale_alpha_shape_speed_and_water_rejection():
     assert ratios["water"] < 0.05, f"Water surface leaked into ground: {ratios['water']:.2%}"
 
 
+def test_egs_csf_low_point_rejection():
+    """Verify that EGS-CSF does not collapse when low noise points (pits/multipath) exist in the data."""
+    rng = np.random.default_rng(42)
+    n_ground = 2000
+    gx = rng.uniform(0.0, 50.0, n_ground)
+    gy = rng.uniform(0.0, 50.0, n_ground)
+    gz = 100.0 + 0.1 * gx + rng.normal(0.0, 0.03, n_ground)
+
+    # Inject 3 extreme subterranean noise points (10m - 100m underground)
+    low_x = np.array([15.0, 25.0, 35.0])
+    low_y = np.array([15.0, 25.0, 35.0])
+    low_z = np.array([50.0, 0.0, -100.0])
+
+    xs = np.concatenate([gx, low_x])
+    ys = np.concatenate([gy, low_y])
+    zs = np.concatenate([gz, low_z])
+
+    mask = ground_classify_egs_csf(
+        xs, ys, zs,
+        cloth_resolution=1.0,
+        rigidness=2.0,
+        class_threshold=0.30,
+        spike_down=2.5,
+    )
+
+    ground_recall = float(mask[:n_ground].mean())
+    low_points_in_ground = int(mask[n_ground:].sum())
+
+    assert ground_recall > 0.95, f"EGS-CSF collapsed due to low points: ground recall {ground_recall:.2%}"
+    assert low_points_in_ground == 0, f"Low noise points classified as ground: {low_points_in_ground}/3"
+
+
+def test_egs_csf_high_relief_and_steep_slope():
+    """Verify that EGS-CSF accurately classifies ground across 80m+ elevation relief with pits."""
+    rng = np.random.default_rng(42)
+    n_ground = 2000
+    gx = rng.uniform(0.0, 50.0, n_ground)
+    gy = rng.uniform(0.0, 50.0, n_ground)
+    # 80m slope with terrain undulation
+    gz = 100.0 + 1.6 * gx + rng.normal(0.0, 0.03, n_ground)
+
+    # Subterranean noise points
+    low_x = np.array([15.0, 25.0, 35.0])
+    low_y = np.array([15.0, 25.0, 35.0])
+    low_z = np.array([50.0, 0.0, -100.0])
+
+    xs = np.concatenate([gx, low_x])
+    ys = np.concatenate([gy, low_y])
+    zs = np.concatenate([gz, low_z])
+
+    mask = ground_classify_egs_csf(
+        xs, ys, zs,
+        cloth_resolution=1.0,
+        rigidness=2.0,
+        class_threshold=0.30,
+        gradient_factor=0.50,
+        spike_down=2.5,
+    )
+
+    ground_recall = float(mask[:n_ground].mean())
+    low_points_in_ground = int(mask[n_ground:].sum())
+
+    assert ground_recall > 0.95, f"EGS-CSF high-relief failure: ground recall {ground_recall:.2%}"
+    assert low_points_in_ground == 0, f"Low noise points classified as ground: {low_points_in_ground}/3"
+
+
+def test_egs_csf_embankment_crest_recovery():
+    """Verify EGS-CSF slope & crest post-processing captures rounded embankment crests without capturing buildings."""
+    # Synthetic terrain: 50x50m flat plain with 3m high rounded embankment
+    x = np.linspace(0, 50, 100)
+    y = np.linspace(0, 50, 100)
+    xx, yy = np.meshgrid(x, y)
+    xx = xx.ravel()
+    yy = yy.ravel()
+
+    # Embankment along y=25, rounded top
+    dist = np.abs(yy - 25.0)
+    embankment = np.maximum(0.0, 3.0 * (1.0 - (dist / 5.0) ** 2))
+    zz = 10.0 + embankment
+
+    # Add a flat building roof (8m tall) on the side
+    bld_mask = (xx >= 5) & (xx <= 15) & (yy >= 5) & (yy <= 15)
+    zz[bld_mask] = 18.0
+
+    crest_mask = dist < 1.0
+
+    mask = ground_classify_egs_csf(
+        xx, yy, zz,
+        cloth_resolution=1.0,
+        rigidness=2.0,
+        class_threshold=0.20,
+        gradient_factor=1.0,
+        slope_smooth=True,
+    )
+
+    crest_recall = float(mask[crest_mask].mean())
+    building_false_positives = float(mask[bld_mask].mean())
+
+    assert crest_recall >= 0.90, f"EGS-CSF failed to retain rounded embankment crest: {crest_recall:.2%}"
+    assert building_false_positives == 0.0, f"EGS-CSF misclassified building as ground: {building_false_positives:.2%}"
+
+
 import unittest
 
 class TestGroundBathy(unittest.TestCase):
@@ -362,6 +465,15 @@ class TestGroundBathy(unittest.TestCase):
 
     def test_malpha_shape(self):
         test_multiscale_alpha_shape_speed_and_water_rejection()
+
+    def test_egs_csf(self):
+        test_egs_csf_low_point_rejection()
+
+    def test_egs_csf_relief(self):
+        test_egs_csf_high_relief_and_steep_slope()
+
+    def test_egs_csf_crest(self):
+        test_egs_csf_embankment_crest_recovery()
 
 
 if __name__ == "__main__":

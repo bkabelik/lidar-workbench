@@ -153,6 +153,11 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
     n_source = int(source_mask.sum())
     result["n_source"] = n_source
     if n_source == 0:
+        logger.warning(
+            "Ground classification: 0 points matched source class %s (total points in tile: %d). "
+            "Please check 'Source Class' filter in the dialog.",
+            sc, n_total
+        )
         return result
 
     xs_sub = data["x"][source_mask]
@@ -255,7 +260,14 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
             time_step=params.get("time_step", 0.65),
             class_threshold=params.get("class_threshold", 0.30),
             gradient_factor=params.get("gradient_factor", 0.50),
-            max_iterations=params.get("max_iterations", 50),
+            max_iterations=params.get("max_iterations", 150),
+            spike_down=params.get("spike_down", 2.5),
+            slope_smooth=params.get("slope_smooth", True),
+            all_returns=params.get("all_returns", False),
+            return_numbers=rn_sub,
+            num_returns=nr_sub,
+            sensor_type=st_sub,
+            exclude_single_returns_in_water=params.get("exclude_single_returns_in_water", False),
         )
     elif method == "stepdown":
         existing_ground = None
@@ -560,7 +572,7 @@ class GroundClassifyDialog(QDialog):
         self._method_combo = QComboBox()
         self._method_combo.addItem("Step-Down PTD — Multi-Scale Bulged TIN", "stepdown")
         self._method_combo.addItem("EP-PTD — Progressive TIN Densification (Axelsson)", "epptd")
-        self._method_combo.addItem("SMRF — Simple Morphological Filter (PDAL)", "smrf")
+        self._method_combo.addItem("SMRF — Simple Morphological Filter (Pingel et al.)", "smrf")
         self._method_combo.addItem("APTD — Adaptive Grid PTD (AGPTD)", "aptd")
         self._method_combo.addItem("H-PTD — Hierarchical/Fast PTD (FPTD)", "hptd")
         self._method_combo.addItem("DL-Hybrid PTD — Pointcept + PTD", "dl_hybrid")
@@ -569,12 +581,20 @@ class GroundClassifyDialog(QDialog):
         self._method_combo.currentIndexChanged.connect(self._on_method_changed)
         mf.addRow("Method:", self._method_combo)
 
+        self._algo_guide_label = QLabel()
+        self._algo_guide_label.setWordWrap(True)
+        self._algo_guide_label.setStyleSheet(
+            "QLabel { background-color: palette(alternate-base); border: 1px solid palette(mid); "
+            "border-radius: 4px; padding: 6px 8px; font-size: 11px; }"
+        )
+        mf.addRow(self._algo_guide_label)
+
         # Source class filter — only reclassify points matching this class
         self._source_class_combo = QComboBox()
+        self._source_class_combo.addItem("0, 1 & 2: All Unclassified + Ground", -2)
         self._source_class_combo.addItem("2: Ground (Pointcept default)", 2)
         self._source_class_combo.addItem("0: Created, Never Classified", 0)
         self._source_class_combo.addItem("1: Unclassified", 1)
-        self._source_class_combo.addItem("0, 1 & 2: All Unclassified + Ground", -2)
         self._source_class_combo.addItem(
             "1 → 2: Densify Unclassified onto Existing Ground", -3
         )
@@ -931,8 +951,24 @@ class GroundClassifyDialog(QDialog):
         csff.addRow("Gradient Factor (β):", self._egs_grad_factor)
         self._egs_max_iter = QSpinBox()
         self._egs_max_iter.setRange(10, 500)
-        self._egs_max_iter.setValue(50)
+        self._egs_max_iter.setValue(150)
+        self._egs_max_iter.setToolTip("Maximum simulation iterations (100–150 recommended for large-relief terrain or riverbanks)")
         csff.addRow("Max Iterations:", self._egs_max_iter)
+        self._egs_spike_down = QDoubleSpinBox()
+        self._egs_spike_down.setRange(0.0, 50.0)
+        self._egs_spike_down.setDecimals(1)
+        self._egs_spike_down.setValue(2.5)
+        self._egs_spike_down.setSuffix(" m")
+        self._egs_spike_down.setToolTip("Down-spike / subterranean pit filter threshold. Suppresses low multipath noise so the cloth does not hang on underground spikes (0 to disable).")
+        csff.addRow("Down-Spike Threshold:", self._egs_spike_down)
+        self._egs_slope_smooth = QCheckBox("Slope & Embankment Crest Smoothing")
+        self._egs_slope_smooth.setChecked(True)
+        self._egs_slope_smooth.setToolTip("Snaps suspended cloth into inverted V-troughs over continuous slopes so rounded embankment crests, levees, and mounds are not cut off.")
+        csff.addRow(self._egs_slope_smooth)
+        self._egs_exclude_single_returns_water = QCheckBox("Exclude single returns in water (bathy)")
+        self._egs_exclude_single_returns_water.setChecked(False)
+        self._egs_exclude_single_returns_water.setToolTip("Drops single returns in water so shallow water is not classified as ground.")
+        csff.addRow(self._egs_exclude_single_returns_water)
         self._egs_csf_group.setVisible(False)
         layout.addWidget(self._egs_csf_group)
 
@@ -1017,19 +1053,16 @@ class GroundClassifyDialog(QDialog):
         self._stepdown_group.setVisible(True)
         layout.addWidget(self._stepdown_group)
 
-        # Info
+        # Info / Algorithm Guide
         info = QLabel(
-            "<b>Step-Down PTD</b>: recommended bare-earth extractor. "
-            "Multi-scale step-down progressive TIN densification with normal bulge "
-            "and slope-adaptive offset tracking — captures river embankments, levee crests, "
-            "and complex topography without leaving true ground trapped in Class 1.\n\n"
-            "<b>EP-PTD</b> (Axelsson + edge controls): iterative progressive TIN densification, "
-            "preserves sharp terrain breaks.\n\n"
-            "<b>SMRF</b> (PDAL): fast, morphological opening filter for flat or gentle terrain.\n\n"
-            "<b>APTD</b> (AGPTD): adaptive two-level grid + outlier removal.\n\n"
-            "<b>H-PTD</b> (FPTD): sliding-window seeds + signed/relative criteria.\n\n"
-            "<b>DL-Hybrid PTD</b>: seeds the TIN from Pointcept's ground predictions (class 2) "
-            "and refines geometrically."
+            "<b>Algorithm Guide — When & Where to Use Each Method:</b><br>"
+            "• <b>Step-Down PTD:</b> <i>Recommended for river corridors, embankments, levees, dikes, floodplains, and bathymetry.</i> Multi-scale bulged TIN snaps directly to 3D breaklines and bridges water channels without coordinate inversion.<br>"
+            "• <b>M-AlphaShape:</b> <i>Best for complex natural terrain, steep rocky cliffs, and ridges.</i> Rolling 3D alpha probes naturally hug convex peaks and steep slopes without raster aliasing.<br>"
+            "• <b>EP-PTD (Axelsson):</b> <i>Classic workhorse for standard airborne topographic surveys and rolling countryside.</i> Iterative TIN densification.<br>"
+            "• <b>EGS-CSF:</b> <i>Best for flat urban areas and large building complexes.</i> Inverted cloth simulation. <i>Avoid on narrow river embankments or dikes</i> due to cloth tension across inverted crest troughs.<br>"
+            "• <b>SMRF (Pingel et al.):</b> <i>Best for flat open plains and gentle agricultural fields where processing speed is the priority.</i><br>"
+            "• <b>APTD / H-PTD:</b> <i>Specialized for extreme mountain-valley relief (APTD) or very large point clouds where standard PTD is too slow (H-PTD).</i><br>"
+            "• <b>DL-Hybrid PTD:</b> <i>Best when Pointcept AI ground predictions (Class 2) already exist and require geometric TIN refinement.</i>"
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -1054,6 +1087,8 @@ class GroundClassifyDialog(QDialog):
         self._ok_btn = btn_box.button(QDialogButtonBox.Ok)
         btn_layout.addWidget(btn_box)
         layout.addLayout(btn_layout)
+
+        self._on_method_changed()
 
     @staticmethod
     def _make_auto_spin(maximum: float, decimals: int, auto_text: str = "Auto") -> QDoubleSpinBox:
@@ -1146,6 +1181,48 @@ class GroundClassifyDialog(QDialog):
         self._alpha_shape_group.setVisible(method == "alpha_shape")
         self._egs_csf_group.setVisible(method == "egs_csf")
 
+        guides = {
+            "stepdown": (
+                "<b>★ Recommended For:</b> River corridors, water embankments, levees, dikes, floodplains, and bathymetry.<br>"
+                "<b>How It Works:</b> Multi-scale step-down progressive TIN densification with normal bulge. Steps from coarse landscape to fine scale in true 3D.<br>"
+                "<b>Key Advantage:</b> Triangle vertices snap directly onto 3D breaklines and levee crests; zero raster aliasing; bridges water channels cleanly."
+            ),
+            "alpha_shape": (
+                "<b>★ Recommended For:</b> Natural complex terrain, steep rocky cliffs, rugged slopes, and sharp ridges.<br>"
+                "<b>How It Works:</b> Multiscale spherical 3D alpha probes (fine 2m, medium 6m, coarse 20m) rolling across the terrain from above.<br>"
+                "<b>Key Advantage:</b> True 3D geometry without planar leveling or inverted tension traps; preserves convex peaks and mounds."
+            ),
+            "epptd": (
+                "<b>★ Recommended For:</b> Standard airborne topographic LiDAR, countryside, and rolling terrain.<br>"
+                "<b>How It Works:</b> Classic Axelsson Progressive TIN Densification. Seeds lowest points in coarse cells and densifies iteratively.<br>"
+                "<b>Note:</b> Widen distance/angle tolerances if working on steep slopes or sharp ridges."
+            ),
+            "egs_csf": (
+                "<b>★ Recommended For:</b> Flat or gently rolling urban areas, industrial sites, and large building complexes.<br>"
+                "<b>How It Works:</b> Inverts point cloud (Z_inv = -Z) and drops a simulated elastic cloth with evolutionary gradient relaxation.<br>"
+                "<b>Caution:</b> <i>Unsuited for river embankments and dikes.</i> In inverted space, convex ridges become narrow trenches where cloth tension suspends the cloth below the real crest."
+            ),
+            "smrf": (
+                "<b>★ Recommended For:</b> Flat agricultural land, open floodplains, and large gentle terrain where speed is essential.<br>"
+                "<b>How It Works:</b> Simple Morphological Filter (Pingel et al. 2013). Fast raster morphological opening (erode + dilate) with progressive window growth.<br>"
+                "<b>Caution:</b> Tends to shave off steep riverbanks, narrow embankments, and sharp breaklines."
+            ),
+            "aptd": (
+                "<b>★ Recommended For:</b> Variable-density point clouds and mixed terrain containing both steep mountains and flat valleys.<br>"
+                "<b>How It Works:</b> Two-level adaptive grid with localized terrain slope adaptation and automatic outlier suppression."
+            ),
+            "hptd": (
+                "<b>★ Recommended For:</b> Very large point clouds where standard PTD is too slow, but TIN accuracy is required.<br>"
+                "<b>How It Works:</b> Hierarchical multi-resolution seed pyramid with signed-angle criteria to accelerate processing."
+            ),
+            "dl_hybrid": (
+                "<b>★ Recommended For:</b> Scenes where Pointcept deep learning has already predicted ground (Class 2).<br>"
+                "<b>How It Works:</b> Seeds the initial TIN directly from AI ground predictions and geometrically densifies unclassified points."
+            ),
+        }
+        if hasattr(self, "_algo_guide_label"):
+            self._algo_guide_label.setText(guides.get(method, ""))
+
         # DL-Hybrid needs both class 1 and class 2 in the source set:
         # class 2 is the DL ground prior, class 1 are the candidates that
         # are densified against it.  Auto-switch the default class-2-only
@@ -1229,6 +1306,9 @@ class GroundClassifyDialog(QDialog):
                 "class_threshold": self._egs_class_thresh.value(),
                 "gradient_factor": self._egs_grad_factor.value(),
                 "max_iterations": self._egs_max_iter.value(),
+                "spike_down": self._egs_spike_down.value(),
+                "slope_smooth": self._egs_slope_smooth.isChecked(),
+                "exclude_single_returns_in_water": self._egs_exclude_single_returns_water.isChecked(),
             }
         # epptd (and legacy "tin")
         return {

@@ -47,9 +47,9 @@ def ground_classify_smrf(
     """
     Simple Morphological Filter (SMRF) for ground classification.
 
-    PDAL's classic ground-filter algorithm.  Applies morphological
-    opening (erode + dilate) with progressively larger window sizes,
-    then classifies points as ground if they fall within an
+    Pingel, Clarke and McBride's (2013) classic ground-filter algorithm.
+    Applies morphological opening (erode + dilate) with progressively larger
+    window sizes, then classifies points as ground if they fall within an
     elevation threshold of the filtered surface.
 
     The slope_threshold controls how aggressively the filter removes
@@ -2442,7 +2442,14 @@ def ground_classify_egs_csf(
     time_step: float = 0.65,
     class_threshold: float = 0.30,
     gradient_factor: float = 0.50,
-    max_iterations: int = 50,
+    max_iterations: int = 150,
+    spike_down: float = 2.5,
+    slope_smooth: bool = True,
+    all_returns: bool = False,
+    return_numbers: Optional[np.ndarray] = None,
+    num_returns: Optional[np.ndarray] = None,
+    sensor_type: Optional[np.ndarray] = None,
+    exclude_single_returns_in_water: bool = False,
     progress: ProgressCB = None,
     **kwargs,
 ) -> np.ndarray:
@@ -2455,22 +2462,30 @@ def ground_classify_egs_csf(
         International Journal of Digital Earth, DOI: 10.1080/17538947.2025.2531843.
 
     Methodology:
-      1. Invert point cloud: Z_inv = max(Z) - Z.
-      2. 2D Particle Cloth Grid:
+      1. Robust Macro-Relief Leveling:
+         - Fits a robust plane trend to level steep slopes so the cloth simulation
+           operates without gravitational starvation across large elevation relief.
+      2. Invert Point Cloud: Z_inv = -Z_norm (ground at top, buildings/trees at bottom).
+      3. 2D Particle Cloth Grid:
          - Discretize 2D plane into cloth particles with spacing = cloth_resolution.
-         - Obstacle surface Z_obs = min(Z_inv) in each grid cell.
-      3. Evolutionary Gradient Adaptation:
+         - Obstacle surface Z_obs = max(Z_inv) in each grid cell (lowest real Z).
+      4. Subterranean Pit / Low-Point Outlier Suppression:
+         - A multi-cell median filter with boundary reflection suppresses subterranean
+           multipath and pit spikes so the cloth never snags on underground noise.
+      5. Evolutionary Gradient Adaptation:
          - Computes terrain gradient magnitude G(x, y) = ||grad(Z_obs)||.
-         - In flat areas: high rigidity prevents cloth from sagging into buildings/trees.
+         - In flat areas: high rigidity pins cloth taut across roofs and tree canopies.
          - In steep areas (slopes, riverbanks): dynamically relaxes rigidity so the cloth
            conforms closely to the terrain.
-      4. Particle Cloth Simulation:
-         - Gravity + collision with obstacle surface + internal spring displacement.
-         - Self-terminates when max particle movement < 5 mm.
-      5. Gradient-Adaptive Classification:
-         - True ground height Z_cloth = max(Z) - Z_c.
-         - Distance tolerance scales with local slope: h(G) = h0 * (1 + beta * G).
-         - Classifies all points within h(G) of the cloth surface as ground.
+      6. Particle Cloth Simulation & Slope Post-Processing (bSlopeSmooth):
+         - Particles that touch ground become immovable anchor pins.
+         - Spring tension pulls suspended roof particles up towards ground pins.
+         - Slope post-processing pulls suspended particles into inverted V-troughs
+           so rounded embankment crests, levees, and ridges are preserved.
+      7. Bilinear Continuous Classification:
+         - Bilinearly interpolates cloth height to exact point coordinates.
+         - Distance tolerance scales with local slope & curvature: h(G, K) = h0 * (1 + beta * (G + K)).
+         - Classifies all candidate points within h(G, K) of the cloth surface as ground.
     """
     n = len(xs)
     if n < 3:
@@ -2483,14 +2498,44 @@ def ground_classify_egs_csf(
     min_x, max_x = float(xs_f.min()), float(xs_f.max())
     min_y, max_y = float(ys_f.min()), float(ys_f.max())
 
+    # Return and water surface filtering
+    working_mask = None
+    if not all_returns:
+        working_mask = _last_return_working_mask(
+            return_numbers, num_returns, sensor_type, n, exclude_single_returns_in_water
+        )
+    if working_mask is not None:
+        grid_idx = np.flatnonzero(working_mask)
+    elif not all_returns and return_numbers is not None and num_returns is not None:
+        last_mask = np.asarray(return_numbers) == np.asarray(num_returns)
+        grid_idx = np.flatnonzero(last_mask) if last_mask.sum() >= 3 else np.arange(n)
+    else:
+        grid_idx = np.arange(n)
+
     if progress:
-        progress("EGS-CSF: initializing cloth particle grid…", 10.0)
+        progress("EGS-CSF: leveling macro-relief and initializing cloth…", 10.0)
 
-    # Step 1: Invert point cloud so ground is at the top
-    # Ground (low Z) becomes high Z_inv; buildings and trees (high Z) become low Z_inv pits
-    z_inv = -zs_f
+    # Step 1: Robust Macro-Relief Leveling (prevents gravity starvation on steep slopes)
+    p10, p90 = float(np.percentile(zs_f, 10.0)), float(np.percentile(zs_f, 90.0))
+    valid_trend = (zs_f >= p10) & (zs_f <= p90)
+    if valid_trend.sum() < 10:
+        valid_trend = np.ones(n, dtype=bool)
 
-    # Step 2: Build 2D Cloth Particle Grid
+    x_mid = (min_x + max_x) * 0.5
+    y_mid = (min_y + max_y) * 0.5
+    x_c = xs_f - x_mid
+    y_c = ys_f - y_mid
+    A_sub = np.column_stack([x_c[valid_trend], y_c[valid_trend], np.ones(valid_trend.sum())])
+    coeffs, _, _, _ = np.linalg.lstsq(A_sub, zs_f[valid_trend], rcond=None)
+    z_plane = x_c * coeffs[0] + y_c * coeffs[1] + coeffs[2]
+
+    # Normalized elevation: ground sits around ~0m across any terrain relief
+    zs_norm = zs_f - z_plane
+
+    # Step 2: Invert normalized point cloud (ground becomes upper boundary)
+    z_inv = -zs_norm
+
+    # Step 3: Build 2D Cloth Particle Grid
     cr = max(0.2, float(cloth_resolution))
     nx = max(3, int(np.ceil((max_x - min_x) / cr)) + 1)
     ny = max(3, int(np.ceil((max_y - min_y) / cr)) + 1)
@@ -2499,9 +2544,9 @@ def ground_classify_egs_csf(
     gy = np.clip(((ys_f - min_y) / cr).astype(np.int32), 0, ny - 1)
     flat_idx = gx * ny + gy
 
-    # Obstacle height in inverted space: maximum Z_inv in each cell (which is the lowest real Z)
+    # Obstacle height in inverted space: maximum Z_inv in each cell (lowest real Z)
     z_obs = np.full(nx * ny, -np.inf, dtype=np.float64)
-    np.maximum.at(z_obs, flat_idx, z_inv)
+    np.maximum.at(z_obs, flat_idx[grid_idx], z_inv[grid_idx])
     z_obs_2d = z_obs.reshape((nx, ny))
 
     # Fill empty cells (voids) with nearest neighbor interpolation
@@ -2517,71 +2562,147 @@ def ground_classify_egs_csf(
             med_val = float(np.median(z_obs_2d[~unoccupied]))
             z_obs_2d[unoccupied] = med_val
 
-    # Step 3: Evolutionary Gradient Calculation
+    # Step 4: Low-Point / Subterranean Pit Outlier Filter
+    # In inverted space, subterranean noise pits (multipath / sensor glitches) manifest
+    # as isolated tall spikes that snag the falling cloth and prevent it from reaching ground.
+    # An adaptive 15m median filter with reflection cleanly suppresses single and cluster pits.
+    if spike_down > 0:
+        from scipy.ndimage import median_filter
+        win_size = max(5, min(21, int(round(15.0 / cr))))
+        if win_size % 2 == 0:
+            win_size += 1
+        med_grid = median_filter(z_obs_2d, size=win_size, mode="reflect")
+        spike = z_obs_2d - med_grid
+        z_obs_2d = np.where(spike > float(spike_down), med_grid, z_obs_2d)
+
+    # Step 5: Evolutionary Gradient Calculation
+    # Computes true world terrain slope (re-incorporating macro plane slope)
+    # so embankments, riverbanks, and levees are detected accurately
     gz, gx_grad = np.gradient(z_obs_2d, cr)
-    grad_mag = np.sqrt(gz * gz + gx_grad * gx_grad)
+    gx_world = -gx_grad + coeffs[0]
+    gz_world = -gz + coeffs[1]
+    grad_mag = np.sqrt(gx_world * gx_world + gz_world * gz_world)
     grad_max = float(np.percentile(grad_mag, 98.0)) if grad_mag.size else 1.0
     grad_norm = np.clip(grad_mag / max(1e-3, grad_max), 0.0, 1.0)
 
-    # Adaptive rigidity: flat areas RI ~ rigidness; steep areas RI relaxed
-    base_ri = max(1.0, float(rigidness))
-    ri_2d = np.maximum(0.5, base_ri * (1.0 - 0.70 * grad_norm))
-
-    # Step 4: Iterative Cloth Simulation
+    # Step 6: Particle Cloth Simulation (Verlet Physics with Immovable Ground Pins)
     if progress:
         progress("EGS-CSF: running evolutionary cloth simulation…", 25.0)
 
-    # Initial cloth elevation at top of inverted space
-    z_cloth = np.full((nx, ny), float(np.max(z_obs_2d)) + 2.0, dtype=np.float64)
-    g = 9.8 * 0.1
-    dt = float(time_step)
+    elev_range = float(np.max(z_obs_2d) - np.min(z_obs_2d))
+    z_cloth = np.full((nx, ny), float(np.max(z_obs_2d)) + 0.10, dtype=np.float64)
+    old_z = z_cloth.copy()
+    movable = np.ones((nx, ny), dtype=bool)
+
+    time_step_f = float(time_step)
+    time_step2 = time_step_f * time_step_f
+    target_fall_steps = max(20, int(max_iterations * 0.70))
+    disp_needed = (elev_range + 2.0) / target_fall_steps
+    gravity = max(0.2, disp_needed / time_step2)
+    acc = -gravity
+
+    base_r = max(1, min(6, int(round(rigidness))))
+    singleMove1 = [0.0, 0.3, 0.51, 0.657, 0.7599, 0.83193, 0.88235]
+    doubleMove1 = [0.0, 0.3, 0.42, 0.468, 0.4872, 0.4949, 0.498]
 
     for it in range(max_iterations):
-        if progress and it % 10 == 0:
-            progress(f"EGS-CSF: cloth iteration {it+1}/{max_iterations}…", 25.0 + 50.0 * it / max_iterations)
+        if progress and it % 25 == 0:
+            progress(f"EGS-CSF: cloth iteration {it+1}/{max_iterations}…", 25.0 + 55.0 * it / max_iterations)
 
-        z_prev = z_cloth.copy()
+        temp = z_cloth.copy()
+        # Verlet integration for movable particles
+        z_cloth[movable] = z_cloth[movable] + (z_cloth[movable] - old_z[movable]) * 0.99 + acc * time_step2
+        old_z = temp
 
-        # 1. Gravity step
-        z_cloth -= g * dt
+        # Constraint relaxation: immovable ground pins pull movable roof/canopy particles up
+        for c_iter in range(base_r):
+            sm = singleMove1[min(c_iter + 1, 6)]
+            dm = doubleMove1[min(c_iter + 1, 6)]
+            for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                n_cloth = np.roll(z_cloth, shift=(di, dj), axis=(0, 1))
+                n_movable = np.roll(movable, shift=(di, dj), axis=(0, 1))
+                diff = n_cloth - z_cloth
 
-        # 2. Collision constraint with inverted surface
-        np.maximum(z_cloth, z_obs_2d, out=z_cloth)
+                both = movable & n_movable
+                z_cloth[both] += diff[both] * dm
 
-        # 3. Internal spring displacement (4-neighbor smoothing)
-        north = np.roll(z_cloth, -1, axis=0); north[-1, :] = z_cloth[-1, :]
-        south = np.roll(z_cloth, 1, axis=0);  south[0, :] = z_cloth[0, :]
-        east  = np.roll(z_cloth, -1, axis=1); east[:, -1] = z_cloth[:, -1]
-        west  = np.roll(z_cloth, 1, axis=1);  west[:, 0] = z_cloth[:, 0]
+                p1_only = movable & (~n_movable)
+                z_cloth[p1_only] += diff[p1_only] * sm
 
-        neighbor_avg = 0.25 * (north + south + east + west)
-        delta = (neighbor_avg - z_cloth) / ri_2d
+        # Collision with inverted obstacle surface
+        hit = z_cloth <= z_obs_2d
+        z_cloth[hit] = z_obs_2d[hit]
+        movable[hit] = False
 
-        # Apply displacement where particles are not resting on rigid collision
-        not_collision = z_cloth > (z_obs_2d + 1e-4)
-        z_cloth[not_collision] += delta[not_collision]
-        np.maximum(z_cloth, z_obs_2d, out=z_cloth)
-
-        max_mov = float(np.max(np.abs(z_cloth - z_prev)))
-        if max_mov < 0.005:
+        if it > target_fall_steps and float(np.max(np.abs(z_cloth - temp))) < 0.002:
             break
 
-    # Step 5: Re-inversion and Gradient-Adaptive Classification
+    # Step 6b: Slope & Embankment Crest Post-Processing (bSlopeSmooth)
+    # In inverted space (Z_inv = -Z), convex rounded ridges, levees, and mounds become
+    # deep V-shaped troughs. Internal cloth tension (rigidness) can suspend particles
+    # across the trough like a hammock, leaving the cloth hanging below the true crest in real space.
+    # Snaps suspended particles that neighbor ground pins over continuous terrain slopes
+    # back down to the obstacle surface, perfectly recovering rounded embankment crests.
+    if slope_smooth and movable.any():
+        smooth_threshold = max(0.5, cr * 1.0)
+        height_threshold = 2.5
+        for _ in range(40):
+            changed = False
+            for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                n_obs = np.roll(z_obs_2d, shift=(di, dj), axis=(0, 1))
+                n_unmovable = np.roll(~movable, shift=(di, dj), axis=(0, 1))
+                can_snap = (
+                    movable
+                    & n_unmovable
+                    & (np.abs(z_obs_2d - n_obs) <= smooth_threshold)
+                    & (np.abs(z_cloth - z_obs_2d) <= height_threshold)
+                )
+                if can_snap.any():
+                    z_cloth[can_snap] = z_obs_2d[can_snap]
+                    movable[can_snap] = False
+                    changed = True
+            if not changed:
+                break
+
+    # Step 7: Bilinear Interpolation of Cloth Elevation and Gradient-Adaptive Classification
     if progress:
         progress("EGS-CSF: classifying points with adaptive gradient threshold…", 85.0)
 
-    # True cloth elevation in original point cloud space
+    # True cloth elevation in normalized original space
     z_cloth_orig = -z_cloth
 
-    # Point-wise cloth elevation via cell sampling
-    point_cloth_z = z_cloth_orig[gx, gy]
+    # Vectorized continuous bilinear interpolation of cloth surface
+    gx_f = np.clip((xs_f - min_x) / cr, 0.0, nx - 1.0)
+    gy_f = np.clip((ys_f - min_y) / cr, 0.0, ny - 1.0)
+    c0 = np.clip(np.floor(gx_f).astype(np.int32), 0, nx - 2)
+    r0 = np.clip(np.floor(gy_f).astype(np.int32), 0, ny - 2)
+    fx = gx_f - c0
+    fy = gy_f - r0
+
+    point_cloth_norm = (
+        z_cloth_orig[c0, r0] * (1.0 - fx) * (1.0 - fy) +
+        z_cloth_orig[c0 + 1, r0] * fx * (1.0 - fy) +
+        z_cloth_orig[c0, r0 + 1] * (1.0 - fx) * fy +
+        z_cloth_orig[c0 + 1, r0 + 1] * fx * fy
+    )
+    # Restore full world elevation
+    point_cloth_world = point_cloth_norm + z_plane
     point_grad = grad_mag[gx, gy]
 
-    # Adaptive distance threshold: h(G) = h0 * (1 + beta * G)
-    h_dynamic = float(class_threshold) * (1.0 + float(gradient_factor) * np.clip(point_grad, 0.0, 3.0))
+    # Curvature / convex breakline detection: detects rounded crests and mounds where slope flattens at the peak
+    curv = np.abs(
+        np.roll(z_obs_2d, 1, 0) + np.roll(z_obs_2d, -1, 0) +
+        np.roll(z_obs_2d, 1, 1) + np.roll(z_obs_2d, -1, 1) - 4.0 * z_obs_2d
+    ) / (cr * cr)
+    point_curv = curv[gx, gy]
 
-    # Point is ground if distance to cloth is within h_dynamic
-    ground_mask = (np.abs(zs_f - point_cloth_z) <= h_dynamic) & (zs_f <= (point_cloth_z + h_dynamic))
+    # Adaptive distance threshold: h(G, K) = h0 * (1 + beta * (G + K * cr))
+    h_dynamic = float(class_threshold) * (1.0 + float(gradient_factor) * np.clip(point_grad + point_curv * cr, 0.0, 3.0))
+
+    # Point is ground if distance to cloth surface is within h_dynamic
+    ground_mask = np.abs(zs_f - point_cloth_world) <= h_dynamic
+    if working_mask is not None:
+        ground_mask = ground_mask & working_mask
 
     if progress:
         progress("EGS-CSF: done", 100.0)
