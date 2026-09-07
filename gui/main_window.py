@@ -1258,13 +1258,17 @@ class MainWindow(QMainWindow):
                                     "Please select tiles in the tile list or open a tile first.")
             return
 
-        # Determine a representative EPSG from the first tile with CRS info
+        # Determine a representative EPSG from the first tile with CRS info or project CRS
         data_epsg = None
         for tid in tile_ids:
             info = self._db.get_tile(tid)
             if info and info.get("crs_epsg"):
                 data_epsg = info.get("crs_epsg")
                 break
+        if not data_epsg and self._db:
+            proj_crs = self._db.get_project_crs()
+            if proj_crs and proj_crs.get("epsg"):
+                data_epsg = proj_crs.get("epsg")
 
         dlg = GroundControlDialog(
             {}, parent=self, data_epsg=data_epsg,
@@ -1328,27 +1332,35 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Shift Failed", str(exc))
 
     def _on_visualize_control_point(self, x: float, y: float, z: float,
-                                    label: str) -> None:
+                                    cloud_z: Optional[float] = None,
+                                    label: str = "GCP") -> None:
         """
         Navigate the 3-D view to a control point and mark it.
 
         Non-destructive: if the point is already inside the loaded point
-        cloud, the camera simply pans/zooms to it and a marker sphere is
-        dropped at ``z``.  Only when the point lies outside the current
-        view is the containing tile loaded into the 3-D view first.
+        cloud, the camera simply pans/zooms to it and a precision marker
+        and vertical error needle are dropped. Only when the point lies
+        outside the current view is the containing tile loaded into the 3-D
+        view first.
         """
         if self._db is None or self._tm is None:
             return
 
         view_3d = self._multi_view._view_3d
 
-        # Fast path — the point is already visible; just move the camera.
-        if view_3d.has_geometry and view_3d.contains_world_xy(x, y):
-            view_3d.focus_on_point(x, y, z)
-            self.set_status(
-                f"Visual check: \"{label}\" @ ({x:.2f}, {y:.2f})",
-                timeout=5000,
+        if cloud_z is not None and z is not None:
+            dz = z - cloud_z
+            status_txt = (
+                f"Visual check: \"{label}\" @ ({x:.2f}, {y:.2f}) | "
+                f"GCP Z: {z:.3f} m | Cloud Z: {cloud_z:.3f} m | ΔZ: {dz:+.3f} m"
             )
+        else:
+            status_txt = f"Visual check: \"{label}\" @ ({x:.2f}, {y:.2f}) | Z: {z:.3f} m"
+
+        # Fast path — the point is already visible; just move the camera.
+        if view_3d.has_geometry and view_3d.contains_world_xy(x, y, margin=15.0):
+            view_3d.focus_on_point(x, y, z, cloud_z=cloud_z, label=label)
+            self.set_status(status_txt, timeout=7000)
             return
 
         # The point is outside the current view — load the tile that covers it.
@@ -1356,12 +1368,23 @@ class MainWindow(QMainWindow):
             info.get("id") for info in self._db.get_tiles_in_bbox(x, y, x, y)
             if info.get("id")
         ]
-        if not tile_ids and self._editor.tile_id:
-            tile_ids = [self._editor.tile_id]
+        if not tile_ids:
+            # Check with a 10m tolerance margin
+            tile_ids = [
+                info.get("id") for info in self._db.get_tiles_in_bbox(x - 10.0, y - 10.0, x + 10.0, y + 10.0)
+                if info.get("id")
+            ]
         if not tile_ids:
             self.set_status(
-                f"Visual check: no tile covers ({x:.2f}, {y:.2f})",
-                timeout=3000,
+                f"Visual check: point \"{label}\" at ({x:.2f}, {y:.2f}) is outside all project tiles",
+                timeout=5000,
+            )
+            QMessageBox.warning(
+                self,
+                "Point Outside Project Extent",
+                f"Control point '{label}' at ({x:.2f}, {y:.2f}) does not lie within any LiDAR tile in the project.\n\n"
+                f"Please check that the coordinate system (EPSG) and column mapping (X/Y) are correct.\n"
+                f"If Easting and Northing are reversed, click '⇄ Swap X & Y' in the Ground Control dialog.",
             )
             return
 
@@ -1385,11 +1408,11 @@ class MainWindow(QMainWindow):
             data.get("classification"), data.get("intensity"),
             data.get("return_number"), data.get("point_source_id"),
         )
-        view_3d.focus_on_point(x, y, z)
+        view_3d.focus_on_point(x, y, z, cloud_z=cloud_z, label=label)
 
         self.set_status(
-            f"Visual check: \"{label}\" — opened {loaded_tid}",
-            timeout=5000,
+            f"{status_txt} — opened {loaded_tid}",
+            timeout=7000,
         )
 
     def _on_crs(self) -> None:

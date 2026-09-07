@@ -184,6 +184,7 @@ class View3D(QWidget):
 
         # Focus/GCP marker (placed by focus_on_point, distinct from pick marker)
         self._marker_pt: Optional[np.ndarray] = None  # (3,) local xyz
+        self._marker_cloud_pt: Optional[np.ndarray] = None  # (3,) local xyz of cloud surface
         self._marker_geom: Optional[str] = None
 
         # Point Info tool state (controlled externally)
@@ -303,13 +304,16 @@ class View3D(QWidget):
         self._fit_camera(xs_local, ys_local, zs_local)
         self._build_and_render(xs_local, ys_local, zs_local, np.asarray(colors, dtype=np.float64))
 
-    def focus_on_point(self, world_x: float, world_y: float, world_z: float) -> None:
+    def focus_on_point(self, world_x: float, world_y: float, world_z: float,
+                       cloud_z: Optional[float] = None, label: str = "") -> None:
         """
-        Centre the camera on a world-space point and mark it with a sphere.
+        Centre the camera on a world-space point and mark it with a precision target.
 
+        If cloud_z is provided, also marks the corresponding LiDAR cloud surface point
+        and connects them with a vertical error needle indicating the delta-Z discrepancy.
         The point is converted to the local (offset) frame of the currently
         loaded cloud, so it must be called after the cloud containing the
-        point has been loaded.  A no-op when no scene/geometry is present.
+        point has been loaded. A no-op when no scene/geometry is present.
         """
         if self._point_data is None or self._scene is None:
             return
@@ -319,16 +323,47 @@ class View3D(QWidget):
                 world_y - self._world_offset[1],
                 world_z - self._world_offset[2],
             ])
+            cloud_local = np.array([
+                world_x - self._world_offset[0],
+                world_y - self._world_offset[1],
+                cloud_z - self._world_offset[2],
+            ]) if cloud_z is not None else None
         else:
             local = np.array([world_x, world_y, world_z])
+            cloud_local = np.array([world_x, world_y, cloud_z]) if cloud_z is not None else None
 
-        # Move the orbit centre onto the point, keeping the current viewing
-        # direction and distance.
+        # Guard against wildly out-of-bounds coordinates (e.g. wrong CRS / swapped coordinates)
+        bounds = self.world_bounds()
+        if bounds is not None:
+            min_x, min_y, _min_z, max_x, max_y, _max_z = bounds
+            span = max(max_x - min_x, max_y - min_y, 100.0)
+            margin = max(500.0, span * 2.0)
+            if not (min_x - margin <= world_x <= max_x + margin and
+                    min_y - margin <= world_y <= max_y + margin):
+                logger.warning(
+                    "focus_on_point: point (%.2f, %.2f) is far outside loaded cloud bounds [%.2f..%.2f, %.2f..%.2f]",
+                    world_x, world_y, min_x, max_x, min_y, max_y,
+                )
+                return
+
+        # Move the orbit centre onto the point (or midpoint between GCP and surface)
+        self._cam_center = local if cloud_local is None else (local + cloud_local) / 2.0
+
+        # Keep current viewing angle, but adjust distance for close inspection (5 - 16m)
         offset = self._cam_eye - self._cam_center
-        self._cam_center = local
-        self._cam_eye = local + offset
+        dist = float(np.linalg.norm(offset))
+        if dist > 1e-3:
+            dir_vec = offset / dist
+        else:
+            dir_vec = np.array([0.0, -1.0, 0.7])
+            dir_vec /= np.linalg.norm(dir_vec)
+
+        inspect_dist = min(dist, 16.0)
+        inspect_dist = max(inspect_dist, 5.0)
+        self._cam_eye = self._cam_center + dir_vec * inspect_dist
 
         self._marker_pt = local
+        self._marker_cloud_pt = cloud_local
         self._show_focus_marker()
         self._render()
 
@@ -422,6 +457,7 @@ class View3D(QWidget):
         self._picked_geom = None
         self._highlight_geom = None
         self._marker_pt = None
+        self._marker_cloud_pt = None
         self._marker_geom = None
         self._world_offset = None
         # Don't touch the Open3D scene — clear_geometry can segfault if
@@ -557,6 +593,8 @@ class View3D(QWidget):
 
         # Re-add pick marker if one exists
         self._show_pick_marker()
+        # Re-add focus/GCP marker if one exists
+        self._show_focus_marker()
 
         self._render()
 
@@ -827,7 +865,7 @@ class View3D(QWidget):
         self._scene.add_geometry(self._picked_geom, sphere, mat)
 
     def _show_focus_marker(self):
-        """Add a bright sphere at the focus/GCP point location."""
+        """Add a precision survey target and error needle at the GCP / focus point."""
         if self._scene is None:
             return
         # Remove old focus marker
@@ -837,17 +875,51 @@ class View3D(QWidget):
         if self._marker_pt is None:
             return
 
-        # Size the marker as a fixed real-world object: 5 cm radius =
-        # 10 cm diameter, which is the size of a typical GCP marker/target.
-        # A camera-relative radius made the GCP look enormous and unusable
-        # for visual verification against the point cloud.
-        radius = 0.05
+        geoms = []
 
-        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=radius)
+        # 1. Precision GCP marker sphere (radius 0.06m = 12cm diameter)
+        sphere = o3d.geometry.TriangleMesh.create_sphere(radius=0.06)
         sphere.translate(self._marker_pt)
-        sphere.paint_uniform_color([1.0, 0.8, 0.0])  # bright yellow
+        sphere.paint_uniform_color([1.0, 0.82, 0.0])  # bright gold/yellow
+        geoms.append(sphere)
+
+        # 2. Horizontal survey target ring (radius 0.12m, thickness 0.01m)
+        ring = o3d.geometry.TriangleMesh.create_cylinder(radius=0.12, height=0.01)
+        ring.translate(self._marker_pt)
+        ring.paint_uniform_color([1.0, 0.82, 0.0])
+        geoms.append(ring)
+
+        # 3. If cloud surface point is provided, add surface disc and vertical error needle
+        if self._marker_cloud_pt is not None:
+            # Flat target disc at the LiDAR surface
+            surf_disc = o3d.geometry.TriangleMesh.create_cylinder(radius=0.12, height=0.01)
+            surf_disc.translate(self._marker_cloud_pt)
+            surf_disc.paint_uniform_color([0.2, 0.85, 1.0])  # cyan
+            geoms.append(surf_disc)
+
+            # Vertical connecting needle / column showing exact ΔZ
+            dz = float(self._marker_pt[2] - self._marker_cloud_pt[2])
+            height = max(abs(dz), 0.005)
+            needle = o3d.geometry.TriangleMesh.create_cylinder(radius=0.012, height=height)
+            mid_pt = (self._marker_pt + self._marker_cloud_pt) / 2.0
+            needle.translate(mid_pt)
+
+            abs_dz = abs(dz)
+            if abs_dz <= 0.05:
+                needle_col = [0.1, 0.9, 0.2]   # green (within 5cm tolerance)
+            elif abs_dz <= 0.15:
+                needle_col = [1.0, 0.75, 0.0]  # amber (moderate error 5-15cm)
+            else:
+                needle_col = [0.95, 0.15, 0.15]  # red (large error > 15cm)
+            needle.paint_uniform_color(needle_col)
+            geoms.append(needle)
+
+        # Combine all parts into single mesh
+        combined = geoms[0]
+        for g in geoms[1:]:
+            combined += g
+
         mat = o3d_render.MaterialRecord()
         mat.shader = "defaultUnlit"
-        mat.base_color = [1.0, 0.8, 0.0, 1.0]
         self._marker_geom = "_focus_marker"
-        self._scene.add_geometry(self._marker_geom, sphere, mat)
+        self._scene.add_geometry(self._marker_geom, combined, mat)

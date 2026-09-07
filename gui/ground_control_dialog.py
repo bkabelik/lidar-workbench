@@ -61,6 +61,50 @@ except ImportError:
 logger = logging.getLogger("lidar_workbench.gui.ground_control_dialog")
 
 
+def _safe_float(val: any) -> float:
+    """Parse float value, handling European decimal commas and whitespace."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip().replace(" ", "").replace(",", ".")
+    return float(s)
+
+
+class _NumericTableWidgetItem(QTableWidgetItem):
+    """QTableWidgetItem that sorts numerically by float value."""
+
+    def __init__(self, val: Optional[float], text: str = ""):
+        display_text = text if text != "" else (f"{val:.3f}" if val is not None else "N/A")
+        super().__init__(display_text)
+        self._val = val
+
+    def __lt__(self, other):
+        if isinstance(other, _NumericTableWidgetItem):
+            v1 = self._val
+            v2 = other._val
+            if v1 is None:
+                return False
+            if v2 is None:
+                return True
+            return v1 < v2
+        return super().__lt__(other)
+
+
+class _CheckboxTableWidgetItem(QTableWidgetItem):
+    """QTableWidgetItem for checkbox that sorts checked before unchecked."""
+
+    def __init__(self, checked: bool = True):
+        super().__init__()
+        self.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        self.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+
+    def __lt__(self, other):
+        if isinstance(other, QTableWidgetItem):
+            c1 = 1 if self.checkState() == Qt.Checked else 0
+            c2 = 1 if other.checkState() == Qt.Checked else 0
+            return c1 < c2
+        return super().__lt__(other)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Background worker
 # ═══════════════════════════════════════════════════════════════════════
@@ -248,45 +292,84 @@ class _GroundControlWorker(QThread):
 
     @staticmethod
     def _compare_gcp_to_surface(gx: float, gy: float, gz: float,
-                                nearby_xyz: np.ndarray):
+                                nearby_xyz: np.ndarray) -> Tuple[float, float, float]:
         """
         Compare a GCP against a robust local point-cloud surface.
 
-        Best practice (ASPRS/USGS vertical checkpoints): filter to the
-        desired class, take points within a small horizontal radius, reject
-        vertical outliers (MAD/sigma clipping), then estimate the surface —
-        a RANSAC plane on slopes, the clipped median on flat terrain — and
-        return ``(z_surface, dz, z_std)`` with ``dz = GCP Z − surface Z``.
+        Best practice (ASPRS/USGS vertical checkpoints):
+        1. Prioritize immediate neighborhood points (radius <= 1.5 m, or closest 20-50 pts).
+        2. Fit an inverse-distance-weighted (IDW) local plane centered at (gx, gy):
+           z(x, y) = z0 + a*(x - gx) + b*(y - gy)
+           where weights w_i = 1 / (d_i + 0.05)^2.
+        3. Perform robust outlier rejection on plane residuals (sigma clipping) to reject
+           vegetation / noise points while strictly preserving the true terrain slope.
+        4. Evaluate elevation at (gx, gy) -> exactly z0, eliminating slope-induced bias.
+        5. Return (z_surface, dz, z_std) with dz = gz - z_surface.
         """
         if len(nearby_xyz) < 3:
             z_med = float(np.median(nearby_xyz[:, 2])) if len(nearby_xyz) else float("nan")
             return z_med, gz - z_med, float(np.std(nearby_xyz[:, 2])) if len(nearby_xyz) else 0.0
 
-        zs = nearby_xyz[:, 2]
-        z_med = float(np.median(zs))
-        mad = float(np.median(np.abs(zs - z_med)))
-        sigma = 1.4826 * mad
-        # Vertical outlier gate: keep points within 2 robust sigma, with a
-        # small absolute floor so flat, noise-free ground is not over-clipped.
-        keep = np.abs(zs - z_med) <= max(2.0 * sigma, 0.15)
-        if keep.sum() < 3:
-            keep = np.ones(len(zs), dtype=bool)
-        inliers = nearby_xyz[keep]
+        dx = nearby_xyz[:, 0] - gx
+        dy = nearby_xyz[:, 1] - gy
+        dists = np.sqrt(dx * dx + dy * dy)
 
-        normal, _ = _GroundControlWorker._fit_ransac_plane(inliers)
-        if normal is not None and abs(normal[2]) > 0.5:
-            mean = inliers.mean(axis=0)
-            denom = normal[2]
-            z_surf = float(
-                mean[2]
-                - (normal[0] * (gx - mean[0]) + normal[1] * (gy - mean[1])) / denom
-            )
-            # Keep the fitted surface inside the observed inlier Z range.
-            z_surf = float(np.clip(z_surf, inliers[:, 2].min(), inliers[:, 2].max()))
+        # Prioritize points close to the GCP location (radius <= 1.5 m)
+        # to capture the immediate target vicinity and avoid macro-topography distortion.
+        close_mask = dists <= 1.5
+        if close_mask.sum() >= 6:
+            pts = nearby_xyz[close_mask]
+            p_dx = dx[close_mask]
+            p_dy = dy[close_mask]
+            p_dists = dists[close_mask]
         else:
-            z_surf = float(np.median(inliers[:, 2]))
+            # Fallback for sparse areas: take the closest 20 to 50 points
+            sort_idx = np.argsort(dists)
+            take = min(len(dists), max(10, min(50, len(dists))))
+            idx = sort_idx[:take]
+            pts = nearby_xyz[idx]
+            p_dx = dx[idx]
+            p_dy = dy[idx]
+            p_dists = dists[idx]
 
-        return z_surf, gz - z_surf, float(np.std(inliers[:, 2]))
+        # Weights: inverse square distance with a small floor (5 cm)
+        weights = 1.0 / (p_dists + 0.05) ** 2
+        weights /= weights.sum()
+
+        # Design matrix for local plane centered at (gx, gy):
+        # z = z0 + a*dx + b*dy
+        A = np.column_stack((np.ones_like(p_dx), p_dx, p_dy))
+        Aw = A * np.sqrt(weights[:, None])
+        zw = pts[:, 2] * np.sqrt(weights)
+
+        try:
+            beta, _, _, _ = np.linalg.lstsq(Aw, zw, rcond=None)
+            residuals = pts[:, 2] - (beta[0] + beta[1] * p_dx + beta[2] * p_dy)
+
+            # Robust residual clipping (reject vegetation / noise around the plane)
+            res_med = float(np.median(residuals))
+            res_mad = float(np.median(np.abs(residuals - res_med)))
+            sigma_res = 1.4826 * res_mad
+            inlier_mask = np.abs(residuals - res_med) <= max(2.5 * sigma_res, 0.08)
+
+            if inlier_mask.sum() >= 3 and inlier_mask.sum() < len(pts):
+                Aw_inl = Aw[inlier_mask]
+                zw_inl = zw[inlier_mask]
+                beta, _, _, _ = np.linalg.lstsq(Aw_inl, zw_inl, rcond=None)
+                residuals = pts[inlier_mask, 2] - (beta[0] + beta[1] * p_dx[inlier_mask] + beta[2] * p_dy[inlier_mask])
+                z_surf = float(beta[0])
+                std_res = float(np.std(residuals))
+            else:
+                z_surf = float(beta[0])
+                std_res = float(np.std(residuals))
+
+            # Bound fitted surface within observed inlier Z range to avoid wild extrapolation
+            z_surf = float(np.clip(z_surf, pts[:, 2].min(), pts[:, 2].max()))
+        except Exception:
+            z_surf = float(np.average(pts[:, 2], weights=weights))
+            std_res = float(np.std(pts[:, 2]))
+
+        return z_surf, gz - z_surf, std_res
 
     @staticmethod
     def _fit_plane_normal(verts: np.ndarray) -> np.ndarray:
@@ -343,23 +426,19 @@ class _GroundControlWorker(QThread):
 
 class GroundControlDialog(QDialog):
     """
-    Dialog for ground control point and roof-surface adjustment.
+    Dialog for Ground Control Point (GCP) and Roof/Surface elevation validation.
 
     Signals
     -------
     shift_applied(float, float, float):
-        Emitted when the user clicks *Apply Shift*, carrying the
-        signed (dx, dy, dz) shift in metres to add to the point cloud.
-        For GCP (Z-only), dx=0, dy=0.
-    visualize_point(float, float, float, str):
-        Emitted when the user clicks *Go To* in the visual-check
-        section: *(x, y, z, label)*.  ``z`` is the control element's
-        elevation (GCP input Z or surface centroid Z) used to place the
-        marker in the 3-D view.
+        Emitted when the user clicks 'Apply Shift'. Args: (dx, dy, dz).
+    visualize_point(float, float, float, object, str):
+        Emitted when user navigates to a GCP or surface.
+        Args: (x, y, z_gcp, z_cloud, label).
     """
 
     shift_applied = Signal(float, float, float)
-    visualize_point = Signal(float, float, float, str)
+    visualize_point = Signal(float, float, float, object, str)
 
     SEPARATORS = {
         "Comma (,)": ",",
@@ -383,6 +462,7 @@ class GroundControlDialog(QDialog):
 
         # GCP state
         self._gcp_points: List[Tuple[str, float, float, float]] = []
+        self._gcp_data_lines: List[List[str]] = []
         self._gcp_results: list = []
         self._gcp_shift: Optional[float] = None
         self._gcp_source_epsg: Optional[int] = None  # EPSG of the GCP CSV
@@ -435,9 +515,18 @@ class GroundControlDialog(QDialog):
 
         vis_layout.addLayout(nav_row)
 
+        action_row = QHBoxLayout()
         self._vis_goto_btn = QPushButton("🔍 Go To in 3-D View")
         self._vis_goto_btn.clicked.connect(self._on_vis_goto)
-        vis_layout.addWidget(self._vis_goto_btn)
+        action_row.addWidget(self._vis_goto_btn, 1)
+
+        self._vis_use_chk = QCheckBox("Use point in shift calculation")
+        self._vis_use_chk.setChecked(True)
+        self._vis_use_chk.setToolTip("Include or exclude this point from the elevation shift and statistics")
+        self._vis_use_chk.toggled.connect(self._on_vis_use_toggled)
+        action_row.addWidget(self._vis_use_chk)
+
+        vis_layout.addLayout(action_row)
 
         layout.addWidget(vis_group)
 
@@ -511,30 +600,43 @@ class GroundControlDialog(QDialog):
 
         layout.addWidget(csv_group)
 
-        # ── GCP CRS ──
-        crs_group = QGroupBox("Coordinate System")
-        crs_f = QFormLayout(crs_group)
+        # ── Coordinate System & Column Mapping ──
+        map_group = QGroupBox("2. Coordinate System & Column Mapping")
+        mf = QVBoxLayout(map_group)
+
+        crs_form = QFormLayout()
         crs_row = QHBoxLayout()
-        crs_row.addWidget(QLabel("GCP EPSG:"))
+        crs_row.addWidget(QLabel("LiDAR Data EPSG:"))
+        self._data_epsg_spin = QSpinBox()
+        self._data_epsg_spin.setRange(0, 99999)
+        self._data_epsg_spin.setSpecialValueText("Unknown (0)")
+        if self._data_epsg:
+            self._data_epsg_spin.setValue(self._data_epsg)
+        self._data_epsg_spin.setToolTip(
+            "EPSG code of the LiDAR point cloud. If unknown, specify the EPSG here (e.g. 25832, 31256, 32633)."
+        )
+        self._data_epsg_spin.valueChanged.connect(self._on_data_epsg_changed)
+        crs_row.addWidget(self._data_epsg_spin)
+
+        crs_row.addSpacing(15)
+        crs_row.addWidget(QLabel("GCP CSV EPSG:"))
         self._gcp_epsg_spin = QSpinBox()
         self._gcp_epsg_spin.setRange(0, 99999)
         self._gcp_epsg_spin.setSpecialValueText("Auto (same as data)")
         self._gcp_epsg_spin.setValue(0)
         self._gcp_epsg_spin.setToolTip(
-            "EPSG code of the GCP coordinates. Set to 0 to use the same as data. "
-            "If different from the data CRS, coordinates will be automatically transformed."
+            "EPSG code of the GCP coordinates. Set to 0 if the CSV already uses the same CRS as the LiDAR data. "
+            "If different (e.g. 4326 for WGS84 GPS coords, or 31256 for Austrian GK), set it here to auto-transform."
         )
+        self._gcp_epsg_spin.valueChanged.connect(self._on_gcp_epsg_changed)
         crs_row.addWidget(self._gcp_epsg_spin)
         crs_row.addStretch()
-        crs_f.addRow("", crs_row)
+        crs_form.addRow("CRS / EPSG:", crs_row)
+
         self._gcp_crs_info = QLabel("")
         self._gcp_crs_info.setWordWrap(True)
-        crs_f.addRow(self._gcp_crs_info)
-        layout.addWidget(crs_group)
-
-        # ── Column mapping ──
-        map_group = QGroupBox("2. Column Mapping")
-        mf = QFormLayout(map_group)
+        crs_form.addRow("", self._gcp_crs_info)
+        mf.addLayout(crs_form)
 
         col_row = QHBoxLayout()
         self._gcp_name_col = QComboBox()
@@ -550,8 +652,28 @@ class GroundControlDialog(QDialog):
         self._gcp_z_col = QComboBox()
         col_row.addWidget(QLabel("Z:"))
         col_row.addWidget(self._gcp_z_col)
+
+        self._gcp_swap_xy_btn = QPushButton("⇄ Swap X & Y")
+        self._gcp_swap_xy_btn.setToolTip("Swap X and Y columns (Easting/Northing)")
+        self._gcp_swap_xy_btn.setStyleSheet("QPushButton { font-weight: bold; padding: 3px 8px; }")
+        self._gcp_swap_xy_btn.clicked.connect(self._on_gcp_swap_xy)
+        col_row.addWidget(self._gcp_swap_xy_btn)
         col_row.addStretch()
-        mf.addRow("Columns:", col_row)
+        mf.addLayout(col_row)
+
+        # Connect combo signals
+        self._gcp_name_col.currentIndexChanged.connect(self._on_gcp_columns_changed)
+        self._gcp_x_col.currentIndexChanged.connect(self._on_gcp_columns_changed)
+        self._gcp_y_col.currentIndexChanged.connect(self._on_gcp_columns_changed)
+        self._gcp_z_col.currentIndexChanged.connect(self._on_gcp_columns_changed)
+
+        # Diagnostics & Extent feedback box
+        diag_box = QGroupBox("Coordinate & Extent Diagnostics")
+        diag_layout = QVBoxLayout(diag_box)
+        self._gcp_diag_label = QLabel("<i>Load a CSV to view coordinate alignment diagnostics.</i>")
+        self._gcp_diag_label.setWordWrap(True)
+        diag_layout.addWidget(self._gcp_diag_label)
+        mf.addWidget(diag_box)
 
         layout.addWidget(map_group)
 
@@ -602,13 +724,42 @@ class GroundControlDialog(QDialog):
         # ── Results table ──
         res_group = QGroupBox("5. Results")
         rl = QVBoxLayout(res_group)
-        self._gcp_table = QTableWidget(0, 7)
+
+        # Quick filter & outlier toolbar
+        filter_row = QHBoxLayout()
+        self._gcp_select_all_btn = QPushButton("Select All")
+        self._gcp_select_all_btn.clicked.connect(self._on_gcp_select_all)
+        filter_row.addWidget(self._gcp_select_all_btn)
+
+        self._gcp_deselect_all_btn = QPushButton("Deselect All")
+        self._gcp_deselect_all_btn.clicked.connect(self._on_gcp_deselect_all)
+        filter_row.addWidget(self._gcp_deselect_all_btn)
+
+        filter_row.addSpacing(15)
+        self._gcp_outlier_spin = QDoubleSpinBox()
+        self._gcp_outlier_spin.setRange(0.01, 50.0)
+        self._gcp_outlier_spin.setDecimals(2)
+        self._gcp_outlier_spin.setValue(0.50)
+        self._gcp_outlier_spin.setSuffix(" m")
+        self._gcp_outlier_spin.setToolTip("Elevation difference threshold for outlier filtering")
+
+        self._gcp_outlier_btn = QPushButton("Disable Outliers (|ΔZ| >)")
+        self._gcp_outlier_btn.setToolTip("Uncheck all GCP points whose absolute elevation difference |ΔZ| exceeds threshold")
+        self._gcp_outlier_btn.clicked.connect(self._on_gcp_disable_outliers)
+        filter_row.addWidget(self._gcp_outlier_btn)
+        filter_row.addWidget(self._gcp_outlier_spin)
+        filter_row.addStretch()
+        rl.addLayout(filter_row)
+
+        self._gcp_table = QTableWidget(0, 8)
         self._gcp_table.setHorizontalHeaderLabels(
-            ["Name", "X", "Y", "Z Input", "Z Cloud", "ΔZ", "Nearby pts"]
+            ["Use", "Name", "X", "Y", "Z Input", "Z Cloud", "ΔZ", "Nearby pts"]
         )
         self._gcp_table.horizontalHeader().setStretchLastSection(True)
         self._gcp_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._gcp_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._gcp_table.setSortingEnabled(True)
+        self._gcp_table.itemChanged.connect(self._on_gcp_table_item_changed)
         rl.addWidget(self._gcp_table)
 
         self._gcp_stats = QLabel("")
@@ -771,6 +922,7 @@ class GroundControlDialog(QDialog):
                                 y_combo: QComboBox,
                                 z_combo: QComboBox):
         for cb in (name_combo, x_combo, y_combo, z_combo):
+            cb.blockSignals(True)
             cb.clear()
             cb.addItem("(none)", -1)
         for i, col in enumerate(header):
@@ -779,17 +931,19 @@ class GroundControlDialog(QDialog):
             x_combo.addItem(col_clean, i)
             y_combo.addItem(col_clean, i)
             z_combo.addItem(col_clean, i)
-        # Auto-detect
+        # Auto-detect including German/survey aliases
         for i, col in enumerate(header):
-            low = col.strip().lower().strip('"').strip("'")
-            if low in ("name", "id", "label", "point", "point_name"):
+            low = col.strip().lower().strip('"').strip("'").replace(" ", "_")
+            if low in ("name", "id", "label", "point", "point_name", "pkt", "punkt", "punktnummer", "punkt_nr", "pn", "nr", "station", "target"):
                 name_combo.setCurrentIndex(i + 1)
-            elif low in ("x", "easting", "east", "lon", "longitude"):
+            elif low in ("x", "easting", "east", "lon", "longitude", "rw", "rechts", "rechtswert", "e", "ost", "ostwert"):
                 x_combo.setCurrentIndex(i + 1)
-            elif low in ("y", "northing", "north", "lat", "latitude"):
+            elif low in ("y", "northing", "north", "lat", "latitude", "hw", "hoch", "hochwert", "n", "nord", "nordwert"):
                 y_combo.setCurrentIndex(i + 1)
-            elif low in ("z", "elev", "elevation", "height", "alt", "altitude"):
+            elif low in ("z", "elev", "elevation", "height", "alt", "altitude", "h", "hoehe", "höhe", "kot", "kote"):
                 z_combo.setCurrentIndex(i + 1)
+        for cb in (name_combo, x_combo, y_combo, z_combo):
+            cb.blockSignals(False)
 
     # ── Browse GCP CSV ───────────────────────────────────────────────
 
@@ -822,7 +976,7 @@ class GroundControlDialog(QDialog):
         numeric_count = 0
         for f in fields:
             try:
-                float(f.strip().replace(",", "."))
+                _safe_float(f)
                 numeric_count += 1
             except ValueError:
                 pass
@@ -859,7 +1013,6 @@ class GroundControlDialog(QDialog):
             return
 
         # ── Auto-detect header vs data ──
-        # If the first line looks like numeric data, it's probably NOT a header
         first_line_is_data = self._line_looks_like_data(parsed_lines[0])
         if first_line_is_data and self._gcp_has_header.isChecked():
             self._gcp_has_header.setChecked(False)
@@ -875,10 +1028,11 @@ class GroundControlDialog(QDialog):
             header = parsed_lines[0]
             data_lines = parsed_lines[1:]
         else:
-            # Generate synthetic header: "Col 0", "Col 1", ...
             n_cols = max(len(fl) for fl in parsed_lines)
             header = [f"Col {i}" for i in range(n_cols)]
-            data_lines = parsed_lines  # all lines are data
+            data_lines = parsed_lines
+
+        self._gcp_data_lines = data_lines
 
         self._populate_column_combos(
             header,
@@ -889,40 +1043,78 @@ class GroundControlDialog(QDialog):
         # If auto-detection failed (no X/Y/Z columns matched), use positional defaults
         if self._gcp_x_col.currentData() is None or self._gcp_x_col.currentData() < 0:
             n_cols = len(header)
+            self._gcp_name_col.blockSignals(True)
+            self._gcp_x_col.blockSignals(True)
+            self._gcp_y_col.blockSignals(True)
+            self._gcp_z_col.blockSignals(True)
             if n_cols >= 4:
-                # Standard layout: Name, X, Y, Z
                 self._gcp_name_col.setCurrentIndex(1)  # Col 0 → Name
                 self._gcp_x_col.setCurrentIndex(2)     # Col 1 → X
                 self._gcp_y_col.setCurrentIndex(3)     # Col 2 → Y
                 self._gcp_z_col.setCurrentIndex(4)     # Col 3 → Z
             elif n_cols == 3:
-                # X, Y, Z only — name will be auto-numbered
                 self._gcp_x_col.setCurrentIndex(1)     # Col 0 → X
                 self._gcp_y_col.setCurrentIndex(2)     # Col 1 → Y
                 self._gcp_z_col.setCurrentIndex(3)     # Col 2 → Z
+            self._gcp_name_col.blockSignals(False)
+            self._gcp_x_col.blockSignals(False)
+            self._gcp_y_col.blockSignals(False)
+            self._gcp_z_col.blockSignals(False)
 
-        # Read points (store in memory for later use)
+        self._update_gcp_points_from_combos()
+
+    def _on_gcp_swap_xy(self):
+        """Swap selected X and Y columns."""
+        x_idx = self._gcp_x_col.currentIndex()
+        y_idx = self._gcp_y_col.currentIndex()
+        self._gcp_x_col.blockSignals(True)
+        self._gcp_y_col.blockSignals(True)
+        self._gcp_x_col.setCurrentIndex(y_idx)
+        self._gcp_y_col.setCurrentIndex(x_idx)
+        self._gcp_x_col.blockSignals(False)
+        self._gcp_y_col.blockSignals(False)
+        self._update_gcp_points_from_combos()
+
+    def _on_gcp_columns_changed(self):
+        self._update_gcp_points_from_combos()
+
+    def _on_data_epsg_changed(self, val: int):
+        self._data_epsg = val if val > 0 else None
+        self._update_coordinate_diagnostics()
+
+    def _on_gcp_epsg_changed(self, val: int):
+        self._update_coordinate_diagnostics()
+
+    def _update_gcp_points_from_combos(self):
+        """Parse GCP points from stored CSV data lines using current column combo selection."""
+        if not hasattr(self, "_gcp_data_lines") or not self._gcp_data_lines:
+            return
+
+        name_idx = self._gcp_name_col.currentData()
+        x_idx = self._gcp_x_col.currentData()
+        y_idx = self._gcp_y_col.currentData()
+        z_idx = self._gcp_z_col.currentData()
+
         self._gcp_points = []
+        if x_idx is None or y_idx is None or z_idx is None or x_idx < 0 or y_idx < 0 or z_idx < 0:
+            self._gcp_run_btn.setEnabled(False)
+            self._update_coordinate_diagnostics()
+            return
+
         auto_name = 0
-        for row in data_lines:
+        for row in self._gcp_data_lines:
             if not row or all(c.strip() == "" for c in row):
                 continue
-            name_idx = self._gcp_name_col.currentData()
-            x_idx = self._gcp_x_col.currentData()
-            y_idx = self._gcp_y_col.currentData()
-            z_idx = self._gcp_z_col.currentData()
-
-            if x_idx is None or y_idx is None or z_idx is None or x_idx < 0 or y_idx < 0 or z_idx < 0:
+            if max(x_idx, y_idx, z_idx) >= len(row):
                 continue
-
             try:
-                gx = float(row[x_idx])
-                gy = float(row[y_idx])
-                gz = float(row[z_idx])
+                gx = _safe_float(row[x_idx])
+                gy = _safe_float(row[y_idx])
+                gz = _safe_float(row[z_idx])
             except (ValueError, IndexError):
                 continue
 
-            if name_idx is not None and name_idx >= 0 and name_idx < len(row):
+            if name_idx is not None and 0 <= name_idx < len(row) and row[name_idx].strip():
                 name = row[name_idx].strip()
             else:
                 auto_name += 1
@@ -932,9 +1124,117 @@ class GroundControlDialog(QDialog):
 
         self._gcp_run_btn.setEnabled(len(self._gcp_points) > 0)
         self._status.setText(f"Loaded {len(self._gcp_points)} GCPs from CSV")
+        self._update_coordinate_diagnostics()
 
-        # Update CRS info label
+    def _get_lidar_extent(self) -> Optional[Tuple[float, float, float, float, float, float]]:
+        """Return (min_x, max_x, min_y, max_y, min_z, max_z) of available LiDAR data."""
+        if self._data and "x" in self._data and len(self._data["x"]) > 0:
+            xs = self._data["x"]
+            ys = self._data["y"]
+            zs = self._data["z"]
+            return (float(np.min(xs)), float(np.max(xs)),
+                    float(np.min(ys)), float(np.max(ys)),
+                    float(np.min(zs)), float(np.max(zs)))
+        if self._db:
+            try:
+                tiles = []
+                if self._tile_ids:
+                    for tid in self._tile_ids:
+                        t = self._db.get_tile(tid)
+                        if t:
+                            tiles.append(t)
+                if not tiles:
+                    tiles = self._db.get_all_tiles()
+                if tiles:
+                    valid_xs = [t["min_x"] for t in tiles if t.get("min_x") is not None]
+                    valid_max_xs = [t["max_x"] for t in tiles if t.get("max_x") is not None]
+                    valid_ys = [t["min_y"] for t in tiles if t.get("min_y") is not None]
+                    valid_max_ys = [t["max_y"] for t in tiles if t.get("max_y") is not None]
+                    valid_zs = [t["min_z"] for t in tiles if t.get("min_z") is not None]
+                    valid_max_zs = [t["max_z"] for t in tiles if t.get("max_z") is not None]
+                    if valid_xs and valid_max_xs and valid_ys and valid_max_ys:
+                        min_x = min(valid_xs)
+                        max_x = max(valid_max_xs)
+                        min_y = min(valid_ys)
+                        max_y = max(valid_max_ys)
+                        min_z = min(valid_zs) if valid_zs else 0.0
+                        max_z = max(valid_max_zs) if valid_max_zs else 0.0
+                        return (min_x, max_x, min_y, max_y, min_z, max_z)
+            except Exception as e:
+                logger.debug("Failed to calculate lidar extent from db: %s", e)
+        return None
+
+    def _update_coordinate_diagnostics(self):
+        """Update live coordinate status, bounds, and alignment warnings."""
         self._update_gcp_crs_info()
+
+        if not hasattr(self, "_gcp_diag_label"):
+            return
+
+        if not self._gcp_points:
+            self._gcp_diag_label.setText("<i>Load a CSV and map columns to view coordinate diagnostics.</i>")
+            return
+
+        coords = self._get_gcp_coords_to_use()
+        if not coords:
+            return
+
+        g_xs = [p[1] for p in coords]
+        g_ys = [p[2] for p in coords]
+        g_zs = [p[3] for p in coords]
+
+        g_min_x, g_max_x = min(g_xs), max(g_xs)
+        g_min_y, g_max_y = min(g_ys), max(g_ys)
+        g_min_z, g_max_z = min(g_zs), max(g_zs)
+
+        lidar_ext = self._get_lidar_extent()
+
+        lines = []
+        s_name, s_x, s_y, s_z = coords[0]
+        lines.append(f"<b>Sample Point 1 ('{s_name}'):</b> X = {s_x:.3f}, &nbsp; Y = {s_y:.3f}, &nbsp; Z = {s_z:.3f}")
+        lines.append(f"<b>GCP Extent ({len(coords)} pts):</b> X: [{g_min_x:.1f} .. {g_max_x:.1f}], &nbsp; Y: [{g_min_y:.1f} .. {g_max_y:.1f}], &nbsp; Z: [{g_min_z:.1f} .. {g_max_z:.1f}]")
+
+        if lidar_ext:
+            l_min_x, l_max_x, l_min_y, l_max_y, l_min_z, l_max_z = lidar_ext
+            lines.append(f"<b>LiDAR Extent:</b> X: [{l_min_x:.1f} .. {l_max_x:.1f}], &nbsp; Y: [{l_min_y:.1f} .. {l_max_y:.1f}], &nbsp; Z: [{l_min_z:.1f} .. {l_max_z:.1f}]")
+
+            # Check 1: Degrees?
+            if (-180.0 <= g_min_x <= 180.0 and -180.0 <= g_max_x <= 180.0 and
+                -90.0 <= g_min_y <= 90.0 and -90.0 <= g_max_y <= 90.0 and
+                (abs(l_max_x) > 1000.0 or abs(l_max_y) > 1000.0)):
+                lines.append(
+                    "<span style='color:#e67e22; font-weight:bold;'>"
+                    "⚠ GCP coordinates appear to be Geographic Lat/Lon in degrees! "
+                    "Enter 4326 in 'GCP CSV EPSG' above to auto-transform to projected LiDAR coordinates.</span>"
+                )
+            # Check 2: Swapped X/Y?
+            elif (l_min_x - 5000.0 <= g_min_y <= l_max_x + 5000.0 and
+                  l_min_y - 5000.0 <= g_min_x <= l_max_y + 5000.0 and
+                  not (l_min_x - 5000.0 <= g_min_x <= l_max_x + 5000.0)):
+                lines.append(
+                    "<span style='color:#e74c3c; font-weight:bold;'>"
+                    "⚠ Coordinates appear SWAPPED (Easting in Y column, Northing in X column)! "
+                    "Click <b>'⇄ Swap X & Y'</b> above.</span>"
+                )
+            else:
+                in_bounds = sum(
+                    1 for _, x, y, _ in coords
+                    if (l_min_x - 50.0 <= x <= l_max_x + 50.0 and l_min_y - 50.0 <= y <= l_max_y + 50.0)
+                )
+                if in_bounds > 0:
+                    lines.append(
+                        f"<span style='color:#27ae60; font-weight:bold;'>"
+                        f"✓ Coordinate overlap verified: {in_bounds}/{len(coords)} GCPs fall inside LiDAR project area.</span>"
+                    )
+                else:
+                    lines.append(
+                        "<span style='color:#c0392b; font-weight:bold;'>"
+                        "❌ No overlap! GCPs are outside the LiDAR project bounds. Check EPSG codes, column mappings, or use '⇄ Swap X & Y'.</span>"
+                    )
+        else:
+            lines.append("<i>LiDAR extent unavailable for bounding box verification.</i>")
+
+        self._gcp_diag_label.setText("<br>".join(lines))
 
     def _on_gcp_sep_changed(self):
         self._gcp_custom_sep.setVisible(
@@ -951,34 +1251,33 @@ class GroundControlDialog(QDialog):
     def _update_gcp_crs_info(self):
         """Update the CRS info label showing transform status."""
         gcp_epsg = self._gcp_epsg_spin.value()
-        data_epsg = self._data_epsg
+        data_epsg = self._data_epsg_spin.value() if hasattr(self, "_data_epsg_spin") and self._data_epsg_spin.value() > 0 else self._data_epsg
 
         if not data_epsg:
             self._gcp_crs_info.setText(
-                "⚠ Data CRS unknown — cannot auto-transform. "
-                "Assign a CRS to the tile first (Tools → Coordinate Systems)."
+                "⚠ LiDAR Data CRS unknown. If your GCPs need reprojection, enter the LiDAR Data EPSG above."
             )
             self._gcp_crs_info.setStyleSheet("color: #c09853;")
         elif gcp_epsg == 0:
             self._gcp_crs_info.setText(
-                f"GCP coords will be used as-is (same as data EPSG:{data_epsg})."
+                f"GCP coordinates assumed in LiDAR CRS (EPSG:{data_epsg}) — no transform."
             )
             self._gcp_crs_info.setStyleSheet("color: #888;")
         elif gcp_epsg == data_epsg:
             self._gcp_crs_info.setText(
-                f"GCP EPSG:{gcp_epsg} matches data EPSG:{data_epsg} — no transform needed."
+                f"GCP EPSG:{gcp_epsg} matches LiDAR EPSG:{data_epsg} — no transform needed."
             )
             self._gcp_crs_info.setStyleSheet("color: #5cb85c;")
         else:
             self._gcp_crs_info.setText(
-                f"GCP EPSG:{gcp_epsg} → will auto-transform to data EPSG:{data_epsg}."
+                f"GCP EPSG:{gcp_epsg} → auto-transforming to LiDAR EPSG:{data_epsg}."
             )
-            self._gcp_crs_info.setStyleSheet("color: #5cb85c; font-weight: bold;")
+            self._gcp_crs_info.setStyleSheet("color: #27ae60; font-weight: bold;")
 
     def _get_gcp_coords_to_use(self) -> List[Tuple[str, float, float, float]]:
         """Return GCP points, transformed to data CRS if needed."""
         gcp_epsg = self._gcp_epsg_spin.value()
-        data_epsg = self._data_epsg
+        data_epsg = self._data_epsg_spin.value() if hasattr(self, "_data_epsg_spin") and self._data_epsg_spin.value() > 0 else self._data_epsg
 
         if (not data_epsg or gcp_epsg == 0
                 or gcp_epsg == data_epsg
@@ -1065,9 +1364,9 @@ class GroundControlDialog(QDialog):
                 continue
 
             try:
-                vx = float(row[x_idx])
-                vy = float(row[y_idx])
-                vz = float(row[z_idx])
+                vx = _safe_float(row[x_idx])
+                vy = _safe_float(row[y_idx])
+                vz = _safe_float(row[z_idx])
             except (ValueError, IndexError):
                 continue
 
@@ -1101,8 +1400,8 @@ class GroundControlDialog(QDialog):
     # ── Run GCP ──────────────────────────────────────────────────────
 
     def _on_run_gcp(self):
-        # Re-parse column mapping from current combo state
-        self._reparse_current_gcp()
+        # Update points from current combo state (never clear or reset combos!)
+        self._update_gcp_points_from_combos()
 
         if not self._gcp_points:
             QMessageBox.warning(self, "No GCP Points",
@@ -1131,9 +1430,11 @@ class GroundControlDialog(QDialog):
         if not data or "x" not in data or len(data.get("x", [])) == 0:
             QMessageBox.warning(
                 self, "No Point Data",
-                "No point cloud data could be loaded for the selected GCP locations.\n"
-                "Check that the GCP coordinates are in the same CRS as the tiles,\n"
-                "and that the selected tiles actually contain points.",
+                "No point cloud data could be loaded for the selected GCP locations.\n\n"
+                "Check that:\n"
+                "1. GCP coordinates are in the same CRS as the LiDAR data (or specify EPSG to auto-transform).\n"
+                "2. X and Y are not reversed (try '⇄ Swap X & Y').\n"
+                "3. The loaded project tiles actually cover this area.",
             )
             return
 
@@ -1158,9 +1459,9 @@ class GroundControlDialog(QDialog):
         """Load point data from tiles that contain any of the given GCPs.
 
         Queries the database for ALL tiles whose bbox overlaps any GCP
-        point — not limited to the tiles currently selected in the tile
-        list.  Returns an empty dict when no tile data could be loaded;
-        the caller is responsible for showing an appropriate message.
+        point (buffered by search radius) — not limited to the tiles currently
+        selected in the tile list. Returns an empty dict when no tile data
+        could be loaded.
         """
         if not self._db or not self._tm:
             return self._data  # fallback to whatever was passed at construction
@@ -1168,14 +1469,24 @@ class GroundControlDialog(QDialog):
         if not gcp_points:
             return {}
 
-        # ── Query DB for all tiles covering any GCP ──
+        radius = self._gcp_radius_spin.value() if hasattr(self, "_gcp_radius_spin") else 5.0
+
+        # ── Query DB for all tiles covering any GCP (buffered by radius) ──
         tiles_with_gcps: set = set()
         for _name, gx, gy, _gz in gcp_points:
-            matches = self._db.get_tiles_in_bbox(gx, gy, gx, gy)
+            matches = self._db.get_tiles_in_bbox(gx - radius, gy - radius, gx + radius, gy + radius)
             for info in matches:
                 tid = info.get("id")
                 if tid:
                     tiles_with_gcps.add(tid)
+
+        if not tiles_with_gcps:
+            # Fallback: if single tile data was passed into dialog, check if it contains points
+            if self._data and "x" in self._data and len(self._data.get("x", [])) > 0:
+                return self._data
+            # Fallback: if tile_ids were passed, try using them
+            if self._tile_ids:
+                tiles_with_gcps.update(self._tile_ids)
 
         if not tiles_with_gcps:
             return {}  # caller validates and shows appropriate message
@@ -1197,7 +1508,9 @@ class GroundControlDialog(QDialog):
                 cls_list.append(np.asarray(td["classification"], dtype=np.int32))
 
         if not xs_list:
-            return {}  # caller validates and shows appropriate message
+            if self._data and "x" in self._data and len(self._data.get("x", [])) > 0:
+                return self._data
+            return {}
 
         return {
             "x": np.concatenate(xs_list),
@@ -1207,111 +1520,196 @@ class GroundControlDialog(QDialog):
         }
 
     def _reparse_current_gcp(self):
-        """Re-read points using current column mapping (in case user changed)."""
-        if not self._gcp_csv_edit.text():
+        """Re-read points using current column mapping without resetting combos."""
+        self._update_gcp_points_from_combos()
+
+    def _on_gcp_select_all(self):
+        """Check all GCP points with valid elevations."""
+        self._gcp_table.blockSignals(True)
+        for row in range(self._gcp_table.rowCount()):
+            use_item = self._gcp_table.item(row, 0)
+            dz_item = self._gcp_table.item(row, 6)
+            if use_item and dz_item and isinstance(dz_item, _NumericTableWidgetItem) and dz_item._val is not None:
+                use_item.setCheckState(Qt.Checked)
+        self._gcp_table.blockSignals(False)
+        self._recalculate_gcp_statistics()
+
+    def _on_gcp_deselect_all(self):
+        """Uncheck all GCP points."""
+        self._gcp_table.blockSignals(True)
+        for row in range(self._gcp_table.rowCount()):
+            use_item = self._gcp_table.item(row, 0)
+            if use_item:
+                use_item.setCheckState(Qt.Unchecked)
+        self._gcp_table.blockSignals(False)
+        self._recalculate_gcp_statistics()
+
+    def _on_gcp_disable_outliers(self):
+        """Uncheck all GCP points whose absolute elevation difference |ΔZ| exceeds threshold."""
+        thresh = self._gcp_outlier_spin.value()
+        self._gcp_table.blockSignals(True)
+        disabled_count = 0
+        for row in range(self._gcp_table.rowCount()):
+            dz_item = self._gcp_table.item(row, 6)
+            use_item = self._gcp_table.item(row, 0)
+            if dz_item and isinstance(dz_item, _NumericTableWidgetItem) and dz_item._val is not None:
+                if abs(dz_item._val) > thresh:
+                    if use_item and use_item.checkState() == Qt.Checked:
+                        use_item.setCheckState(Qt.Unchecked)
+                        disabled_count += 1
+        self._gcp_table.blockSignals(False)
+        self._recalculate_gcp_statistics()
+        self._status.setText(f"Disabled {disabled_count} outliers with |ΔZ| > {thresh:.2f} m")
+
+    def _on_gcp_table_item_changed(self, item: QTableWidgetItem):
+        if item.column() == 0:
+            self._recalculate_gcp_statistics()
+
+    def _on_vis_use_toggled(self, checked: bool):
+        if self._vis_mode != "gcp" or not self._gcp_results:
             return
-        sep = self._get_separator(self._gcp_sep_combo, self._gcp_custom_sep)
-        try:
-            with open(self._gcp_csv_edit.text(), "r", encoding="utf-8-sig") as f:
-                content = f.read()
-        except Exception:
+        if not (0 <= self._vis_index < len(self._gcp_results)):
             return
 
-        # Parse lines into fields (handle spaces properly)
-        raw_lines = content.splitlines()
-        parsed_lines = []
-        for line in raw_lines:
-            if line.strip() == "":
+        self._gcp_results[self._vis_index]["used"] = checked
+
+        # Synchronize corresponding checkbox item in table
+        self._gcp_table.blockSignals(True)
+        for row in range(self._gcp_table.rowCount()):
+            use_item = self._gcp_table.item(row, 0)
+            if use_item and use_item.data(Qt.UserRole) == self._vis_index:
+                use_item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                break
+        self._gcp_table.blockSignals(False)
+
+        self._recalculate_gcp_statistics()
+
+    def _recalculate_gcp_statistics(self):
+        """Recalculate GCP statistics using only enabled/checked points."""
+        used_dzs = []
+        total_pts = self._gcp_table.rowCount()
+        enabled_pts = 0
+
+        for row in range(total_pts):
+            use_item = self._gcp_table.item(row, 0)
+            if not use_item:
                 continue
-            fields = self._split_csv_line(line, sep)
-            if fields:
-                parsed_lines.append(fields)
+            orig_idx = use_item.data(Qt.UserRole)
+            is_checked = (use_item.checkState() == Qt.Checked)
 
-        if not parsed_lines:
-            return
+            if orig_idx is not None and 0 <= orig_idx < len(self._gcp_results):
+                self._gcp_results[orig_idx]["used"] = is_checked
 
-        # ── Auto-detect header vs data (same logic as _parse_gcp_csv) ──
-        first_line_is_data = self._line_looks_like_data(parsed_lines[0])
-        if first_line_is_data and self._gcp_has_header.isChecked():
-            self._gcp_has_header.setChecked(False)
-            has_header = False
+            if is_checked:
+                enabled_pts += 1
+                dz_item = self._gcp_table.item(row, 6)
+                if dz_item and isinstance(dz_item, _NumericTableWidgetItem) and dz_item._val is not None:
+                    used_dzs.append(dz_item._val)
+
+        if used_dzs:
+            dz_arr = np.array(used_dzs)
+            median_dz = float(np.median(dz_arr))
+            mean_dz = float(np.mean(dz_arr))
+            std_dz = float(np.std(dz_arr))
+            rms_dz = float(np.sqrt(np.mean(dz_arr ** 2)))
+            max_abs_dz = float(np.max(np.abs(dz_arr)))
+
+            stats_txt = (
+                f"<b>Statistics (using {len(used_dzs)} of {total_pts} points):</b>  "
+                f"Median shift = <b>{median_dz:+.3f} m</b>  |  "
+                f"Average shift = {mean_dz:+.3f} m  |  "
+                f"StdDev = {std_dz:.3f} m  |  "
+                f"RMS = {rms_dz:.3f} m"
+            )
+            if max_abs_dz > 20.0:
+                stats_txt += (
+                    f"<br><span style='color:#c09853;'>"
+                    f"⚠ Max |ΔZ| in active points = {max_abs_dz:.1f} m — check for CRS/datum mismatch.</span>"
+                )
+            elif max_abs_dz > 5.0:
+                stats_txt += (
+                    f"<br><span style='color:#c09853;'>"
+                    f"⚠ Max |ΔZ| in active points = {max_abs_dz:.2f} m.</span>"
+                )
+            self._gcp_stats.setText(stats_txt)
+
+            self._gcp_shift = median_dz
+            self._gcp_apply_btn.setEnabled(True)
+            self._gcp_apply_btn.setText(
+                f"⬆ Apply Z Shift ({self._gcp_shift:+.3f} m) from {len(used_dzs)} Active Points to Current Tile"
+            )
+            self._status.setText(f"GCP calculation: using {len(used_dzs)}/{total_pts} points (Median shift: {median_dz:+.3f} m)")
         else:
-            has_header = self._gcp_has_header.isChecked()
-
-        # ── Header handling ──
-        if has_header:
-            header = parsed_lines[0]
-            data_lines = parsed_lines[1:]
-        else:
-            n_cols = max(len(fl) for fl in parsed_lines)
-            header = [f"Col {i}" for i in range(n_cols)]
-            data_lines = parsed_lines
-
-        # Re-populate column combos so indices stay valid for this file
-        self._populate_column_combos(
-            header,
-            self._gcp_name_col, self._gcp_x_col,
-            self._gcp_y_col, self._gcp_z_col,
-        )
-
-        # If auto-detection failed (no X/Y/Z columns matched), use positional defaults
-        if self._gcp_x_col.currentData() is None or self._gcp_x_col.currentData() < 0:
-            n_cols = len(header)
-            if n_cols >= 4:
-                self._gcp_name_col.setCurrentIndex(1)  # Col 0 → Name
-                self._gcp_x_col.setCurrentIndex(2)     # Col 1 → X
-                self._gcp_y_col.setCurrentIndex(3)     # Col 2 → Y
-                self._gcp_z_col.setCurrentIndex(4)     # Col 3 → Z
-            elif n_cols == 3:
-                self._gcp_x_col.setCurrentIndex(1)     # Col 0 → X
-                self._gcp_y_col.setCurrentIndex(2)     # Col 1 → Y
-                self._gcp_z_col.setCurrentIndex(3)     # Col 2 → Z
-
-        self._gcp_points = []
-        auto_name = 0
-        for row in data_lines:
-            if not row or all(c.strip() == "" for c in row):
-                continue
-            name_idx = self._gcp_name_col.currentData()
-            x_idx = self._gcp_x_col.currentData()
-            y_idx = self._gcp_y_col.currentData()
-            z_idx = self._gcp_z_col.currentData()
-            if x_idx is None or y_idx is None or z_idx is None or x_idx < 0 or y_idx < 0 or z_idx < 0:
-                continue
-            try:
-                gx, gy, gz = float(row[x_idx]), float(row[y_idx]), float(row[z_idx])
-            except (ValueError, IndexError):
-                continue
-            if name_idx is not None and name_idx >= 0 and name_idx < len(row):
-                name = row[name_idx].strip()
+            self._gcp_shift = None
+            self._gcp_apply_btn.setEnabled(False)
+            if total_pts > 0:
+                self._gcp_stats.setText(
+                    f"<span style='color:#c0392b; font-weight:bold;'>"
+                    f"No active points ({enabled_pts} enabled, 0 with valid ΔZ). "
+                    f"Please check at least one valid GCP point.</span>"
+                )
+                self._status.setText("GCP calculation: no active points selected")
             else:
-                auto_name += 1
-                name = str(auto_name)
-            self._gcp_points.append((name, gx, gy, gz))
+                self._gcp_stats.setText("")
+
+        # Synchronize visual check checkbox if showing a GCP
+        if self._vis_mode == "gcp" and self._gcp_results and 0 <= self._vis_index < len(self._gcp_results):
+            r = self._gcp_results[self._vis_index]
+            self._vis_use_chk.blockSignals(True)
+            self._vis_use_chk.setEnabled(r.get("z_cloud") is not None)
+            self._vis_use_chk.setChecked(r.get("used", True) and r.get("z_cloud") is not None)
+            self._vis_use_chk.blockSignals(False)
 
     def _on_gcp_finished(self, results: list):
         self._gcp_results = results
+        for r in self._gcp_results:
+            r["used"] = (r.get("z_cloud") is not None)
+
         self._gcp_run_btn.setEnabled(True)
         self._progress.setVisible(False)
 
-        # Populate table
+        # Populate table with numeric sorting enabled
+        self._gcp_table.blockSignals(True)
+        self._gcp_table.setSortingEnabled(False)
         self._gcp_table.setRowCount(0)
-        dzs = []
-        for r in results:
+
+        for i, r in enumerate(results):
             row = self._gcp_table.rowCount()
             self._gcp_table.insertRow(row)
-            self._gcp_table.setItem(row, 0, QTableWidgetItem(str(r["name"])))
-            self._gcp_table.setItem(row, 1, QTableWidgetItem(f"{r['x']:.3f}"))
-            self._gcp_table.setItem(row, 2, QTableWidgetItem(f"{r['y']:.3f}"))
-            self._gcp_table.setItem(row, 3, QTableWidgetItem(f"{r['z_in']:.3f}"))
-            if r["z_cloud"] is not None:
-                self._gcp_table.setItem(row, 4, QTableWidgetItem(f"{r['z_cloud']:.3f}"))
+
+            # Col 0: Checkbox "Use"
+            is_valid = (r.get("z_cloud") is not None)
+            chk_item = _CheckboxTableWidgetItem(checked=is_valid)
+            chk_item.setData(Qt.UserRole, i)  # map to results index
+            if not is_valid:
+                chk_item.setFlags(Qt.ItemIsSelectable)
+            self._gcp_table.setItem(row, 0, chk_item)
+
+            # Col 1: Name
+            self._gcp_table.setItem(row, 1, QTableWidgetItem(str(r["name"])))
+
+            # Col 2: X
+            self._gcp_table.setItem(row, 2, _NumericTableWidgetItem(r['x']))
+
+            # Col 3: Y
+            self._gcp_table.setItem(row, 3, _NumericTableWidgetItem(r['y']))
+
+            # Col 4: Z Input
+            self._gcp_table.setItem(row, 4, _NumericTableWidgetItem(r['z_in']))
+
+            # Col 5: Z Cloud
+            if is_valid:
+                self._gcp_table.setItem(row, 5, _NumericTableWidgetItem(r['z_cloud']))
+            else:
+                self._gcp_table.setItem(row, 5, _NumericTableWidgetItem(None, "N/A"))
+
+            # Col 6: ΔZ
+            if is_valid:
                 dz = r["dz"]
-                dz_str = f"{dz:+.3f}"
-                dz_item = QTableWidgetItem(dz_str)
+                dz_item = _NumericTableWidgetItem(dz, f"{dz:+.3f}")
                 if abs(dz) > 20.0:
                     dz_item.setForeground(QColor("#c0392b"))  # red
-                    dz_item.setText(f"{dz_str} ⚠ CRS/datum?")
+                    dz_item.setText(f"{dz:+.3f} ⚠ CRS/datum?")
                     dz_item.setToolTip(
                         "ΔZ is implausibly large — the GCP's X/Y or Z is "
                         "likely in a different CRS/vertical datum than the "
@@ -1323,54 +1721,37 @@ class GroundControlDialog(QDialog):
                         "ΔZ is larger than expected — verify the GCP position "
                         "and elevation against the point cloud."
                     )
-                self._gcp_table.setItem(row, 5, dz_item)
-                dzs.append(dz)
+                self._gcp_table.setItem(row, 6, dz_item)
             else:
-                self._gcp_table.setItem(row, 4, QTableWidgetItem("N/A"))
-                self._gcp_table.setItem(row, 5, QTableWidgetItem(r.get("warning", "N/A")))
-            self._gcp_table.setItem(row, 6, QTableWidgetItem(str(r.get("n_nearby", 0))))
+                warn_txt = r.get("warning", "N/A")
+                self._gcp_table.setItem(row, 6, _NumericTableWidgetItem(None, warn_txt))
+
+            # Col 7: Nearby pts
+            self._gcp_table.setItem(row, 7, _NumericTableWidgetItem(float(r.get("n_nearby", 0)), str(r.get("n_nearby", 0))))
+
         self._gcp_table.resizeColumnsToContents()
+        self._gcp_table.setSortingEnabled(True)
+        self._gcp_table.blockSignals(False)
 
-        # Statistics
-        if dzs:
-            dz_arr = np.array(dzs)
-            median_dz = float(np.median(dz_arr))
-            mean_dz = float(np.mean(dz_arr))
-            std_dz = float(np.std(dz_arr))
-            rms_dz = float(np.sqrt(np.mean(dz_arr ** 2)))
-            stats_txt = (
-                f"<b>Statistics ({len(dzs)} points):</b>  "
-                f"Median shift = {median_dz:+.3f} m  |  "
-                f"Average shift = {mean_dz:+.3f} m  |  "
-                f"StdDev = {std_dz:.3f} m  |  "
-                f"RMS = {rms_dz:.3f} m"
-            )
-            max_abs_dz = float(np.max(np.abs(dz_arr)))
-            if max_abs_dz > 20.0:
-                stats_txt += (
-                    f"<br><span style='color:#c09853;'>"
-                    f"⚠ Max |ΔZ| = {max_abs_dz:.1f} m — check that the GCP "
-                    f"CRS/datum matches the point cloud.</span>"
-                )
-            self._gcp_stats.setText(stats_txt)
+        # Recalculate statistics from active points
+        self._recalculate_gcp_statistics()
 
-            # The shift to apply equals the median ΔZ (GCP elevation minus
-            # point-cloud elevation). Median is used (not mean) so that the
-            # occasional wildly-off GCP — e.g. a CRS/datum mismatch — cannot
-            # drag the applied shift by hundreds of metres.
-            self._gcp_shift = median_dz
-            self._gcp_apply_btn.setEnabled(True)
-            self._gcp_apply_btn.setText(
-                f"⬆ Apply Z Shift ({self._gcp_shift:+.3f} m) to Current Tile"
+        has_valid = any(r.get("z_cloud") is not None for r in results)
+        if not has_valid:
+            n_total = len(results)
+            self._gcp_stats.setText(
+                f"<span style='color:#c0392b; font-weight:bold;'>"
+                f"0 / {n_total} GCP points found nearby LiDAR points!</span><br>"
+                f"• Check that X and Y columns are not reversed (try <b>'⇄ Swap X & Y'</b> above).<br>"
+                f"• Check Coordinate System: ensure LiDAR Data EPSG and GCP EPSG are correctly specified.<br>"
+                f"• Check Target Classes: if the LiDAR data is unclassified, ensure Class 0 or 1 is checked.<br>"
+                f"• Try increasing the Search Radius (currently {self._gcp_radius_spin.value():.1f} m)."
             )
-            self._vis_mode = "gcp"
-            self._vis_index = 0
-            self._update_vis_nav()
-        else:
-            self._gcp_stats.setText("No valid results — check class selection and search radius")
             self._gcp_apply_btn.setEnabled(False)
 
-        self._status.setText(f"GCP calculation done: {len(dzs)} valid, {len(results) - len(dzs)} failed")
+        self._vis_mode = "gcp"
+        self._vis_index = 0
+        self._update_vis_nav()
 
     # ── Run Roofs ────────────────────────────────────────────────────
 
@@ -1443,7 +1824,9 @@ class GroundControlDialog(QDialog):
             if x_idx is None or y_idx is None or z_idx is None or x_idx < 0 or y_idx < 0 or z_idx < 0:
                 continue
             try:
-                vx, vy, vz = float(row[x_idx]), float(row[y_idx]), float(row[z_idx])
+                vx = _safe_float(row[x_idx])
+                vy = _safe_float(row[y_idx])
+                vz = _safe_float(row[z_idx])
             except (ValueError, IndexError):
                 continue
             if id_idx is not None and id_idx >= 0 and id_idx < len(row):
@@ -1566,6 +1949,8 @@ class GroundControlDialog(QDialog):
             self._vis_prev_btn.setEnabled(False)
             self._vis_next_btn.setEnabled(False)
             self._vis_goto_btn.setEnabled(False)
+            if hasattr(self, "_vis_use_chk"):
+                self._vis_use_chk.setVisible(False)
             return
 
         self._vis_prev_btn.setEnabled(self._vis_index > 0)
@@ -1578,10 +1963,20 @@ class GroundControlDialog(QDialog):
             x, y = item.get("x", 0), item.get("y", 0)
             dz = item.get("dz")
             dz_str = f"{dz:+.3f} m" if dz is not None else "N/A"
+            is_used = item.get("used", True) if dz is not None else False
+            status_tag = " [ACTIVE]" if is_used else " [DISABLED]"
             self._vis_label.setText(
-                f"[{self._vis_index + 1}/{n}]  {name}  @ ({x:.2f}, {y:.2f})  ΔZ={dz_str}"
+                f"[{self._vis_index + 1}/{n}]  {name}  @ ({x:.2f}, {y:.2f})  ΔZ={dz_str}{status_tag}"
             )
+            if hasattr(self, "_vis_use_chk"):
+                self._vis_use_chk.setVisible(True)
+                self._vis_use_chk.blockSignals(True)
+                self._vis_use_chk.setEnabled(dz is not None)
+                self._vis_use_chk.setChecked(is_used)
+                self._vis_use_chk.blockSignals(False)
         else:
+            if hasattr(self, "_vis_use_chk"):
+                self._vis_use_chk.setVisible(False)
             cx = item.get("centroid_x", 0)
             cy = item.get("centroid_y", 0)
             dx = item.get("dx")
@@ -1612,17 +2007,21 @@ class GroundControlDialog(QDialog):
             return
         item = items[self._vis_index]
         if self._vis_mode == "gcp":
-            x, y = item.get("x", 0), item.get("y", 0)
+            x, y = float(item.get("x", 0)), float(item.get("y", 0))
             z = item.get("z_in")
+            cloud_z = item.get("z_cloud")
             if z is None:
-                z = item.get("z_cloud")
-            self.visualize_point.emit(x, y, z if z is not None else 0.0,
-                                      item.get("name", "GCP"))
+                z = cloud_z
+            self.visualize_point.emit(
+                x, y, float(z if z is not None else 0.0),
+                float(cloud_z) if cloud_z is not None else None,
+                str(item.get("name", "GCP")),
+            )
         else:
-            x = item.get("centroid_x", 0)
-            y = item.get("centroid_y", 0)
-            z = item.get("centroid_z", 0)
-            self.visualize_point.emit(x, y, z, item.get("name", "Surface"))
+            x = float(item.get("centroid_x", 0))
+            y = float(item.get("centroid_y", 0))
+            z = float(item.get("centroid_z", 0))
+            self.visualize_point.emit(x, y, z, None, str(item.get("name", "Surface")))
 
     # ── Progress / error slots ───────────────────────────────────────
 
