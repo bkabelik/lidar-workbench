@@ -255,15 +255,15 @@ class ViewDTM(QWidget):
     # ── coordinate transforms ──────────────────────────────────────
 
     def _world_to_widget(self, wx: float, wy: float) -> QPointF:
-        """Convert world coordinates to widget pixel coordinates."""
+        """Convert world coordinates to widget pixel coordinates (North is up / nadir)."""
         px = (wx - self._offset_x) * self._scale + self.width() / 2
-        py = (wy - self._offset_y) * self._scale + self.height() / 2
+        py = -(wy - self._offset_y) * self._scale + self.height() / 2
         return QPointF(px, py)
 
     def _widget_to_world(self, px: float, py: float) -> Tuple[float, float]:
-        """Convert widget pixel coordinates to world coordinates."""
+        """Convert widget pixel coordinates to world coordinates (North is up / nadir)."""
         wx = (px - self.width() / 2) / self._scale + self._offset_x
-        wy = (py - self.height() / 2) / self._scale + self._offset_y
+        wy = self._offset_y - (py - self.height() / 2) / self._scale
         return wx, wy
 
     def _bbox_to_widget_rect(self, bbox: Tuple[float, float, float, float]) -> QRectF:
@@ -337,7 +337,7 @@ class ViewDTM(QWidget):
         h = max(2, int(round(span_y / res)))
 
         col = ((xs - x_min) / span_x * (w - 1)).astype(np.int32)
-        row = ((ys - y_min) / span_y * (h - 1)).astype(np.int32)
+        row = ((y_max - ys) / span_y * (h - 1)).astype(np.int32)
         col = np.clip(col, 0, w - 1)
         row = np.clip(row, 0, h - 1)
 
@@ -388,52 +388,64 @@ class ViewDTM(QWidget):
             self._dtm_pixmap = None
             return
 
-        z_valid = z[~np.isnan(z)]
+        # Flip vertically so row 0 is North (top of map / nadir view from aircraft)
+        z_north = np.ascontiguousarray(np.flipud(z))
+
+        z_valid = z_north[~np.isnan(z_north)]
         if len(z_valid) == 0:
             self._dtm_pixmap = None
             return
 
         z_min, z_max = z_valid.min(), z_valid.max()
         if z_max <= z_min:
-            z_norm = np.full_like(z, 0.5, dtype=np.float64)
+            z_norm = np.full_like(z_north, 0.5, dtype=np.float64)
         else:
-            z_norm = (z - z_min) / (z_max - z_min)
+            z_norm = (z_north - z_min) / (z_max - z_min)
 
         # ── hillshade ───────────────────────────────────────────
-        # Compute slope and aspect from the DTM grid
+        # Compute slope and aspect from the DTM grid (North-Up)
         # Cell size in CRS units (approximate)
         dx = (self._dtm_bbox[1] - self._dtm_bbox[0]) / max(nx - 1, 1)
         dy = (self._dtm_bbox[3] - self._dtm_bbox[2]) / max(ny - 1, 1)
         cell_size = min(dx, dy) or 1.0
 
-        dz_dx = np.zeros_like(z)
-        dz_dy = np.zeros_like(z)
-        # Central differences for interior, forward/backward for edges
-        dz_dx[:, 1:-1] = (z[:, 2:] - z[:, :-2]) / (2 * cell_size)
-        dz_dx[:, 0] = (z[:, 1] - z[:, 0]) / cell_size
-        dz_dx[:, -1] = (z[:, -1] - z[:, -2]) / cell_size
+        # Differences in world coordinates:
+        # col increases to East (+X): dz_dx
+        # row increases to South (-Y), so row-1 is North (+Y): dz_dy
+        dz_dx = np.zeros_like(z_north)
+        dz_dy = np.zeros_like(z_north)
 
-        dz_dy[1:-1, :] = (z[2:, :] - z[:-2, :]) / (2 * cell_size)
-        dz_dy[0, :] = (z[1, :] - z[0, :]) / cell_size
-        dz_dy[-1, :] = (z[-1, :] - z[-2, :]) / cell_size
+        dz_dx[:, 1:-1] = (z_north[:, 2:] - z_north[:, :-2]) / (2 * cell_size)
+        dz_dx[:, 0] = (z_north[:, 1] - z_north[:, 0]) / cell_size
+        dz_dx[:, -1] = (z_north[:, -1] - z_north[:, -2]) / cell_size
 
-        # Slope (radians)
-        slope = np.arctan(np.sqrt(dz_dx * dz_dx + dz_dy * dz_dy))
+        dz_dy[1:-1, :] = (z_north[:-2, :] - z_north[2:, :]) / (2 * cell_size)
+        dz_dy[0, :] = (z_north[0, :] - z_north[1, :]) / cell_size
+        dz_dy[-1, :] = (z_north[-2, :] - z_north[-1, :]) / cell_size
 
-        # Aspect (radians, 0 = south, increasing east → standard GIS)
-        aspect = np.arctan2(dz_dy, -dz_dx)
-        aspect = np.where(aspect < 0, aspect + 2 * np.pi, aspect)
+        # Upward terrain surface normal: N = (-dz_dx, -dz_dy, 1) / |N|
+        norm_len = np.sqrt(dz_dx * dz_dx + dz_dy * dz_dy + 1.0)
+        n_x = -dz_dx / norm_len
+        n_y = -dz_dy / norm_len
+        n_z = 1.0 / norm_len
 
-        # Sun parameters (NW light, 45° above horizon)
-        sun_azimuth = math.radians(315.0)   # NW
-        sun_altitude = math.radians(45.0)   # 45° above horizon
-        sun_zenith = math.pi / 2 - sun_altitude
+        # Sun vector from NW (azimuth 315° CW from North, altitude 45° above horizon)
+        # Vector pointing UP towards sun:
+        # X: West is negative -> sin(315°) * cos(45°) = -0.5
+        # Y: North is positive -> cos(315°) * cos(45°) = +0.5
+        # Z: Upward is positive -> sin(45°) = sqrt(2)/2
+        sun_alt = math.radians(45.0)
+        sun_az = math.radians(315.0)
+        sun_vec = np.array([
+            math.sin(sun_az) * math.cos(sun_alt),
+            math.cos(sun_az) * math.cos(sun_alt),
+            math.sin(sun_alt),
+        ], dtype=np.float64)
+        sun_vec /= np.linalg.norm(sun_vec)
 
-        # Hillshade = cos(zenith)*cos(slope) + sin(zenith)*sin(slope)*cos(azimuth-aspect)
-        hs = (np.cos(sun_zenith) * np.cos(slope)
-              + np.sin(sun_zenith) * np.sin(slope)
-              * np.cos(sun_azimuth - aspect))
-        hs = np.where(np.isnan(z), 0.0, np.clip(hs, 0.0, 1.0))
+        # Lambertian hillshade = N . S
+        hs = n_x * sun_vec[0] + n_y * sun_vec[1] + n_z * sun_vec[2]
+        hs = np.where(np.isnan(z_north), 0.0, np.clip(hs, 0.0, 1.0))
 
         # ── combine elevation colour + hillshade ─────────────────
         # Elevation colours: green→yellow→brown
@@ -442,7 +454,7 @@ class ViewDTM(QWidget):
         g_el = np.clip((1 - t) * 160 + 40, 0, 255).astype(np.float64)
         b_el = np.clip((1 - t) * 100 + 20, 0, 255).astype(np.float64)
 
-        # Blend: hillshade modulates brightness (50% base + 50% shaded)
+        # Blend: hillshade modulates brightness (40% base + 60% shaded)
         blend = 0.4 + 0.6 * hs
         r = np.clip(r_el * blend, 0, 255).astype(np.uint8)
         g = np.clip(g_el * blend, 0, 255).astype(np.uint8)
@@ -452,7 +464,7 @@ class ViewDTM(QWidget):
         img[:, :, 0] = r
         img[:, :, 1] = g
         img[:, :, 2] = b
-        img[:, :, 3] = np.where(np.isnan(z), 0, 255).astype(np.uint8)
+        img[:, :, 3] = np.where(np.isnan(z_north), 0, 255).astype(np.uint8)
 
         qimg = QImage(img.data, nx, ny, QImage.Format_RGBA8888)
         self._dtm_pixmap = QPixmap.fromImage(qimg.copy())
@@ -532,6 +544,31 @@ class ViewDTM(QWidget):
         painter.drawLine(cx - 10, cy, cx + 10, cy)
         painter.drawLine(cx, cy - 10, cx, cy + 10)
 
+        # North compass indicator (top-right corner: nadir top-down view)
+        nx_pos = self.width() - 28
+        ny_pos = 36
+        painter.setPen(Qt.NoPen)
+        # Red North needle
+        painter.setBrush(QColor("#e74c3c"))
+        n_arrow = QPainterPath()
+        n_arrow.moveTo(nx_pos, ny_pos - 16)
+        n_arrow.lineTo(nx_pos - 5, ny_pos)
+        n_arrow.lineTo(nx_pos, ny_pos - 4)
+        n_arrow.closeSubpath()
+        painter.drawPath(n_arrow)
+
+        # Grey South needle
+        painter.setBrush(QColor("#bdc3c7"))
+        s_arrow = QPainterPath()
+        s_arrow.moveTo(nx_pos, ny_pos - 16)
+        s_arrow.lineTo(nx_pos + 5, ny_pos)
+        s_arrow.lineTo(nx_pos, ny_pos - 4)
+        s_arrow.closeSubpath()
+        painter.drawPath(s_arrow)
+
+        painter.setPen(QPen(QColor("#ffffff"), 1))
+        painter.drawText(int(nx_pos - 4), int(ny_pos - 19), "N")
+
         painter.end()
 
     # ── mouse events ───────────────────────────────────────────────
@@ -554,7 +591,7 @@ class ViewDTM(QWidget):
                 dx = event.position().x() - self._pan_last.x()
                 dy = event.position().y() - self._pan_last.y()
                 self._offset_x -= dx / self._scale
-                self._offset_y -= dy / self._scale
+                self._offset_y += dy / self._scale
             self._pan_last = event.position()
             self.update()
             return
@@ -595,7 +632,7 @@ class ViewDTM(QWidget):
 
         # Keep the world point under the cursor stationary
         self._offset_x = wx - (px - self.width() / 2) / self._scale
-        self._offset_y = wy - (py - self.height() / 2) / self._scale
+        self._offset_y = wy + (py - self.height() / 2) / self._scale
         self.update()
 
     def resizeEvent(self, event) -> None:
