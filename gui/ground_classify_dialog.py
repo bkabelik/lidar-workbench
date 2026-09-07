@@ -261,12 +261,12 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
 
         mask = ground_classify_stepdown(
             xs_sub, ys_sub, zs_sub,
-            step=params.get("step", 3.0),
+            step=params.get("step", 5.0),
             sub_steps=params.get("sub_steps", 6),
             bulge=params.get("bulge"),
-            offset=params.get("offset", 0.10),
-            spike=params.get("spike", 1.0),
-            spike_down=params.get("spike_down", 1.0),
+            offset=params.get("offset", 0.08),
+            spike=params.get("spike", 0.50),
+            spike_down=params.get("spike_down", 0.50),
             refine_loops=params.get("refine_loops", 2),
             all_returns=params.get("all_returns", False),
             return_numbers=rn_sub,
@@ -936,7 +936,7 @@ class GroundClassifyDialog(QDialog):
         lgf = QFormLayout(self._stepdown_group)
 
         self._stepdown_preset_combo = QComboBox()
-        self._stepdown_preset_combo.addItem("Embankments & River Corridors (step 3m, sub 6, bulge 1.5m)", "river")
+        self._stepdown_preset_combo.addItem("Embankments & River Corridors (step 5m, sub 6, bulge 1.0m)", "river")
         self._stepdown_preset_combo.addItem("Nature & Undulating (step 5m, sub 5, bulge 1.0m)", "nature")
         self._stepdown_preset_combo.addItem("Steep Hills & Mountains (step 1.5m, sub 7, bulge 1.5m)", "steep")
         self._stepdown_preset_combo.addItem("Town & Low Density (step 10m, sub 4, bulge 1.5m)", "town")
@@ -948,9 +948,9 @@ class GroundClassifyDialog(QDialog):
         self._stepdown_step = QDoubleSpinBox()
         self._stepdown_step.setRange(0.5, 100.0)
         self._stepdown_step.setDecimals(1)
-        self._stepdown_step.setValue(3.0)
+        self._stepdown_step.setValue(5.0)
         self._stepdown_step.setSuffix(" m")
-        self._stepdown_step.setToolTip("Initial coarse grid resolution. 3m for riverbanks, 5m for nature, 25m for city.")
+        self._stepdown_step.setToolTip("Initial coarse grid resolution. 5m for riverbanks, 5m for nature, 25m for city.")
         lgf.addRow("Initial Step Size:", self._stepdown_step)
 
         self._stepdown_sub = QSpinBox()
@@ -963,7 +963,7 @@ class GroundClassifyDialog(QDialog):
         self._stepdown_bulge = QDoubleSpinBox()
         self._stepdown_bulge.setRange(0.0, 10.0)
         self._stepdown_bulge.setDecimals(2)
-        self._stepdown_bulge.setValue(1.50)
+        self._stepdown_bulge.setValue(1.00)
         self._stepdown_bulge.setSuffix(" m")
         self._stepdown_bulge.setToolTip("Max allowable elevation rise when curving the TIN across ridges/slopes.")
         bulge_box.addWidget(self._stepdown_bulge)
@@ -977,7 +977,7 @@ class GroundClassifyDialog(QDialog):
         self._stepdown_offset = QDoubleSpinBox()
         self._stepdown_offset.setRange(0.01, 2.0)
         self._stepdown_offset.setDecimals(2)
-        self._stepdown_offset.setValue(0.10)
+        self._stepdown_offset.setValue(0.08)
         self._stepdown_offset.setSuffix(" m")
         self._stepdown_offset.setToolTip("Base elevation inclusion tolerance above bulged ground surface. Scales dynamically with slope.")
         lgf.addRow("Offset Tolerance:", self._stepdown_offset)
@@ -985,7 +985,7 @@ class GroundClassifyDialog(QDialog):
         self._stepdown_spike = QDoubleSpinBox()
         self._stepdown_spike.setRange(0.0, 10.0)
         self._stepdown_spike.setDecimals(2)
-        self._stepdown_spike.setValue(1.0)
+        self._stepdown_spike.setValue(0.50)
         self._stepdown_spike.setSuffix(" m")
         self._stepdown_spike.setToolTip("Up-spike removal threshold. Filters building roofs and tree tops from coarse seeds.")
         lgf.addRow("Up-Spike Threshold:", self._stepdown_spike)
@@ -993,7 +993,7 @@ class GroundClassifyDialog(QDialog):
         self._stepdown_spike_down = QDoubleSpinBox()
         self._stepdown_spike_down.setRange(0.0, 10.0)
         self._stepdown_spike_down.setDecimals(2)
-        self._stepdown_spike_down.setValue(1.0)
+        self._stepdown_spike_down.setValue(0.50)
         self._stepdown_spike_down.setSuffix(" m")
         self._stepdown_spike_down.setToolTip("Down-spike removal threshold. Filters low pits and multipath noise.")
         lgf.addRow("Down-Spike Threshold:", self._stepdown_spike_down)
@@ -1063,13 +1063,13 @@ class GroundClassifyDialog(QDialog):
     def _on_stepdown_preset_changed(self):
         preset = self._stepdown_preset_combo.currentData()
         if preset == "river":
-            self._stepdown_step.setValue(3.0)
+            self._stepdown_step.setValue(5.0)
             self._stepdown_sub.setValue(6)
             self._stepdown_bulge_auto.setChecked(False)
-            self._stepdown_bulge.setValue(1.50)
-            self._stepdown_offset.setValue(0.10)
-            self._stepdown_spike.setValue(1.0)
-            self._stepdown_spike_down.setValue(1.0)
+            self._stepdown_bulge.setValue(1.00)
+            self._stepdown_offset.setValue(0.08)
+            self._stepdown_spike.setValue(0.50)
+            self._stepdown_spike_down.setValue(0.50)
         elif preset == "nature":
             self._stepdown_step.setValue(5.0)
             self._stepdown_sub.setValue(5)
