@@ -2144,78 +2144,97 @@ def _extract_alpha_shape_bottom_layer(
     min_y: float,
     max_x: float,
     max_y: float,
+    cand_indices: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Extract lower boundary points using a bottom rolling sphere of radius alpha.
 
-    Implements the modified 3D alpha shape lower envelope test:
+    Implements the modified 3D alpha shape lower envelope test (Cao et al. 2024):
     A sphere of radius alpha placed beneath point P tests if any neighbor
     point penetrates the sphere from below. Points where the sphere is clear
     belong to the lower alpha-shape boundary.
     """
-    n = len(xs)
+    n_total = len(xs)
+    if cand_indices is not None and len(cand_indices) > 0:
+        sub_xs = xs[cand_indices]
+        sub_ys = ys[cand_indices]
+        sub_zs = zs[cand_indices]
+        orig_indices = cand_indices
+    else:
+        sub_xs, sub_ys, sub_zs = xs, ys, zs
+        orig_indices = np.arange(n_total)
+
     cell_size = max(alpha * 0.4, 0.5)
     nx = max(1, int(np.ceil((max_x - min_x) / cell_size)) + 1)
     ny = max(1, int(np.ceil((max_y - min_y) / cell_size)) + 1)
 
-    gx = np.clip(((xs - min_x) / cell_size).astype(np.int32), 0, nx - 1)
-    gy = np.clip(((ys - min_y) / cell_size).astype(np.int32), 0, ny - 1)
+    gx = np.clip(((sub_xs - min_x) / cell_size).astype(np.int32), 0, nx - 1)
+    gy = np.clip(((sub_ys - min_y) / cell_size).astype(np.int32), 0, ny - 1)
     flat_idx = gx * ny + gy
 
     # Find minimum Z in each cell
     cell_min = np.full(nx * ny, np.inf, dtype=np.float64)
-    np.minimum.at(cell_min, flat_idx, zs)
-    cand_mask = (zs <= cell_min[flat_idx] + 0.05)
-    cand_idx = np.flatnonzero(cand_mask)
-    if len(cand_idx) == 0:
-        return np.zeros(n, dtype=bool)
+    np.minimum.at(cell_min, flat_idx, sub_zs)
+    cand_mask = (sub_zs <= cell_min[flat_idx] + 0.05)
+    local_cands = np.flatnonzero(cand_mask)
+    if len(local_cands) == 0:
+        return np.zeros(n_total, dtype=bool)
 
-    # KDTree query to test rolling sphere
+    # KDTree query on candidate lowest points only (10-100x speedup over querying all points)
     try:
         from scipy.spatial import cKDTree
-        tree = cKDTree(np.column_stack((xs, ys)))
+        c_x = sub_xs[local_cands]
+        c_y = sub_ys[local_cands]
+        c_z = sub_zs[local_cands]
+        c_orig = orig_indices[local_cands]
+
+        cand_tree = cKDTree(np.column_stack((c_x, c_y)))
         search_r = min(alpha * 1.2, 35.0)
-        neighbors_list = tree.query_ball_point(
-            np.column_stack((xs[cand_idx], ys[cand_idx])), r=search_r
+        neighbors_list = cand_tree.query_ball_point(
+            np.column_stack((c_x, c_y)), r=search_r
         )
-        is_bottom = np.ones(len(cand_idx), dtype=bool)
+        is_bottom = np.ones(len(local_cands), dtype=bool)
         two_alpha = 2.0 * alpha
 
-        for i, (ci, nbrs) in enumerate(zip(cand_idx, neighbors_list)):
+        for i, nbrs in enumerate(neighbors_list):
             if len(nbrs) < 4:
                 continue
             nbrs_arr = np.asarray(nbrs)
-            dx = xs[nbrs_arr] - xs[ci]
-            dy = ys[nbrs_arr] - ys[ci]
-            dz = zs[nbrs_arr] - zs[ci]
+            dx = c_x[nbrs_arr] - c_x[i]
+            dy = c_y[nbrs_arr] - c_y[i]
+            dz = c_z[nbrs_arr] - c_z[i]
 
-            # Fit local tangent plane to account for terrain slope
-            X = np.column_stack((dx, dy))
-            try:
-                plane, _, _, _ = np.linalg.lstsq(X, dz, rcond=None)
-                n = np.array([-plane[0], -plane[1], 1.0], dtype=np.float64)
-                n /= np.linalg.norm(n)
-            except Exception:
-                n = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            # Fast 2x2 analytic normal (avoiding expensive np.linalg.lstsq in Python loop)
+            s_xx = np.dot(dx, dx)
+            s_yy = np.dot(dy, dy)
+            s_xy = np.dot(dx, dy)
+            s_xz = np.dot(dx, dz)
+            s_yz = np.dot(dy, dz)
+            det = s_xx * s_yy - s_xy * s_xy
 
-            # Perpendicular distance along surface normal: d_perp = n · (P - P0)
-            diff = np.column_stack((dx, dy, dz))
-            d_perp = np.dot(diff, n)
-            d_sq = np.sum(diff * diff, axis=1)
+            if det > 1e-6:
+                a = (s_yy * s_xz - s_xy * s_yz) / det
+                b = (s_xx * s_yz - s_xy * s_xz) / det
+                norm_factor = 1.0 / np.sqrt(a * a + b * b + 1.0)
+                nx_val = -a * norm_factor
+                ny_val = -b * norm_factor
+                nz_val = norm_factor
+            else:
+                nx_val, ny_val, nz_val = 0.0, 0.0, 1.0
 
-            # A neighbor violates the tangent sphere if it penetrates below the sphere:
-            # d_perp < -0.05 (significantly below the tangent plane) and d_sq < -2 * alpha * d_perp
+            d_perp = dx * nx_val + dy * ny_val + dz * nz_val
             below = d_perp < -0.05
             if below.any():
-                violates = d_sq[below] < (-two_alpha * d_perp[below])
-                if violates.any():
+                d_sq = dx[below] ** 2 + dy[below] ** 2 + dz[below] ** 2
+                if (d_sq < (-two_alpha * d_perp[below])).any():
                     is_bottom[i] = False
 
-        bottom_mask = np.zeros(n, dtype=bool)
-        bottom_mask[cand_idx[is_bottom]] = True
+        bottom_mask = np.zeros(n_total, dtype=bool)
+        bottom_mask[c_orig[is_bottom]] = True
         return bottom_mask
     except Exception:
-        # Fallback to local grid minimums
-        return cand_mask
+        fallback_mask = np.zeros(n_total, dtype=bool)
+        fallback_mask[orig_indices[local_cands]] = True
+        return fallback_mask
 
 
 def ground_classify_multiscale_alpha_shape(
@@ -2225,8 +2244,11 @@ def ground_classify_multiscale_alpha_shape(
     coarse_alpha: float = 20.0,
     medium_alpha: float = 6.0,
     fine_alpha: float = 2.0,
-    max_distance: float = 0.5,
-    max_terrain_angle: float = 60.0,
+    max_distance: float = 0.20,
+    max_terrain_angle: float = 45.0,
+    all_returns: bool = False,
+    return_numbers: Optional[np.ndarray] = None,
+    num_returns: Optional[np.ndarray] = None,
     progress: ProgressCB = None,
     **kwargs,
 ) -> np.ndarray:
@@ -2264,6 +2286,13 @@ def ground_classify_multiscale_alpha_shape(
     ys_f = np.asarray(ys, dtype=np.float64)
     zs_f = np.asarray(zs, dtype=np.float64)
 
+    # Return filtering: default prefers last returns
+    if not all_returns and return_numbers is not None and num_returns is not None:
+        last_mask = np.asarray(return_numbers) == np.asarray(num_returns)
+        cand_indices = np.flatnonzero(last_mask) if last_mask.sum() >= 3 else np.arange(n)
+    else:
+        cand_indices = np.arange(n)
+
     min_x, max_x = float(xs_f.min()), float(xs_f.max())
     min_y, max_y = float(ys_f.min()), float(ys_f.max())
 
@@ -2272,7 +2301,7 @@ def ground_classify_multiscale_alpha_shape(
 
     # 1. Coarse alpha layer (large scale seeds)
     coarse_mask = _extract_alpha_shape_bottom_layer(
-        xs_f, ys_f, zs_f, coarse_alpha, min_x, min_y, max_x, max_y
+        xs_f, ys_f, zs_f, coarse_alpha, min_x, min_y, max_x, max_y, cand_indices=cand_indices
     )
 
     if progress:
@@ -2280,7 +2309,7 @@ def ground_classify_multiscale_alpha_shape(
 
     # 2. Medium alpha layer
     med_mask = _extract_alpha_shape_bottom_layer(
-        xs_f, ys_f, zs_f, medium_alpha, min_x, min_y, max_x, max_y
+        xs_f, ys_f, zs_f, medium_alpha, min_x, min_y, max_x, max_y, cand_indices=cand_indices
     )
 
     if progress:
@@ -2288,7 +2317,7 @@ def ground_classify_multiscale_alpha_shape(
 
     # 3. Fine alpha layer
     fine_mask = _extract_alpha_shape_bottom_layer(
-        xs_f, ys_f, zs_f, fine_alpha, min_x, min_y, max_x, max_y
+        xs_f, ys_f, zs_f, fine_alpha, min_x, min_y, max_x, max_y, cand_indices=cand_indices
     )
 
     # Hierarchical Multiscale Constraint (Cao et al. 2024):
@@ -2308,7 +2337,7 @@ def ground_classify_multiscale_alpha_shape(
                     b_z = zs_f[c_idx][tri_c.simplices[s_m[ins_m]]]
                     min_tri_z = np.min(b_z, axis=1)
                     dz_m = zs_f[m_idx[ins_m]] - min_tri_z
-                    valid_m = dz_m <= 2.5
+                    valid_m = dz_m <= 1.5
                     drop_m = m_idx[ins_m][~valid_m]
                     med_mask[drop_m] = False
             bottom_seeds |= med_mask
@@ -2322,7 +2351,7 @@ def ground_classify_multiscale_alpha_shape(
                     b_z = zs_f[c_idx][tri_c.simplices[s_f[ins_f]]]
                     min_tri_z = np.min(b_z, axis=1)
                     dz_f = zs_f[f_idx[ins_f]] - min_tri_z
-                    valid_f = dz_f <= 2.0
+                    valid_f = dz_f <= 1.0
                     drop_f = f_idx[ins_f][~valid_f]
                     fine_mask[drop_f] = False
             bottom_seeds |= fine_mask

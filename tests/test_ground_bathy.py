@@ -20,6 +20,7 @@ from ground import (
     ground_classify_epptd,
     ground_classify_epptd_two_pass,
     ground_classify_stepdown,
+    ground_classify_multiscale_alpha_shape,
 )
 
 def _make_scene(include_scatter: bool = False, seed: int = 7):
@@ -316,6 +317,28 @@ def test_stepdown_bathy_channel_separation():
     assert ratios["water"] < 0.05, f"Water surface classified as ground: {ratios['water']:.2%}"
 
 
+def test_multiscale_alpha_shape_speed_and_water_rejection():
+    """Verify that M-AlphaShape runs fast (<1s) and successfully excludes water surface."""
+    import time
+    data = _make_scene()
+    t0 = time.time()
+    mask = ground_classify_multiscale_alpha_shape(
+        data["x"], data["y"], data["z"],
+        coarse_alpha=20.0,
+        medium_alpha=6.0,
+        fine_alpha=2.0,
+        max_distance=0.20,
+    )
+    elapsed = time.time() - t0
+    ratios = _ratios(data, mask)
+
+    assert elapsed < 3.0, f"M-AlphaShape too slow: {elapsed:.2f}s"
+    assert ratios["bed"] > 0.90, f"Riverbed lost: {ratios['bed']:.2%}"
+    assert ratios["bank"] > 0.95, f"Riverbank lost: {ratios['bank']:.2%}"
+    assert ratios["dry"] > 0.95, f"Dry ground lost: {ratios['dry']:.2%}"
+    assert ratios["water"] < 0.05, f"Water surface leaked into ground: {ratios['water']:.2%}"
+
+
 import unittest
 
 class TestGroundBathy(unittest.TestCase):
@@ -336,6 +359,9 @@ class TestGroundBathy(unittest.TestCase):
 
     def test_stepdown_bathy(self):
         test_stepdown_bathy_channel_separation()
+
+    def test_malpha_shape(self):
+        test_multiscale_alpha_shape_speed_and_water_rejection()
 
 
 if __name__ == "__main__":

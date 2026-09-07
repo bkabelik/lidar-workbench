@@ -241,8 +241,11 @@ def _ground_process_tile(tile_id: str, las_path: str, method: str,
             coarse_alpha=params.get("coarse_alpha", 20.0),
             medium_alpha=params.get("medium_alpha", 6.0),
             fine_alpha=params.get("fine_alpha", 2.0),
-            max_distance=params.get("max_distance", 0.5),
-            max_terrain_angle=params.get("max_terrain_angle", 60.0),
+            max_distance=params.get("max_distance", 0.20),
+            max_terrain_angle=params.get("max_terrain_angle", 45.0),
+            all_returns=params.get("all_returns", False),
+            return_numbers=rn_sub,
+            num_returns=nr_sub,
         )
     elif method == "egs_csf":
         mask = ground_classify_egs_csf(
@@ -875,10 +878,11 @@ class GroundClassifyDialog(QDialog):
         self._as_fine_alpha.setSuffix(" m")
         asf.addRow("Fine Scale (α₃):", self._as_fine_alpha)
         self._as_dist = QDoubleSpinBox()
-        self._as_dist.setRange(0.1, 10.0)
+        self._as_dist.setRange(0.02, 5.0)
         self._as_dist.setDecimals(2)
-        self._as_dist.setValue(1.0)
+        self._as_dist.setValue(0.20)
         self._as_dist.setSuffix(" m")
+        self._as_dist.setToolTip("Max perpendicular distance to bottom alpha-shape TIN. Lower (e.g. 0.15-0.20m) strips water surface reflections and low vegetation.")
         asf.addRow("Max Distance:", self._as_dist)
         self._as_angle = QDoubleSpinBox()
         self._as_angle.setRange(1.0, 45.0)
@@ -889,8 +893,9 @@ class GroundClassifyDialog(QDialog):
         self._as_terrain_angle = QDoubleSpinBox()
         self._as_terrain_angle.setRange(10.0, 90.0)
         self._as_terrain_angle.setDecimals(1)
-        self._as_terrain_angle.setValue(60.0)
+        self._as_terrain_angle.setValue(45.0)
         self._as_terrain_angle.setSuffix("°")
+        self._as_terrain_angle.setToolTip("Max allowed slope angle of ground facets. 45° prevents steep bridging triangles across riverbanks and water.")
         asf.addRow("Max Terrain Angle:", self._as_terrain_angle)
         self._alpha_shape_group.setVisible(False)
         layout.addWidget(self._alpha_shape_group)
