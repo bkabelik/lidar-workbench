@@ -165,6 +165,9 @@ class MainWindow(QMainWindow):
         # Keep ground-control dialog alive (non-modal, prevent GC of wrapper)
         self._ground_control_dlg: Optional[GroundControlDialog] = None
 
+        # Keep Point QC map viewer window alive (modeless top-level window)
+        self._point_qc_window: Optional[Any] = None
+
         # True when the project has changes that haven't been persisted via
         # File → Save Project (tile/geometry edits, processing results, …).
         self._project_dirty = False
@@ -198,6 +201,11 @@ class MainWindow(QMainWindow):
         if not self._confirm_save_if_needed():
             event.ignore()
             return
+        if getattr(self, "_point_qc_window", None) is not None:
+            try:
+                self._point_qc_window.close()
+            except Exception:
+                pass
         super().closeEvent(event)
 
     def _mark_project_dirty(self) -> None:
@@ -354,6 +362,11 @@ class MainWindow(QMainWindow):
         crs_action.triggered.connect(self._on_crs)
         tools_menu.addAction(crs_action)
 
+        point_qc_action = QAction("&Point QC / Map Viewer…", self)
+        point_qc_action.setObjectName("point_qc_viewer")
+        point_qc_action.triggered.connect(self._on_point_qc)
+        tools_menu.addAction(point_qc_action)
+
         tools_menu.addSeparator()
 
         analysis_action = QAction("&Processing Time Analysis…", self)
@@ -431,6 +444,10 @@ class MainWindow(QMainWindow):
         crs_btn = toolbar.addAction("CRS")
         crs_btn.setToolTip("CRS / Projection (assign, transform, match points)")
         crs_btn.triggered.connect(self._on_crs)
+
+        point_qc_btn = toolbar.addAction("PointQC")
+        point_qc_btn.setToolTip("Point QC & Map Viewer (raster/vector viewer, strip differences, density, spacing)")
+        point_qc_btn.triggered.connect(self._on_point_qc)
 
     def _setup_central_widget(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
@@ -1658,6 +1675,110 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Transform Failed", str(exc))
             self.set_status("Match transform failed", timeout=5000)
+
+    def _on_point_qc(self) -> None:
+        """Open the Point QC & Map Viewer window."""
+        if not self._tm or not self._db:
+            QMessageBox.information(
+                self, "No Project",
+                "Please open or create a project first before opening Point QC.",
+            )
+            return
+
+        from .point_qc_window import PointQCWindow
+        proj_dir = str(self._pm.project_root) if self._pm and self._pm.project_root else "."
+        selected_tids = self._tile_list_widget.get_selected_tile_ids()
+
+        if getattr(self, "_point_qc_window", None) is None:
+            self._point_qc_window = PointQCWindow(
+                tile_manager=self._tm,
+                database=self._db,
+                project_dir=proj_dir,
+                selected_tile_ids=selected_tids if selected_tids else None,
+                parent=None,
+            )
+            self._point_qc_window.jump_to_tile.connect(self._on_tile_open)
+            self._point_qc_window.bulk_load_tiles.connect(self._on_point_qc_bulk_load)
+        else:
+            self._point_qc_window.selected_tile_ids = selected_tids if selected_tids else []
+
+        self._point_qc_window.show()
+        self._point_qc_window.raise_()
+        self._point_qc_window.activateWindow()
+
+    def _on_point_qc_bulk_load(self, tile_ids: List[str], max_points: int = 5_000_000) -> None:
+        """Bulk load multiple tiles into the 3D viewer."""
+        if not tile_ids or not self._tm:
+            return
+
+        self.set_status(f"Bulk loading {len(tile_ids)} tiles into 3D viewer…", timeout=0)
+        logger.info("Bulk loading tiles: %s", tile_ids)
+
+        all_x, all_y, all_z = [], [], []
+        all_cls, all_int, all_ret, all_fl = [], [], [], []
+        total_pts = 0
+
+        for tid in tile_ids:
+            data = self._tm.load_tile_points_full(tid)
+            if data is None or "x" not in data or len(data["x"]) == 0:
+                continue
+            all_x.append(data["x"])
+            all_y.append(data["y"])
+            all_z.append(data["z"])
+            if "classification" in data:
+                all_cls.append(data["classification"])
+            if "intensity" in data:
+                all_int.append(data["intensity"])
+            if "return_number" in data:
+                all_ret.append(data["return_number"])
+            if "point_source_id" in data:
+                all_fl.append(data["point_source_id"])
+            total_pts += len(data["x"])
+
+        if not all_x:
+            QMessageBox.warning(self, "No Points", "None of the selected tiles contained point data.")
+            self.set_status("Bulk load failed: no point data found", timeout=4000)
+            return
+
+        merged_x = np.concatenate(all_x)
+        merged_y = np.concatenate(all_y)
+        merged_z = np.concatenate(all_z)
+        merged_cls = np.concatenate(all_cls) if len(all_cls) == len(all_x) else None
+        merged_int = np.concatenate(all_int) if len(all_int) == len(all_x) else None
+        merged_ret = np.concatenate(all_ret) if len(all_ret) == len(all_x) else None
+        merged_fl = np.concatenate(all_fl) if len(all_fl) == len(all_x) else None
+
+        # Downsample if total points exceed max_points for fluid 3D rendering
+        n_total = len(merged_x)
+        if n_total > max_points:
+            step = int(np.ceil(n_total / max_points))
+            merged_x = merged_x[::step]
+            merged_y = merged_y[::step]
+            merged_z = merged_z[::step]
+            if merged_cls is not None:
+                merged_cls = merged_cls[::step]
+            if merged_int is not None:
+                merged_int = merged_int[::step]
+            if merged_ret is not None:
+                merged_ret = merged_ret[::step]
+            if merged_fl is not None:
+                merged_fl = merged_fl[::step]
+            logger.info("Downsampled bulk cloud from %d to %d points (1:%d)", n_total, len(merged_x), step)
+
+        bulk_data = {
+            "x": merged_x,
+            "y": merged_y,
+            "z": merged_z,
+            "classification": merged_cls,
+            "intensity": merged_int,
+            "return_number": merged_ret,
+            "point_source_id": merged_fl,
+        }
+
+        # Load into multi_view
+        self._multi_view.load_tile(f"bulk_{len(tile_ids)}_tiles", bulk_data)
+        self._properties_panel.set_tile_data(bulk_data)
+        self.set_status(f"Loaded {len(tile_ids)} tiles ({len(merged_x):,} pts displayed) in 3D view", timeout=6000)
 
     def _on_export_raster(self, tile_ids: Optional[List[str]] = None) -> None:
         """Open the DTM / DSM export dialog.

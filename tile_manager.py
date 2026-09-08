@@ -891,6 +891,61 @@ class TileManager:
             logger.warning("Failed to sync tile bbox for %s", tile_id)
         return actual
 
+    def sync_all_tile_bboxes_from_las(self) -> int:
+        """Sync all tile bounding boxes in the database with their LAS files on disk.
+
+        Derives each tile's nominal square survey grid bounding box from its actual
+        LAS points, fixing any transposition or stale bounding boxes.
+        Returns the number of updated tiles.
+        """
+        tiles = self._db.get_all_tiles()
+        if not tiles:
+            return 0
+
+        tile_size_m = float(self._pm.metadata.get("tile_size_m", 200.0) or 200.0)
+        overlap_m = float(self._pm.metadata.get("tile_overlap_m", 5.0) or 5.0)
+        stride = tile_size_m - overlap_m if tile_size_m > overlap_m else tile_size_m
+
+        survey_tiles = [
+            t for t in tiles
+            if str(t.get("status", "")).upper() != "NOISE" and "_noise" not in str(t.get("id", "")).lower()
+        ]
+        if not survey_tiles:
+            return 0
+
+        las_headers: Dict[str, BBox] = {}
+        for t in survey_tiles:
+            tid = str(t.get("id"))
+            box = self.get_tile_bbox_from_las(tid)
+            if box is not None:
+                las_headers[tid] = box
+
+        if not las_headers:
+            return 0
+
+        # Determine grid alignment phase (modulo stride) from LAS coordinates
+        sample_b = next(iter(las_headers.values()))
+        x_mod = sample_b[0] % stride
+        y_mod = sample_b[1] % stride
+        half_ov = overlap_m / 2.0
+
+        updated = 0
+        with self._db.connect() as conn:
+            for tid, (lx0, ly0, lx1, ly1) in las_headers.items():
+                mid_x = 0.5 * (lx0 + lx1)
+                mid_y = 0.5 * (ly0 + ly1)
+                core_x0 = np.floor((mid_x - x_mod) / stride) * stride + x_mod
+                core_y0 = np.floor((mid_y - y_mod) / stride) * stride + y_mod
+                x0 = core_x0 - half_ov
+                y0 = core_y0 - half_ov
+                x1 = x0 + tile_size_m
+                y1 = y0 + tile_size_m
+                self._db.update_tile_bbox(conn, tid, (float(x0), float(y0), float(x1), float(y1)))
+                updated += 1
+
+        logger.info("Synced %d tile bounding boxes from LAS files.", updated)
+        return updated
+
     def get_tiles_in_viewport(
         self,
         min_x: float,
@@ -1176,6 +1231,9 @@ def _compute_tile_grid(
     """
     Generate a regular grid of tile bounding boxes covering *global_bbox*.
 
+    Ordered row-major (y outer, x inner) to match point indexing:
+    ``tile_idx = row * grid_cols + col``.
+
     Args:
         global_bbox: ``(min_x, min_y, max_x, max_y)``.
         tile_size:   Tile edge length in CRS units.
@@ -1190,15 +1248,13 @@ def _compute_tile_grid(
         stride = tile_size
 
     tiles: List[BBox] = []
-    x0 = min_x
-    while x0 < max_x:
-        y0 = min_y
-        while y0 < max_y:
-            tx_max = min(x0 + tile_size, max_x)
-            ty_max = min(y0 + tile_size, max_y)
-            tiles.append((x0, y0, tx_max, ty_max))
-            y0 += stride
-        x0 += stride
+    y0 = min_y
+    while y0 < max_y:
+        x0 = min_x
+        while x0 < max_x:
+            tiles.append((x0, y0, x0 + tile_size, y0 + tile_size))
+            x0 += stride
+        y0 += stride
 
     return tiles
 

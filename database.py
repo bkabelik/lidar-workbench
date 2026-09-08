@@ -105,6 +105,11 @@ class Database:
         """
         self._db_path = Path(db_path)
 
+    @property
+    def db_path(self) -> Path:
+        """Return the Path to the SQLite database file."""
+        return self._db_path
+
     # ── connection management ──────────────────────────────────────
 
     @contextmanager
