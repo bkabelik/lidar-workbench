@@ -907,6 +907,26 @@ class TileManager:
         self._point_cache.clear()
         logger.debug("Point cache cleared")
 
+    def tile_ids(self) -> List[str]:
+        """Return all tile IDs registered in the project database."""
+        if self._db is None:
+            return []
+        tiles = self._db.get_all_tiles()
+        return [t["id"] for t in tiles]
+
+    def tile_las_path(self, tile_id: str) -> Optional[Path]:
+        """Return the absolute path to a tile's LAS file on disk, or None."""
+        if self._pm.tiles_dir is None:
+            return None
+        tile_info = self._db.get_tile(tile_id) if self._db else None
+        if tile_info is not None:
+            las_path = self._pm.tiles_dir / tile_info["filename"]
+            if las_path.is_file():
+                return las_path
+        # Fallback to direct {tile_id}.las
+        direct = self._pm.tiles_dir / f"{tile_id}.las"
+        return direct if direct.is_file() else None
+
 
 # ── Internal helpers ──────────────────────────────────────────────────
 

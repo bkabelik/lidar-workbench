@@ -301,6 +301,11 @@ class MainWindow(QMainWindow):
         filter_action.triggered.connect(self._on_filter)
         tools_menu.addAction(filter_action)
 
+        strip_adj_action = QAction("&Strip Adjustment…", self)
+        strip_adj_action.setObjectName("strip_adj")
+        strip_adj_action.triggered.connect(self._on_strip_adjustment)
+        tools_menu.addAction(strip_adj_action)
+
         classify_action = QAction("&Classify (Pointcept)…", self)
         classify_action.setObjectName("classify")
         classify_action.triggered.connect(self._on_classify)
@@ -400,6 +405,10 @@ class MainWindow(QMainWindow):
         filter_btn = toolbar.addAction("Filter")
         filter_btn.setToolTip("Apply noise filter to selected tiles")
         filter_btn.triggered.connect(self._on_filter)
+
+        strip_adj_btn = toolbar.addAction("StripAdj")
+        strip_adj_btn.setToolTip("LiDAR Strip Adjustment (align overlapping flightlines via XYZ, boresight, drift)")
+        strip_adj_btn.triggered.connect(self._on_strip_adjustment)
 
         classify_btn = toolbar.addAction("Classify")
         classify_btn.setToolTip("Run Pointcept classification on selected tiles")
@@ -1246,6 +1255,43 @@ class MainWindow(QMainWindow):
         with self._db.connect() as conn:
             self._db.update_tile_bbox(conn, tile_id, bbox, point_count=len(data["x"]))
         return True
+
+    def _on_strip_adjustment(self) -> None:
+        """Open the Strip Adjustment dialog to align overlapping flightlines."""
+        if not self._tm or not self._db:
+            QMessageBox.information(
+                self, "No Project",
+                "Please open or create a project first before running Strip Adjustment.",
+            )
+            return
+
+        from .strip_adjustment_dialog import StripAdjustmentDialog
+        proj_dir = str(self._pm.project_root) if self._pm and self._pm.project_root else "."
+        selected_tids = self._tile_list_widget.get_selected_tile_ids()
+        dlg = StripAdjustmentDialog(
+            tile_manager=self._tm,
+            database=self._db,
+            project_dir=proj_dir,
+            tile_ids=selected_tids if selected_tids else None,
+            parent=self,
+        )
+        dlg.adjustment_applied.connect(self._on_strip_adjustment_applied)
+        dlg.exec_()
+
+    def _on_strip_adjustment_applied(self, results: dict) -> None:
+        """Handler called after strip adjustment is applied to project tiles."""
+        self._mark_project_dirty()
+        if self._editor.tile_id is not None:
+            data = self._tm.load_tile_points_full(self._editor.tile_id)
+            if data is not None:
+                self._multi_load_for_edit(data)
+        self._regenerate_dtm()
+        init_rmse = results.get("initial_rmse", 0.0)
+        final_rmse = results.get("final_rmse", 0.0)
+        self.set_status(
+            f"Strip adjustment applied: Overlap RMSE reduced from {init_rmse:.3f} m to {final_rmse:.3f} m.",
+            timeout=8000,
+        )
 
     def _on_ground_control(self) -> None:
         """Open the Ground Control dialog for selected tiles."""
