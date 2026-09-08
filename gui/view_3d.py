@@ -72,11 +72,14 @@ class _PreviewView(QWidget):
         from PySide6.QtGui import QPainter
         from PySide6.QtCore import QRectF
         p = QPainter(self)
-        p.setRenderHint(QPainter.SmoothPixmapTransform)
-        src = QRectF(0, 0, self._pixmap.width(), self._pixmap.height())
-        dst = QRectF(0, 0, self.width(), self.height())
-        p.drawPixmap(dst, self._pixmap, src)
-        p.end()
+        try:
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            src = QRectF(0, 0, self._pixmap.width(), self._pixmap.height())
+            dst = QRectF(0, 0, self.width(), self.height())
+            p.drawPixmap(dst, self._pixmap, src)
+        finally:
+            if p.isActive():
+                p.end()
 
     def mousePressEvent(self, event):
         self._mouse_last = (event.position().x(), event.position().y())

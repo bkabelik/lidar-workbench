@@ -168,6 +168,10 @@ class ViewDTM(QWidget):
         """Generate a DTM from the currently loaded ground-classified points."""
         if self._points_x_orig is None:
             return
+        cls = self._points_class_orig
+        if cls is None or not (cls == ground_class).any():
+            logger.debug("No ground points (class %d) available for DTM, skipping", ground_class)
+            return
         try:
             xs = self._points_x_orig
             ys = self._points_y_orig
@@ -471,105 +475,107 @@ class ViewDTM(QWidget):
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#1a1a2e"))
+        try:
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.fillRect(self.rect(), QColor("#1a1a2e"))
 
-        show_raster = self._show_dtm and self._dtm_pixmap is not None
+            show_raster = self._show_dtm and self._dtm_pixmap is not None
 
-        if show_raster:
-            # DTM raster (hillshade) — smooth scaling looks better here
-            painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
-            target_rect = self._bbox_to_widget_rect(self._dtm_bbox)
-            painter.drawPixmap(
-                target_rect, self._dtm_pixmap,
-                QRectF(0, 0, self._dtm_pixmap.width(), self._dtm_pixmap.height()),
-            )
-            painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
-        elif self._scatter_pixmap is not None and self._scatter_bbox is not None:
-            # Class-coloured point scatter
-            target_rect = self._bbox_to_widget_rect(self._scatter_bbox)
-            painter.drawPixmap(
-                target_rect, self._scatter_pixmap,
-                QRectF(0, 0, self._scatter_pixmap.width(), self._scatter_pixmap.height()),
-            )
+            if show_raster:
+                # DTM raster (hillshade) — smooth scaling looks better here
+                painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+                target_rect = self._bbox_to_widget_rect(self._dtm_bbox)
+                painter.drawPixmap(
+                    target_rect, self._dtm_pixmap,
+                    QRectF(0, 0, self._dtm_pixmap.width(), self._dtm_pixmap.height()),
+                )
+                painter.setRenderHint(QPainter.SmoothPixmapTransform, False)
+            elif self._scatter_pixmap is not None and self._scatter_bbox is not None:
+                # Class-coloured point scatter
+                target_rect = self._bbox_to_widget_rect(self._scatter_bbox)
+                painter.drawPixmap(
+                    target_rect, self._scatter_pixmap,
+                    QRectF(0, 0, self._scatter_pixmap.width(), self._scatter_pixmap.height()),
+                )
 
-        # Draw profile line
-        if self._profile_start is not None:
-            pen = QPen(QColor("#ff4444"), 2, Qt.DashLine)
+            # Draw profile line
+            if self._profile_start is not None:
+                pen = QPen(QColor("#ff4444"), 2, Qt.DashLine)
+                painter.setPen(pen)
+                p1 = self._world_to_widget(*self._profile_start)
+                if self._profile_end is not None:
+                    p2 = self._world_to_widget(*self._profile_end)
+                    painter.drawLine(p1, p2)
+
+            # Draw corridor band (semi-transparent shaded band)
+            if self._corridor_start is not None and self._corridor_end is not None:
+                sx, sy = self._corridor_start
+                ex, ey = self._corridor_end
+                dx, dy = ex - sx, ey - sy
+                length = math.sqrt(dx * dx + dy * dy)
+                if length > 0:
+                    # Perpendicular unit vector (rotate 90°)
+                    px, py = -dy / length, dx / length
+                    half_w = self._corridor_width / 2.0
+
+                    # Four corners of the corridor band
+                    p1 = self._world_to_widget(sx + px * (-half_w), sy + py * (-half_w))
+                    p2 = self._world_to_widget(sx + px * half_w, sy + py * half_w)
+                    p3 = self._world_to_widget(ex + px * half_w, ey + py * half_w)
+                    p4 = self._world_to_widget(ex + px * (-half_w), ey + py * (-half_w))
+
+                    path = QPainterPath()
+                    path.moveTo(p1)
+                    path.lineTo(p2)
+                    path.lineTo(p3)
+                    path.lineTo(p4)
+                    path.closeSubpath()
+
+                    # Fill with semi-transparent light blue
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QColor(80, 140, 220, 50))
+                    painter.drawPath(path)
+
+                    # Outline
+                    painter.setPen(QPen(QColor(80, 140, 220, 140), 1))
+                    painter.setBrush(Qt.NoBrush)
+                    painter.drawPath(path)
+
+            # Crosshair at center
+            pen = QPen(QColor("#444"), 1, Qt.DotLine)
             painter.setPen(pen)
-            p1 = self._world_to_widget(*self._profile_start)
-            if self._profile_end is not None:
-                p2 = self._world_to_widget(*self._profile_end)
-                painter.drawLine(p1, p2)
+            cx = self.width() / 2
+            cy = self.height() / 2
+            painter.drawLine(cx - 10, cy, cx + 10, cy)
+            painter.drawLine(cx, cy - 10, cx, cy + 10)
 
-        # Draw corridor band (semi-transparent shaded band)
-        if self._corridor_start is not None and self._corridor_end is not None:
-            sx, sy = self._corridor_start
-            ex, ey = self._corridor_end
-            dx, dy = ex - sx, ey - sy
-            length = math.sqrt(dx * dx + dy * dy)
-            if length > 0:
-                # Perpendicular unit vector (rotate 90°)
-                px, py = -dy / length, dx / length
-                half_w = self._corridor_width / 2.0
+            # North compass indicator (top-right corner: nadir top-down view)
+            nx_pos = self.width() - 28
+            ny_pos = 36
+            painter.setPen(Qt.NoPen)
+            # Red North needle
+            painter.setBrush(QColor("#e74c3c"))
+            n_arrow = QPainterPath()
+            n_arrow.moveTo(nx_pos, ny_pos - 16)
+            n_arrow.lineTo(nx_pos - 5, ny_pos)
+            n_arrow.lineTo(nx_pos, ny_pos - 4)
+            n_arrow.closeSubpath()
+            painter.drawPath(n_arrow)
 
-                # Four corners of the corridor band
-                p1 = self._world_to_widget(sx + px * (-half_w), sy + py * (-half_w))
-                p2 = self._world_to_widget(sx + px * half_w, sy + py * half_w)
-                p3 = self._world_to_widget(ex + px * half_w, ey + py * half_w)
-                p4 = self._world_to_widget(ex + px * (-half_w), ey + py * (-half_w))
+            # Grey South needle
+            painter.setBrush(QColor("#bdc3c7"))
+            s_arrow = QPainterPath()
+            s_arrow.moveTo(nx_pos, ny_pos - 16)
+            s_arrow.lineTo(nx_pos + 5, ny_pos)
+            s_arrow.lineTo(nx_pos, ny_pos - 4)
+            s_arrow.closeSubpath()
+            painter.drawPath(s_arrow)
 
-                path = QPainterPath()
-                path.moveTo(p1)
-                path.lineTo(p2)
-                path.lineTo(p3)
-                path.lineTo(p4)
-                path.closeSubpath()
-
-                # Fill with semi-transparent light blue
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor(80, 140, 220, 50))
-                painter.drawPath(path)
-
-                # Outline
-                painter.setPen(QPen(QColor(80, 140, 220, 140), 1))
-                painter.setBrush(Qt.NoBrush)
-                painter.drawPath(path)
-
-        # Crosshair at center
-        pen = QPen(QColor("#444"), 1, Qt.DotLine)
-        painter.setPen(pen)
-        cx = self.width() / 2
-        cy = self.height() / 2
-        painter.drawLine(cx - 10, cy, cx + 10, cy)
-        painter.drawLine(cx, cy - 10, cx, cy + 10)
-
-        # North compass indicator (top-right corner: nadir top-down view)
-        nx_pos = self.width() - 28
-        ny_pos = 36
-        painter.setPen(Qt.NoPen)
-        # Red North needle
-        painter.setBrush(QColor("#e74c3c"))
-        n_arrow = QPainterPath()
-        n_arrow.moveTo(nx_pos, ny_pos - 16)
-        n_arrow.lineTo(nx_pos - 5, ny_pos)
-        n_arrow.lineTo(nx_pos, ny_pos - 4)
-        n_arrow.closeSubpath()
-        painter.drawPath(n_arrow)
-
-        # Grey South needle
-        painter.setBrush(QColor("#bdc3c7"))
-        s_arrow = QPainterPath()
-        s_arrow.moveTo(nx_pos, ny_pos - 16)
-        s_arrow.lineTo(nx_pos + 5, ny_pos)
-        s_arrow.lineTo(nx_pos, ny_pos - 4)
-        s_arrow.closeSubpath()
-        painter.drawPath(s_arrow)
-
-        painter.setPen(QPen(QColor("#ffffff"), 1))
-        painter.drawText(int(nx_pos - 4), int(ny_pos - 19), "N")
-
-        painter.end()
+            painter.setPen(QPen(QColor("#ffffff"), 1))
+            painter.drawText(int(nx_pos - 4), int(ny_pos - 19), "N")
+        finally:
+            if painter.isActive():
+                painter.end()
 
     # ── mouse events ───────────────────────────────────────────────
 

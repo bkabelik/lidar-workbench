@@ -152,6 +152,94 @@ class RiverCenterline:
 
         return best_s
 
+    @property
+    def cum_dist(self) -> np.ndarray:
+        """Cumulative distance array along the vertices."""
+        return self._cum_dist
+
+    def trim(self, s_start: float, s_end: float) -> "RiverCenterline":
+        """
+        Trim the centerline to the station interval [s_start, s_end].
+        Returns a new RiverCenterline object whose station 0.0 corresponds to s_start.
+        """
+        s_a = max(0.0, min(float(s_start), float(s_end)))
+        s_b = min(self._total_length, max(float(s_start), float(s_end)))
+        if s_b - s_a < 1.0:
+            raise ValueError(f"Trim range [{s_a:.1f}, {s_b:.1f}] is too short (must be >= 1.0 m).")
+
+        p_start, _, _ = self.evaluate(s_a)
+        p_end, _, _ = self.evaluate(s_b)
+
+        # Vertices strictly between s_a and s_b
+        mask = (self._cum_dist > s_a + 1e-4) & (self._cum_dist < s_b - 1e-4)
+        mid_verts = self._verts[mask]
+
+        new_verts = [p_start]
+        if len(mid_verts) > 0:
+            new_verts.extend(mid_verts)
+        new_verts.append(p_end)
+
+        return RiverCenterline(np.array(new_verts))
+
+
+def project_points_to_centerline(
+    centerline: RiverCenterline,
+    xs: np.ndarray,
+    ys: np.ndarray,
+    chunk_size: int = 25000,
+) -> np.ndarray:
+    """
+    Project an array of 2D points (xs, ys) onto the centerline polyline,
+    returning station distance s along the centerline for each point.
+    Vectorized over points and polyline segments.
+    """
+    xs = np.asarray(xs, dtype=np.float64)
+    ys = np.asarray(ys, dtype=np.float64)
+    n_pts = len(xs)
+    if n_pts == 0:
+        return np.array([], dtype=np.float64)
+
+    verts = centerline.vertices
+    cum_dist = centerline.cum_dist
+
+    p0 = verts[:-1]  # (S, 2)
+    p1 = verts[1:]   # (S, 2)
+    seg_vec = p1 - p0
+    seg_len_sq = np.sum(seg_vec ** 2, axis=1)  # (S,)
+    seg_len = np.sqrt(seg_len_sq)
+
+    valid_segs = seg_len > 1e-9
+    p0 = p0[valid_segs]
+    seg_vec = seg_vec[valid_segs]
+    seg_len_sq = seg_len_sq[valid_segs]
+    cum_dist_valid = cum_dist[:-1][valid_segs]
+
+    out_s = np.empty(n_pts, dtype=np.float64)
+
+    # Process in chunks to prevent memory spikes if n_pts is large
+    for start_idx in range(0, n_pts, chunk_size):
+        end_idx = min(start_idx + chunk_size, n_pts)
+        pts_chunk = np.column_stack((xs[start_idx:end_idx], ys[start_idx:end_idx]))  # (C, 2)
+
+        # w: (C, S, 2)
+        w = pts_chunk[:, None, :] - p0[None, :, :]
+        # dot product w * seg_vec: (C, S)
+        t = np.sum(w * seg_vec[None, :, :], axis=2) / seg_len_sq[None, :]
+        t_clamped = np.clip(t, 0.0, 1.0)
+
+        # proj: p0 + t_clamped * seg_vec -> (C, S, 2)
+        proj = p0[None, :, :] + t_clamped[:, :, None] * seg_vec[None, :, :]
+        # dist_sq: (C, S)
+        d_sq = np.sum((pts_chunk[:, None, :] - proj) ** 2, axis=2)
+
+        # Best segment for each point in chunk
+        best_seg = np.argmin(d_sq, axis=1)  # (C,)
+        best_t = t_clamped[np.arange(len(pts_chunk)), best_seg]  # (C,)
+        best_s = cum_dist_valid[best_seg] + best_t * np.sqrt(seg_len_sq[best_seg])
+        out_s[start_idx:end_idx] = best_s
+
+    return out_s
+
 
 def slice_cross_section_points(
     xs: np.ndarray,
@@ -164,6 +252,7 @@ def slice_cross_section_points(
     slice_thickness: float = 2.0,
     sensor_types: Optional[np.ndarray] = None,
     classes: Optional[np.ndarray] = None,
+    sorted_x: bool = False,
 ) -> dict:
     """
     Slice 3D points in a transverse corridor perpendicular to the river centerline.
@@ -177,6 +266,7 @@ def slice_cross_section_points(
         slice_thickness: Corridor thickness along the stream (metres, default 2.0).
         sensor_types: Optional array of sensor types (1=NIR/topo, 2=Green/bathy).
         classes: Optional array of point classifications.
+        sorted_x: Whether xs is sorted in ascending order for O(log N) binary search.
 
     Returns:
         Dictionary with sliced points in cross-section local coordinates:
@@ -191,27 +281,58 @@ def slice_cross_section_points(
     nx, ny = normal
     tx, ty = tangent
 
-    # Vector from center to points
-    dx = xs - cx
-    dy = ys - cy
-
-    # Fast bounding box pre-filter
     max_r = corridor_width * 0.5 + slice_thickness
-    bbox_mask = (np.abs(dx) <= max_r) & (np.abs(dy) <= max_r)
-    if not bbox_mask.any():
-        return {
-            "offset": np.array([], dtype=np.float64),
-            "z": np.array([], dtype=np.float64),
-            "stream_dist": np.array([], dtype=np.float64),
-            "sensor_type": None,
-            "classification": None,
-            "indices": np.array([], dtype=np.int64),
-        }
 
-    sub_idx = np.flatnonzero(bbox_mask)
-    dx_sub = dx[sub_idx]
-    dy_sub = dy[sub_idx]
-    z_sub = zs[sub_idx]
+    if sorted_x:
+        i0 = int(np.searchsorted(xs, cx - max_r, side="left"))
+        i1 = int(np.searchsorted(xs, cx + max_r, side="right"))
+        if i0 >= i1:
+            return {
+                "offset": np.array([], dtype=np.float64),
+                "z": np.array([], dtype=np.float64),
+                "stream_dist": np.array([], dtype=np.float64),
+                "sensor_type": None,
+                "classification": None,
+                "indices": np.array([], dtype=np.int64),
+            }
+        dx_cand = xs[i0:i1] - cx
+        dy_cand = ys[i0:i1] - cy
+        sub_mask = np.abs(dy_cand) <= max_r
+        if not sub_mask.any():
+            return {
+                "offset": np.array([], dtype=np.float64),
+                "z": np.array([], dtype=np.float64),
+                "stream_dist": np.array([], dtype=np.float64),
+                "sensor_type": None,
+                "classification": None,
+                "indices": np.array([], dtype=np.int64),
+            }
+        rel_idx = np.flatnonzero(sub_mask)
+        sub_idx = i0 + rel_idx
+        dx_sub = dx_cand[rel_idx]
+        dy_sub = dy_cand[rel_idx]
+        z_sub = zs[sub_idx]
+    else:
+        # Vector from center to points
+        dx = xs - cx
+        dy = ys - cy
+
+        # Fast bounding box pre-filter
+        bbox_mask = (np.abs(dx) <= max_r) & (np.abs(dy) <= max_r)
+        if not bbox_mask.any():
+            return {
+                "offset": np.array([], dtype=np.float64),
+                "z": np.array([], dtype=np.float64),
+                "stream_dist": np.array([], dtype=np.float64),
+                "sensor_type": None,
+                "classification": None,
+                "indices": np.array([], dtype=np.int64),
+            }
+
+        sub_idx = np.flatnonzero(bbox_mask)
+        dx_sub = dx[sub_idx]
+        dy_sub = dy[sub_idx]
+        z_sub = zs[sub_idx]
 
     # Transverse offset across stream (along normal)
     offset = dx_sub * nx + dy_sub * ny
@@ -311,14 +432,25 @@ def detect_section_water_level(
         if len(edge_pts):
             z_right = float(np.percentile(edge_pts, 15.0))  # lowest bank edge
 
-    # Method 2: Bathymetric Green Surface Echo / Channel Upper Envelope
+    # Method 2: Channel Core NIR / Topo surface returns (NIR laser reflects on air-water interface)
+    chan_nir_mask = (np.abs(off_s) <= 3.0) & nir_s
+    z_chan_nir = np.nan
+    if chan_nir_mask.sum() >= 2:
+        chan_pts = z_s[chan_nir_mask]
+        z_chan_nir = float(np.percentile(chan_pts, 75.0)) if len(chan_pts) >= 4 else float(np.median(chan_pts))
+
+    # Method 3: Bathymetric Green Surface Echo / Channel Upper Envelope (fallback if no topo)
     z_bathy_surf = np.nan
     if bathy_s.sum() >= 5:
         b_z = z_s[bathy_s]
         z_bathy_surf = float(np.percentile(b_z, 92.0))
 
-    # Reconcile bank water levels
-    if not np.isnan(z_left) and not np.isnan(z_right):
+    # Reconcile water levels:
+    # 1. Prioritize Topo LiDAR returns in the channel core (direct physical water surface returns)
+    if not np.isnan(z_chan_nir):
+        water_z = z_chan_nir
+    # 2. Reconcile bank water levels if available
+    elif not np.isnan(z_left) and not np.isnan(z_right):
         if abs(z_left - z_right) <= 0.80:
             water_z = 0.5 * (z_left + z_right)
         else:
@@ -327,6 +459,7 @@ def detect_section_water_level(
         water_z = z_left
     elif not np.isnan(z_right):
         water_z = z_right
+    # 3. Fall back to top of bathymetric returns if no topo returns available
     elif not np.isnan(z_bathy_surf):
         water_z = z_bathy_surf
     elif prior_z is not None:
@@ -390,6 +523,141 @@ def enforce_downstream_monotonicity(
                 levels[i] = levels[i - 1]
 
     return levels
+
+
+def drape_centerline_water_surface(
+    centerline: RiverCenterline,
+    stations: np.ndarray,
+    xs: Optional[np.ndarray] = None,
+    ys: Optional[np.ndarray] = None,
+    zs: Optional[np.ndarray] = None,
+    sensor_types: Optional[np.ndarray] = None,
+    classes: Optional[np.ndarray] = None,
+    corridor_width: float = 40.0,
+    center_strip_width: float = 1.5,
+    max_water_depth: float = 3.5,
+    outlier_threshold_m: float = 0.60,
+    median_window: int = 5,
+    cached_sections: Optional[List[Optional[dict]]] = None,
+) -> np.ndarray:
+    """
+    Estimate clean water surface elevations along a river centerline by draping a narrow corridor
+    directly over the water channel, filtering out high riverbank ground and tree canopies.
+
+    Parameters:
+        centerline: The RiverCenterline object.
+        stations: Sampled 1D array of station distances along the centerline.
+        xs, ys, zs: Global corridor point cloud coordinates (if cached_sections is None).
+        sensor_types: Sensor type array (1=NIR, 2=Bathy green).
+        classes: ASPRS point classification array.
+        corridor_width: Full cross-section corridor width in meters.
+        center_strip_width: Half-width of central channel strip to inspect (default 1.5 m -> 3.0 m total).
+        max_water_depth: Maximum plausible water depth above riverbed to isolate channel from canopy (default 3.5 m).
+        outlier_threshold_m: Max deviation from local running median before outlier replacement (default 0.60 m).
+        median_window: Window size (number of stations) for running median filtering (default 5).
+        cached_sections: Optional pre-sliced cross-sections list from slice_cross_section_points.
+
+    Returns:
+        np.ndarray of smooth, monotonic water surface elevations for each station.
+    """
+    n_sec = len(stations)
+    if n_sec == 0:
+        return np.array([], dtype=np.float64)
+
+    raw_levels = np.full(n_sec, np.nan, dtype=np.float64)
+    pos, tangent, normal = (None, None, None)
+
+    for i in range(n_sec):
+        if cached_sections is not None and i < len(cached_sections) and cached_sections[i] is not None:
+            sec = cached_sections[i]
+        elif xs is not None and ys is not None and zs is not None:
+            if pos is None:
+                pos, tangent, normal = centerline.evaluate(stations)
+            sec = slice_cross_section_points(
+                xs, ys, zs,
+                center_pos=pos[i],
+                normal=normal[i],
+                tangent=tangent[i],
+                corridor_width=corridor_width,
+                slice_thickness=2.0,
+                sensor_types=sensor_types,
+                classes=classes,
+            )
+        else:
+            sec = None
+
+        if sec is None or len(sec["offset"]) == 0:
+            continue
+
+        off = sec["offset"]
+        z = sec["z"]
+        st = sec.get("sensor_type")
+
+        # 1. Isolate the central river channel strip (e.g. +/- 1.5m)
+        strip = np.abs(off) <= center_strip_width
+        if strip.sum() < 3:
+            # Expand slightly if data is sparse along the centerline
+            strip = np.abs(off) <= max(2.5, center_strip_width * 1.6)
+
+        if strip.sum() < 3:
+            continue
+
+        z_strip = z[strip]
+        st_strip = st[strip] if st is not None else None
+
+        # 2. Estimate riverbed elevation Z_bed (lowest 5th percentile)
+        z_bed = float(np.percentile(z_strip, 5.0))
+
+        # 3. Canopy / bridge rejection: only consider points in the plausible water channel column
+        # Points higher than z_bed + max_water_depth are overhanging tree branches, leaves, or bridges
+        chan_mask = (z_strip >= (z_bed - 0.5)) & (z_strip <= (z_bed + max_water_depth))
+        if chan_mask.sum() < 3:
+            continue
+
+        chan_z = z_strip[chan_mask]
+        chan_st = st_strip[chan_mask] if st_strip is not None else None
+
+        # 4. Determine water surface elevation:
+        # Prioritize Topo LiDAR (NIR, sensor_type != 2) because NIR light reflects directly
+        # off the air-water boundary. Bathy green returns (sensor_type == 2) penetrate to the bed.
+        if chan_st is not None:
+            topo_mask = (chan_st != 2)
+            if topo_mask.sum() >= 2:
+                topo_z = chan_z[topo_mask]
+                raw_levels[i] = float(np.percentile(topo_z, 75.0)) if len(topo_z) >= 4 else float(np.median(topo_z))
+                continue
+
+            bathy_mask = (chan_st == 2)
+            if bathy_mask.sum() >= 3:
+                # Top of bathymetric returns as fallback when topo returns are absent
+                raw_levels[i] = float(np.percentile(chan_z[bathy_mask], 85.0))
+                continue
+
+        # Otherwise use upper envelope (85th percentile) of channel points
+        raw_levels[i] = float(np.percentile(chan_z, 85.0))
+
+    # 4. Longitudinal running median filter to eliminate bridge / dense canopy outliers
+    filtered = np.copy(raw_levels)
+    half_w = max(1, median_window // 2)
+
+    for i in range(n_sec):
+        win = raw_levels[max(0, i - half_w) : min(n_sec, i + half_w + 1)]
+        valid = win[~np.isnan(win)]
+        if len(valid) > 0:
+            med = float(np.median(valid))
+            if np.isnan(filtered[i]) or abs(filtered[i] - med) > outlier_threshold_m:
+                filtered[i] = med
+
+    # 5. Linearly interpolate across any remaining NaNs
+    nans = np.isnan(filtered)
+    if nans.all():
+        return np.zeros(n_sec, dtype=np.float64)
+    if nans.any():
+        val_idx = np.flatnonzero(~nans)
+        filtered[nans] = np.interp(np.flatnonzero(nans), val_idx, filtered[val_idx])
+
+    # 6. Downstream monotonicity enforcement
+    return enforce_downstream_monotonicity(filtered)
 
 
 def interpolate_anchor_sections(
@@ -487,6 +755,92 @@ def insert_custom_station(
     return up_stations, up_levels, up_locked, up_cached, idx
 
 
+def remove_station(
+    stations: np.ndarray,
+    water_levels: np.ndarray,
+    locked_mask: np.ndarray,
+    cached_sections: List[Optional[dict]],
+    idx: int,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[Optional[dict]], int]:
+    """
+    Remove a cross-section station at index `idx`.
+
+    Parameters:
+        stations: Array of station distances.
+        water_levels: Array of water surface elevations.
+        locked_mask: Boolean array of anchor lock status.
+        cached_sections: List of sliced cross-section point dictionaries.
+        idx: 0-based index of the station to remove.
+
+    Returns:
+        (updated_stations, updated_water_levels, updated_locked_mask, updated_cached_sections, new_curr_idx)
+    """
+    n = len(stations)
+    if n <= 1:
+        raise ValueError("Cannot remove the only remaining cross-section.")
+    if idx < 0 or idx >= n:
+        raise IndexError(f"Index {idx} out of range for stations length {n}.")
+
+    up_stations = np.delete(stations, idx)
+    up_levels = np.delete(water_levels, idx)
+    up_locked = np.delete(locked_mask, idx)
+    up_cached = list(cached_sections)
+    if idx < len(up_cached):
+        up_cached.pop(idx)
+
+    new_idx = min(idx, len(up_stations) - 1)
+    return up_stations, up_levels, up_locked, up_cached, new_idx
+
+
+def detect_embankment_extents(
+    offsets: np.ndarray,
+    elevations: np.ndarray,
+    water_z: float,
+    corridor_width: float,
+    margin: float = 2.5,
+) -> Tuple[float, float]:
+    """
+    Detect the transverse offsets where the water surface touches the left and right embankments,
+    plus a margin into the bank terrain.
+
+    Returns:
+        (left_offset, right_offset) in metres where left_offset < 0 and right_offset > 0.
+    """
+    half_w = float(corridor_width * 0.5)
+    default_left = -half_w
+    default_right = half_w
+
+    if np.isnan(water_z) or len(offsets) == 0:
+        return default_left, default_right
+
+    # Select all points below or at the calculated water surface
+    # Exclude extreme underground noise (> 20m depth)
+    below_mask = (elevations <= (water_z + 0.05)) & (elevations >= (water_z - 20.0))
+    if below_mask.sum() == 0:
+        below_mask = elevations <= (water_z + 0.05)
+
+    if below_mask.sum() >= 1:
+        sub_offsets = offsets[below_mask]
+        min_off = float(np.min(sub_offsets))
+        max_off = float(np.max(sub_offsets))
+
+        # Left extent: leftmost water point minus bank margin
+        left_ext = max(-half_w, min(0.0, min_off) - margin)
+
+        # Right extent: rightmost water point plus bank margin
+        right_ext = min(half_w, max(0.0, max_off) + margin)
+    else:
+        left_ext = default_left
+        right_ext = default_right
+
+    # Guarantee minimum width of 2m across channel so it never degenerates
+    if right_ext - left_ext < 2.0:
+        left_ext = min(left_ext, -1.0)
+        right_ext = max(right_ext, 1.0)
+
+    return float(left_ext), float(right_ext)
+
+
 def rasterize_water_surface_model(
     centerline: RiverCenterline,
     stations: np.ndarray,
@@ -495,9 +849,15 @@ def rasterize_water_surface_model(
     output_path: str | Path,
     resolution: float = 1.0,
     data_epsg: Optional[int] = None,
+    left_offsets: Optional[np.ndarray] = None,
+    right_offsets: Optional[np.ndarray] = None,
+    water_levels_left: Optional[np.ndarray] = None,
+    water_levels_right: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, dict]:
     """
-    Rasterize the 3D horizontal water surface cross-sections into a GeoTIFF.
+    Rasterize the 3D water surface cross-sections into a GeoTIFF.
+    Supports per-section embankment widths (left_offsets, right_offsets)
+    and cross-stream tilt (water_levels_left, water_levels_right).
     """
     if not HAS_RASTERIO:
         raise RuntimeError("rasterio is required to rasterize water surface models.")
@@ -506,12 +866,31 @@ def rasterize_water_surface_model(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     pos, tangent, normal = centerline.evaluate(stations)
-    half_w = corridor_width * 0.5
 
-    left_x = pos[:, 0] - half_w * normal[:, 0]
-    left_y = pos[:, 1] - half_w * normal[:, 1]
-    right_x = pos[:, 0] + half_w * normal[:, 0]
-    right_y = pos[:, 1] + half_w * normal[:, 1]
+    if left_offsets is not None:
+        l_off = np.asarray(left_offsets, dtype=np.float64)
+    else:
+        l_off = np.full(len(stations), -corridor_width * 0.5)
+
+    if right_offsets is not None:
+        r_off = np.asarray(right_offsets, dtype=np.float64)
+    else:
+        r_off = np.full(len(stations), corridor_width * 0.5)
+
+    if water_levels_left is not None:
+        z_left = np.asarray(water_levels_left, dtype=np.float64)
+    else:
+        z_left = np.asarray(water_levels, dtype=np.float64)
+
+    if water_levels_right is not None:
+        z_right = np.asarray(water_levels_right, dtype=np.float64)
+    else:
+        z_right = np.asarray(water_levels, dtype=np.float64)
+
+    left_x = pos[:, 0] + l_off * normal[:, 0]
+    left_y = pos[:, 1] + l_off * normal[:, 1]
+    right_x = pos[:, 0] + r_off * normal[:, 0]
+    right_y = pos[:, 1] + r_off * normal[:, 1]
 
     all_x = np.concatenate([left_x, right_x])
     all_y = np.concatenate([left_y, right_y])
@@ -533,14 +912,17 @@ def rasterize_water_surface_model(
         p_ri = (right_x[i], right_y[i])
         p_li1 = (left_x[i + 1], left_y[i + 1])
         p_ri1 = (right_x[i + 1], right_y[i + 1])
-        zi = water_levels[i]
-        zi1 = water_levels[i + 1]
+
+        z_li = z_left[i]
+        z_ri = z_right[i]
+        z_li1 = z_left[i + 1]
+        z_ri1 = z_right[i + 1]
 
         tri_vertices.append([p_li, p_ri, p_li1])
-        tri_z.append((zi, zi, zi1))
+        tri_z.append((z_li, z_ri, z_li1))
 
         tri_vertices.append([p_ri, p_ri1, p_li1])
-        tri_z.append((zi, zi1, zi1))
+        tri_z.append((z_ri, z_ri1, z_li1))
 
     surface = np.full((rows, cols), np.nan, dtype=np.float32)
 
@@ -715,7 +1097,109 @@ def load_centerline_from_file(path: str | Path) -> np.ndarray:
     raise ValueError(f"Could not parse centerline polyline coordinates from {path}")
 
 
-def stitch_contiguous_waterways(ways: List[dict], max_gap: float = 30.0) -> List[dict]:
+def clip_segment_to_bbox(
+    p0: Sequence[float],
+    p1: Sequence[float],
+    xmin: float,
+    ymin: float,
+    xmax: float,
+    ymax: float,
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Clip 2D line segment (p0 -> p1) against rectangular bounding box using Liang-Barsky algorithm.
+    Returns (clipped_p0, clipped_p1) or None if completely outside.
+    """
+    dx = p1[0] - p0[0]
+    dy = p1[1] - p0[1]
+    p = [-dx, dx, -dy, dy]
+    q = [p0[0] - xmin, xmax - p0[0], p0[1] - ymin, ymax - p0[1]]
+    u1, u2 = 0.0, 1.0
+    for pi, qi in zip(p, q):
+        if pi == 0:
+            if qi < 0:
+                return None
+        else:
+            t = qi / pi
+            if pi < 0:
+                if t > u2:
+                    return None
+                if t > u1:
+                    u1 = t
+            else:
+                if t < u1:
+                    return None
+                if t < u2:
+                    u2 = t
+    return (
+        np.array([p0[0] + u1 * dx, p0[1] + u1 * dy], dtype=np.float64),
+        np.array([p0[0] + u2 * dx, p0[1] + u2 * dy], dtype=np.float64),
+    )
+
+
+def clip_polyline_to_bbox(
+    verts: np.ndarray,
+    bbox: Tuple[float, float, float, float],
+    buffer_m: float = 20.0,
+) -> List[np.ndarray]:
+    """
+    Clip polyline against a bounding box (min_x, min_y, max_x, max_y) with expansion buffer.
+    Returns list of contiguous polyline vertex arrays (each shape (K, 2)) inside the box.
+    """
+    if len(verts) < 2:
+        return []
+    xmin, ymin, xmax, ymax = bbox
+    xmin -= buffer_m
+    ymin -= buffer_m
+    xmax += buffer_m
+    ymax += buffer_m
+
+    chains: List[List[np.ndarray]] = []
+    curr_chain: List[np.ndarray] = []
+
+    for i in range(len(verts) - 1):
+        clipped = clip_segment_to_bbox(verts[i], verts[i + 1], xmin, ymin, xmax, ymax)
+        if clipped is not None:
+            c0, c1 = clipped
+            if not curr_chain:
+                curr_chain = [c0, c1]
+            else:
+                if np.hypot(curr_chain[-1][0] - c0[0], curr_chain[-1][1] - c0[1]) < 1e-3:
+                    curr_chain.append(c1)
+                else:
+                    chains.append(curr_chain)
+                    curr_chain = [c0, c1]
+        else:
+            if curr_chain:
+                chains.append(curr_chain)
+                curr_chain = []
+    if curr_chain:
+        chains.append(curr_chain)
+
+    return [np.array(ch, dtype=np.float64) for ch in chains if len(ch) >= 2]
+
+
+def polyline_length_in_bbox(
+    verts: np.ndarray,
+    bbox: Tuple[float, float, float, float],
+    buffer_m: float = 0.0,
+) -> float:
+    """Calculate the total length in metres of a polyline lying inside a bounding box."""
+    if len(verts) < 2:
+        return 0.0
+    xmin, ymin, xmax, ymax = bbox
+    xmin -= buffer_m
+    ymin -= buffer_m
+    xmax += buffer_m
+    ymax += buffer_m
+    tot_len = 0.0
+    for i in range(len(verts) - 1):
+        c = clip_segment_to_bbox(verts[i], verts[i + 1], xmin, ymin, xmax, ymax)
+        if c is not None:
+            tot_len += float(np.hypot(c[1][0] - c[0][0], c[1][1] - c[0][1]))
+    return tot_len
+
+
+def stitch_contiguous_waterways(ways: List[dict], max_gap: float = 15.0) -> List[dict]:
     """
     Stitch contiguous waterway segments (with matching names) into continuous polylines.
     """
@@ -802,18 +1286,19 @@ def fetch_osm_waterways(
 
     Args:
         bbox_local: (min_x, min_y, max_x, max_y) in local project CRS.
-        data_epsg: EPSG code of local project CRS (e.g. 25832).
+        data_epsg: EPSG code of local project CRS (e.g. 25833).
         buffer_m: Bounding box expansion buffer in metres.
-        timeout: Network timeout in seconds.
+        timeout: Network timeout in seconds per endpoint attempt.
 
     Returns:
-        List of candidate river dicts sorted by length descending:
+        List of candidate river dicts sorted by length inside bbox descending:
             {
                 "id": osm_id,
                 "name": river_name,
                 "waterway": "river" | "stream" | "canal",
                 "vertices": np.ndarray of shape (K, 2) in local CRS [X, Y],
-                "length_m": float,
+                "length_m": float (total OSM polyline length),
+                "length_inside_m": float (length within query bbox_local),
             }
     """
     import urllib.parse
@@ -841,17 +1326,28 @@ def fetch_osm_waterways(
     east = float(np.max(lons))
 
     # Overpass QL query
-    query = f"""[out:json][timeout:{timeout}];
+    ep_timeout = min(timeout, 8)
+    query = f"""[out:json][timeout:{ep_timeout}];
 (
   way["waterway"~"river|stream|canal"]({south:.6f},{west:.6f},{north:.6f},{east:.6f});
 );
 out body geom;
 """
     endpoints = [
-        "https://overpass-api.de/api/interpreter",
-        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.openstreetmap.fr/api/interpreter",
         "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
+        "https://overpass-api.de/api/interpreter",
     ]
+
+    import hashlib
+    from pathlib import Path
+    cache_dir = Path.home() / ".cache" / "lidar_workbench" / "osm"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    box_round = (round(min_x, -1), round(min_y, -1), round(max_x, -1), round(max_y, -1))
+    cache_key = hashlib.md5(f"{data_epsg}_{box_round}".encode("utf-8")).hexdigest()
+    cache_file = cache_dir / f"osm_{data_epsg}_{cache_key}.json"
 
     last_err = None
     res = None
@@ -863,7 +1359,7 @@ out body geom;
                 url, data=post_data,
                 headers={"User-Agent": "LiDARWorkbench/1.0 (RiverWSM)"}
             )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=ep_timeout) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 break
         except Exception as e:
@@ -871,6 +1367,19 @@ out body geom;
             continue
 
     if res is None:
+        # Check local disk cache as fallback
+        if cache_file.is_file():
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cached_data = json.load(f)
+                cached_ways = []
+                for item in cached_data:
+                    item["vertices"] = np.array(item["vertices"], dtype=np.float64)
+                    cached_ways.append(item)
+                logger.info("Loaded %d OSM waterways from local disk cache (%s)", len(cached_ways), cache_file)
+                return cached_ways
+            except Exception as ce:
+                logger.warning("Failed to read OSM cache %s: %s", cache_file, ce)
         raise RuntimeError(f"Failed to fetch waterways from OpenStreetMap: {last_err}")
 
     elements = res.get("elements", [])
@@ -898,6 +1407,37 @@ out body geom;
         })
 
     # Stitch contiguous ways
-    return stitch_contiguous_waterways(raw_ways)
+    stitched = stitch_contiguous_waterways(raw_ways)
+
+    # Compute length inside the local project bounding box (unbuffered)
+    valid_ways = []
+    for w in stitched:
+        l_in = polyline_length_in_bbox(w["vertices"], bbox_local, buffer_m=0.0)
+        w["length_inside_m"] = l_in
+        # Filter out waterways that have negligible overlap with the project box
+        if l_in >= 1.0 or w["length_m"] >= 1.0:
+            valid_ways.append(w)
+
+    # Sort primarily by length inside project bbox, then by total length
+    valid_ways.sort(key=lambda x: (x["length_inside_m"], x["length_m"]), reverse=True)
+
+    # Persist to disk cache
+    try:
+        to_cache = []
+        for w in valid_ways:
+            to_cache.append({
+                "id": w.get("id"),
+                "name": w.get("name"),
+                "waterway": w.get("waterway"),
+                "vertices": w["vertices"].tolist(),
+                "length_m": float(w["length_m"]),
+                "length_inside_m": float(w.get("length_inside_m", 0.0)),
+            })
+        with open(cache_file, "w", encoding="utf-8") as f:
+            json.dump(to_cache, f)
+    except Exception as ce:
+        logger.debug("Failed to write OSM waterways cache: %s", ce)
+
+    return valid_ways
 
 

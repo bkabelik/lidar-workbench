@@ -971,7 +971,10 @@ class MainWindow(QMainWindow):
             self._dtm_ref_elevations = None
             # Defer clear to next event-loop iteration so any in-flight
             # Open3D render operations complete first.
-            QTimer.singleShot(0, self._multi_view.clear)
+            def _safe_clear():
+                if self._editor.tile_id is None:
+                    self._multi_view.clear()
+            QTimer.singleShot(0, _safe_clear)
             self.set_status(
                 f"Filter applied — tile '{open_tid}' was updated. "
                 f"Re-open it to continue editing.",
@@ -1112,27 +1115,86 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Project", "Please open a project first.")
             return
 
-        selected = self._tile_list_widget.get_selected_tile_ids()
-        if not selected:
-            selected = self._tm.tile_ids
-        if not selected:
+        all_tiles = self._db.get_all_tiles() if self._db else []
+        # Filter out _noise tiles
+        non_noise_tiles = [t for t in all_tiles if "_noise" not in t.get("id", "")]
+        base_tiles = non_noise_tiles if non_noise_tiles else all_tiles
+
+        if not base_tiles:
             QMessageBox.information(self, "No Tiles", "No tiles available in project.")
             return
 
-        tile_info = self._db.get_tile(selected[0])
-        data_epsg = tile_info.get("crs_epsg") if tile_info else None
+        # Determine CRS EPSG from tiles or project metadata
+        data_epsg = None
+        for t in base_tiles:
+            if t.get("crs_epsg"):
+                try:
+                    data_epsg = int(t["crs_epsg"])
+                    break
+                except (ValueError, TypeError):
+                    pass
+        if data_epsg is None and hasattr(self._project, "crs_epsg") and self._project.crs_epsg:
+            try:
+                data_epsg = int(self._project.crs_epsg)
+            except (ValueError, TypeError):
+                pass
 
-        def _loader():
+        # Compute full project bounding box across tiles
+        min_xs = [t["bbox_min_x"] for t in base_tiles if t.get("bbox_min_x") is not None]
+        min_ys = [t["bbox_min_y"] for t in base_tiles if t.get("bbox_min_y") is not None]
+        max_xs = [t["bbox_max_x"] for t in base_tiles if t.get("bbox_max_x") is not None]
+        max_ys = [t["bbox_max_y"] for t in base_tiles if t.get("bbox_max_y") is not None]
+        project_bbox = (min(min_xs), min(min_ys), max(max_xs), max(max_ys)) if min_xs else None
+
+        user_selected = self._tile_list_widget.get_selected_tile_ids()
+        user_selected = [tid for tid in user_selected if "_noise" not in tid]
+
+        def _get_target_tile_ids(centerline_verts=None):
+            # If user selected a specific subset of tiles, respect user's explicit selection
+            if user_selected and len(user_selected) < len(base_tiles):
+                return user_selected
+
+            # If centerline is provided, find tiles that intersect the river corridor (60m buffer)
+            if centerline_verts is not None and len(centerline_verts) >= 2:
+                c_verts = np.asarray(centerline_verts, dtype=np.float64)
+                intersecting = []
+                for t in base_tiles:
+                    tid = t["id"]
+                    x0 = t.get("bbox_min_x")
+                    y0 = t.get("bbox_min_y")
+                    x1 = t.get("bbox_max_x")
+                    y1 = t.get("bbox_max_y")
+                    if None in (x0, y0, x1, y1):
+                        continue
+                    dx = np.maximum(0.0, np.maximum(x0 - c_verts[:, 0], c_verts[:, 0] - x1))
+                    dy = np.maximum(0.0, np.maximum(y0 - c_verts[:, 1], c_verts[:, 1] - y1))
+                    if float(np.min(np.hypot(dx, dy))) <= 60.0:
+                        intersecting.append(tid)
+                if intersecting:
+                    return intersecting
+
+            # Fallback if no centerline yet: first 20 tiles
+            return [t["id"] for t in base_tiles[:20]]
+
+        def _loader(centerline_verts=None):
+            tids = _get_target_tile_ids(centerline_verts)
             combined = {}
-            for tid in selected[:8]:
+            for tid in tids:
                 data = self._tm.load_tile_points_full(tid)
                 if data is not None and "x" in data and len(data["x"]) > 0:
+                    n_pts = len(data["x"])
+                    # If dense tile (> 1.5M points), downsample with stride 2 for fast slicing
+                    step = 2 if n_pts > 1_500_000 else 1
                     if not combined:
-                        combined = {k: [v] for k, v in data.items() if isinstance(v, np.ndarray)}
+                        combined = {
+                            k: [v[::step] if isinstance(v, np.ndarray) and len(v) == n_pts else v]
+                            for k, v in data.items() if isinstance(v, np.ndarray)
+                        }
                     else:
                         for k in combined:
                             if k in data and isinstance(data[k], np.ndarray):
-                                combined[k].append(data[k])
+                                v = data[k]
+                                combined[k].append(v[::step] if len(v) == n_pts else v)
             if not combined:
                 return {}
             return {k: np.concatenate(v) for k, v in combined.items()}
@@ -1142,6 +1204,7 @@ class MainWindow(QMainWindow):
             project_dir=self._project.root_dir,
             load_points_func=_loader,
             data_epsg=data_epsg,
+            project_bbox=project_bbox,
             parent=self,
         )
         dlg.exec()
@@ -2406,9 +2469,9 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
         self._properties_panel.set_tile_data(data)
         self._properties_panel.set_undo_info(*self._editor.undo_stack_info)
 
-        # Auto-generate DTM if tile is classified
+        # Auto-generate DTM if tile has ground-classified points
         tile_info = self._db.get_tile(tile_id)
-        if tile_info and tile_info.get("status") in (TileStatus.CLASSIFIED, TileStatus.GROUND, TileStatus.BATHY, TileStatus.EDITED, TileStatus.FILTERED):
+        if tile_info and tile_info.get("status") in (TileStatus.CLASSIFIED, TileStatus.GROUND, TileStatus.BATHY, TileStatus.EDITED):
             self._multi_view._view_dtm.generate_dtm()
 
         # Populate metadata panel

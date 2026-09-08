@@ -151,118 +151,197 @@ class TileListWidget(QWidget):
         """
         Replace the entire tile list.
 
+        Preserves currently selected tile IDs and suppresses signal storms
+        during tree construction to avoid GUI races and crashes.
+
         Args:
             tiles: List of tile dicts as returned by :meth:`Database.get_all_tiles`.
         """
-        self._tree.clear()
-        self._status_groups.clear()
-        self._tiles = {t["id"]: t for t in tiles}
+        prev_selected = set(self.get_selected_tile_ids())
 
-        # Create group items for each status, respecting the order in TileStatus.ALL
-        for status in TileStatus.ALL:
-            group = QTreeWidgetItem(self._tree)
-            group.setText(0, "")
-            group.setText(1, status)
-            group.setIcon(0, _make_status_icon(_STATUS_COLORS.get(status, QColor("#999"))))
-            group.setFlags(group.flags() | Qt.ItemIsAutoTristate)
-            font = group.font(1)
-            font.setBold(True)
-            group.setFont(1, font)
-            self._status_groups[status] = group
+        self._tree.blockSignals(True)
+        try:
+            if self._tree.selectionModel() is not None:
+                self._tree.selectionModel().clearSelection()
+            self._tree.clear()
+            self._status_groups.clear()
+            self._tiles = {t["id"]: t for t in tiles}
 
-        # Populate tiles under their status groups
-        for tile in tiles:
-            status = tile.get("status", TileStatus.IMPORTED)
-            group = self._status_groups.get(status)
-            if group is None:
-                continue
+            # Create group items for each status, respecting the order in TileStatus.ALL
+            for status in TileStatus.ALL:
+                group = QTreeWidgetItem(self._tree)
+                group.setText(0, "")
+                group.setText(1, status)
+                group.setIcon(0, _make_status_icon(_STATUS_COLORS.get(status, QColor("#999"))))
+                group.setFlags(group.flags() | Qt.ItemIsAutoTristate)
+                font = group.font(1)
+                font.setBold(True)
+                group.setFont(1, font)
+                self._status_groups[status] = group
 
-            item = QTreeWidgetItem(group)
-            item.setData(0, Qt.UserRole, tile["id"])
-            item.setIcon(0, _make_status_icon(_STATUS_COLORS.get(status, QColor("#999")), 10))
-            item.setText(1, tile["id"])
-            item.setText(2, f"{tile.get('point_count', 0):,}")
-            item.setText(3, tile.get("last_modified", ""))
+            items_to_select = []
 
-            # QC status column
-            qc = tile.get("qc_status")
-            if qc:
-                item.setText(4, QCStatus.LABELS.get(qc, qc))
-                item.setIcon(4, _make_status_icon(_QC_STATUS_COLORS.get(qc, QColor("#999")), 10))
-                item.setForeground(4, _QC_STATUS_COLORS.get(qc, QColor("#999")))
+            # Populate tiles under their status groups
+            for tile in tiles:
+                status = tile.get("status", TileStatus.IMPORTED)
+                group = self._status_groups.get(status)
+                if group is None:
+                    # Dynamically create group if status is unknown/custom
+                    group = QTreeWidgetItem(self._tree)
+                    group.setText(0, "")
+                    group.setText(1, status)
+                    group.setIcon(0, _make_status_icon(_STATUS_COLORS.get(status, QColor("#999"))))
+                    group.setFlags(group.flags() | Qt.ItemIsAutoTristate)
+                    font = group.font(1)
+                    font.setBold(True)
+                    group.setFont(1, font)
+                    self._status_groups[status] = group
 
-            # Build tooltip with scanner + QC info
-            tooltip_parts = [f"Tile: {tile['id']}"]
-            dom_scanner = tile.get("scanner", "")
-            all_raw = tile.get("all_scanners", "[]")
-            try:
-                all_list = json.loads(all_raw) if isinstance(all_raw, str) else all_raw
-            except Exception:
-                all_list = []
-            if all_list:
-                tooltip_parts.append(f"Sensors: {', '.join(all_list)}")
-            elif dom_scanner:
-                tooltip_parts.append(f"Scanner: {dom_scanner}")
-            fl = tile.get("flight_line", 0)
-            if fl:
-                tooltip_parts.append(f"Flight Line: {fl}")
-            # QC info in tooltip
-            if qc:
-                tooltip_parts.append(f"QC: {QCStatus.LABELS.get(qc, qc)}")
-                qc_comment = tile.get("qc_comment")
-                if qc_comment:
-                    tooltip_parts.append(f"QC Comment: {qc_comment}")
-            item.setToolTip(1, "\n".join(tooltip_parts))
+                tid = tile["id"]
+                item = QTreeWidgetItem(group)
+                item.setData(0, Qt.UserRole, tid)
+                item.setIcon(0, _make_status_icon(_STATUS_COLORS.get(status, QColor("#999")), 10))
+                item.setText(1, tid)
+                item.setText(2, f"{tile.get('point_count', 0):,}")
+                item.setText(3, tile.get("last_modified", ""))
 
-            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(1, Qt.Checked)
+                # QC status column
+                qc = tile.get("qc_status")
+                if qc:
+                    item.setText(4, QCStatus.LABELS.get(qc, qc))
+                    item.setIcon(4, _make_status_icon(_QC_STATUS_COLORS.get(qc, QColor("#999")), 10))
+                    item.setForeground(4, _QC_STATUS_COLORS.get(qc, QColor("#999")))
 
-        self._tree.expandAll()
+                # Build tooltip with scanner + QC info
+                tooltip_parts = [f"Tile: {tid}"]
+                dom_scanner = tile.get("scanner", "")
+                all_raw = tile.get("all_scanners", "[]")
+                try:
+                    all_list = json.loads(all_raw) if isinstance(all_raw, str) else all_raw
+                except Exception:
+                    all_list = []
+                if all_list:
+                    tooltip_parts.append(f"Sensors: {', '.join(all_list)}")
+                elif dom_scanner:
+                    tooltip_parts.append(f"Scanner: {dom_scanner}")
+                fl = tile.get("flight_line", 0)
+                if fl:
+                    tooltip_parts.append(f"Flight Line: {fl}")
+                # QC info in tooltip
+                if qc:
+                    tooltip_parts.append(f"QC: {QCStatus.LABELS.get(qc, qc)}")
+                    qc_comment = tile.get("qc_comment")
+                    if qc_comment:
+                        tooltip_parts.append(f"QC Comment: {qc_comment}")
+                item.setToolTip(1, "\n".join(tooltip_parts))
+
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(1, Qt.Checked)
+
+                if tid in prev_selected:
+                    items_to_select.append(item)
+
+            self._tree.expandAll()
+
+            # Restore previous selection
+            for it in items_to_select:
+                it.setSelected(True)
+        finally:
+            self._tree.blockSignals(False)
+
+    def select_tile(self, tile_id: str) -> bool:
+        """Select a tile by its ID in the tree widget and emit tile_selected."""
+        item = self._find_tile_item(tile_id)
+        if item is not None:
+            self._tree.clearSelection()
+            item.setSelected(True)
+            self._tree.setCurrentItem(item)
+            self.tile_selected.emit(tile_id)
+            return True
+        return False
+
+    def select_tiles(self, tile_ids: List[str]) -> int:
+        """Select multiple tiles by their IDs in the tree widget."""
+        selected_set = set(tile_ids)
+        count = 0
+        self._tree.blockSignals(True)
+        try:
+            self._tree.clearSelection()
+            for tid in selected_set:
+                item = self._find_tile_item(tid)
+                if item is not None:
+                    item.setSelected(True)
+                    count += 1
+        finally:
+            self._tree.blockSignals(False)
+        return count
 
     def get_selected_tile_ids(self) -> List[str]:
         """Return tile IDs of all currently selected rows."""
         ids: List[str] = []
-        for item in self._tree.selectedItems():
-            tid = item.data(0, Qt.UserRole)
-            if tid:
-                ids.append(tid)
+        try:
+            for item in self._tree.selectedItems():
+                tid = item.data(0, Qt.UserRole)
+                if tid:
+                    ids.append(tid)
+        except RuntimeError:
+            pass
         return ids
 
     def update_tile_status(self, tile_id: str, new_status: str) -> None:
-        """Move a tile to a different status group in the tree."""
+        """Move a tile to a different status group in the tree, safely preserving selection."""
         old_item = self._find_tile_item(tile_id)
         if old_item is None:
             return
 
-        # Remove from old group
-        old_parent = old_item.parent()
-        if old_parent:
-            old_parent.removeChild(old_item)
+        self._tree.blockSignals(True)
+        try:
+            was_selected = old_item.isSelected()
+            if was_selected:
+                old_item.setSelected(False)
 
-        # Add to new group
-        new_group = self._status_groups.get(new_status)
-        if new_group is None:
-            return
+            # Remove from old group
+            old_parent = old_item.parent()
+            if old_parent:
+                old_parent.removeChild(old_item)
 
-        item = QTreeWidgetItem(new_group)
-        item.setData(0, Qt.UserRole, tile_id)
-        item.setIcon(0, _make_status_icon(_STATUS_COLORS.get(new_status, QColor("#999")), 10))
-        item.setText(1, tile_id)
-        if tile_id in self._tiles:
-            item.setText(2, f"{self._tiles[tile_id].get('point_count', 0):,}")
-            item.setText(3, self._tiles[tile_id].get("last_modified", ""))
-            # QC column
-            qc = self._tiles[tile_id].get("qc_status")
-            if qc:
-                item.setText(4, QCStatus.LABELS.get(qc, qc))
-                item.setIcon(4, _make_status_icon(_QC_STATUS_COLORS.get(qc, QColor("#999")), 10))
-                item.setForeground(4, _QC_STATUS_COLORS.get(qc, QColor("#999")))
-        item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-        item.setCheckState(1, Qt.Checked)
+            # Add to new group
+            new_group = self._status_groups.get(new_status)
+            if new_group is None:
+                new_group = QTreeWidgetItem(self._tree)
+                new_group.setText(0, "")
+                new_group.setText(1, new_status)
+                new_group.setIcon(0, _make_status_icon(_STATUS_COLORS.get(new_status, QColor("#999"))))
+                new_group.setFlags(new_group.flags() | Qt.ItemIsAutoTristate)
+                font = new_group.font(1)
+                font.setBold(True)
+                new_group.setFont(1, font)
+                self._status_groups[new_status] = new_group
 
-        # Update internal dict
-        if tile_id in self._tiles:
-            self._tiles[tile_id]["status"] = new_status
+            item = QTreeWidgetItem(new_group)
+            item.setData(0, Qt.UserRole, tile_id)
+            item.setIcon(0, _make_status_icon(_STATUS_COLORS.get(new_status, QColor("#999")), 10))
+            item.setText(1, tile_id)
+            if tile_id in self._tiles:
+                item.setText(2, f"{self._tiles[tile_id].get('point_count', 0):,}")
+                item.setText(3, self._tiles[tile_id].get("last_modified", ""))
+                # QC column
+                qc = self._tiles[tile_id].get("qc_status")
+                if qc:
+                    item.setText(4, QCStatus.LABELS.get(qc, qc))
+                    item.setIcon(4, _make_status_icon(_QC_STATUS_COLORS.get(qc, QColor("#999")), 10))
+                    item.setForeground(4, _QC_STATUS_COLORS.get(qc, QColor("#999")))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(1, Qt.Checked)
+
+            # Update internal dict
+            if tile_id in self._tiles:
+                self._tiles[tile_id]["status"] = new_status
+
+            if was_selected:
+                item.setSelected(True)
+        finally:
+            self._tree.blockSignals(False)
 
     def update_tile_qc_status(self, tile_id: str, qc_status: Optional[str],
                                qc_comment: Optional[str] = None) -> None:
@@ -295,21 +374,34 @@ class TileListWidget(QWidget):
     # ── signal handlers ────────────────────────────────────────────
 
     def _on_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
-        tid = item.data(0, Qt.UserRole)
+        if item is None:
+            return
+        try:
+            tid = item.data(0, Qt.UserRole)
+        except RuntimeError:
+            return
         if tid:
             self.tile_selected.emit(tid)
 
     def _on_item_double_clicked(self, item: QTreeWidgetItem, column: int) -> None:
-        tid = item.data(0, Qt.UserRole)
+        if item is None:
+            return
+        try:
+            tid = item.data(0, Qt.UserRole)
+        except RuntimeError:
+            return
         if tid:
             self.open_requested.emit(tid)
 
     def _on_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
-        if column != 1:
+        if item is None or column != 1:
             return
-        tid = item.data(0, Qt.UserRole)
-        if tid:
+        try:
+            tid = item.data(0, Qt.UserRole)
             visible = item.checkState(1) == Qt.Checked
+        except RuntimeError:
+            return
+        if tid:
             self.tile_visibility_changed.emit(tid, visible)
 
     def _on_context_menu(self, pos) -> None:

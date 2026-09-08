@@ -883,21 +883,54 @@ class BathyDialog(QDialog):
             self._crop_geotiff_info.setText(f"⚠ Error: {exc}")
             self._crop_geotiff_info.setVisible(True)
 
-    def _load_active_points_for_wsm(self) -> dict:
+    def _load_active_points_for_wsm(self, centerline_verts=None) -> dict:
         parent = self.parent()
         tm = parent._tm if parent and hasattr(parent, '_tm') else None
-        if tm is None or not self._tile_ids:
+        db = parent._db if parent and hasattr(parent, '_db') else None
+        if tm is None:
             return {}
+
+        tids = list(self._tile_ids) if self._tile_ids else []
+
+        # If centerline is provided and db is available, load tiles intersecting the river corridor
+        if db and centerline_verts is not None and len(centerline_verts) >= 2:
+            all_tiles = [t for t in db.get_all_tiles() if "_noise" not in t.get("id", "")]
+            c_verts = np.asarray(centerline_verts, dtype=np.float64)
+            intersecting = []
+            for t in all_tiles:
+                tid = t["id"]
+                x0 = t.get("bbox_min_x")
+                y0 = t.get("bbox_min_y")
+                x1 = t.get("bbox_max_x")
+                y1 = t.get("bbox_max_y")
+                if None in (x0, y0, x1, y1):
+                    continue
+                dx = np.maximum(0.0, np.maximum(x0 - c_verts[:, 0], c_verts[:, 0] - x1))
+                dy = np.maximum(0.0, np.maximum(y0 - c_verts[:, 1], c_verts[:, 1] - y1))
+                if float(np.min(np.hypot(dx, dy))) <= 60.0:
+                    intersecting.append(tid)
+            if intersecting:
+                tids = intersecting
+
+        if not tids:
+            return {}
+
         combined = {}
-        for tid in self._tile_ids[:6]:
+        for tid in tids:
             data = tm.load_tile_points_full(tid)
             if data is not None and "x" in data and len(data["x"]) > 0:
+                n_pts = len(data["x"])
+                step = 2 if n_pts > 1_500_000 else 1
                 if not combined:
-                    combined = {k: [v] for k, v in data.items() if isinstance(v, np.ndarray)}
+                    combined = {
+                        k: [v[::step] if isinstance(v, np.ndarray) and len(v) == n_pts else v]
+                        for k, v in data.items() if isinstance(v, np.ndarray)
+                    }
                 else:
                     for k in combined:
                         if k in data and isinstance(data[k], np.ndarray):
-                            combined[k].append(data[k])
+                            v = data[k]
+                            combined[k].append(v[::step] if len(v) == n_pts else v)
         if not combined:
             return {}
         return {k: np.concatenate(v) for k, v in combined.items()}
@@ -906,10 +939,33 @@ class BathyDialog(QDialog):
         from .water_surface_dialog import WaterSurfaceDialog
         parent = self.parent()
         project_dir = parent._project.root_dir if parent and hasattr(parent, '_project') and parent._project else Path.cwd()
+        db = parent._db if parent and hasattr(parent, '_db') else None
+        project_bbox = None
+        data_epsg = self._data_epsg
+        if db:
+            all_tiles = [t for t in db.get_all_tiles() if "_noise" not in t.get("id", "")]
+            active_ids = set(self._tile_ids) if getattr(self, "_tile_ids", None) else set()
+            active_tiles = [t for t in all_tiles if t.get("id") in active_ids]
+            tiles = active_tiles if active_tiles else all_tiles
+            if tiles:
+                min_xs = [t["bbox_min_x"] for t in tiles if t.get("bbox_min_x") is not None]
+                min_ys = [t["bbox_min_y"] for t in tiles if t.get("bbox_min_y") is not None]
+                max_xs = [t["bbox_max_x"] for t in tiles if t.get("bbox_max_x") is not None]
+                max_ys = [t["bbox_max_y"] for t in tiles if t.get("bbox_max_y") is not None]
+                if min_xs:
+                    margin = 50.0 if active_tiles else 0.0
+                    project_bbox = (min(min_xs) - margin, min(min_ys) - margin, max(max_xs) + margin, max(max_ys) + margin)
+                if data_epsg is None:
+                    for t in tiles:
+                        if t.get("crs_epsg"):
+                            data_epsg = int(t["crs_epsg"])
+                            break
+
         dlg = WaterSurfaceDialog(
             project_dir=project_dir,
             load_points_func=self._load_active_points_for_wsm,
-            data_epsg=self._data_epsg,
+            data_epsg=data_epsg,
+            project_bbox=project_bbox,
             parent=self,
         )
         dlg.wsm_generated.connect(self._on_centerline_wsm_ready)

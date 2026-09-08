@@ -267,125 +267,127 @@ class ViewProfile(QWidget):
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#1a1a2e"))
+        try:
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.fillRect(self.rect(), QColor("#1a1a2e"))
 
-        # Axes
-        painter.setPen(QPen(QColor("#555"), 1))
-        origin = self._world_to_widget(0, 0)
-        painter.drawLine(0, int(origin.y()), self.width(), int(origin.y()))
-        painter.drawLine(int(origin.x()), 0, int(origin.x()), self.height())
+            # Axes
+            painter.setPen(QPen(QColor("#555"), 1))
+            origin = self._world_to_widget(0, 0)
+            painter.drawLine(0, int(origin.y()), self.width(), int(origin.y()))
+            painter.drawLine(int(origin.x()), 0, int(origin.x()), self.height())
 
-        # DTM reference line
-        if self._dtm_distances is not None and self._dtm_elevations is not None:
-            pen = QPen(QColor("#8B4513"), 2)
-            painter.setPen(pen)
-            path = QPainterPath()
-            pt = self._world_to_widget(self._dtm_distances[0], self._dtm_elevations[0])
-            path.moveTo(pt)
-            for i in range(1, len(self._dtm_distances)):
-                pt = self._world_to_widget(self._dtm_distances[i], self._dtm_elevations[i])
-                path.lineTo(pt)
-            painter.drawPath(path)
+            # DTM reference line
+            if self._dtm_distances is not None and self._dtm_elevations is not None:
+                pen = QPen(QColor("#8B4513"), 2)
+                painter.setPen(pen)
+                path = QPainterPath()
+                pt = self._world_to_widget(self._dtm_distances[0], self._dtm_elevations[0])
+                path.moveTo(pt)
+                for i in range(1, len(self._dtm_distances)):
+                    pt = self._world_to_widget(self._dtm_distances[i], self._dtm_elevations[i])
+                    path.lineTo(pt)
+                painter.drawPath(path)
 
-        # Point cloud
-        if self._distances is not None and len(self._distances) > 0:
-            n = len(self._distances)
-            step = max(1, n // 30_000)
+            # Point cloud
+            if self._distances is not None and len(self._distances) > 0:
+                n = len(self._distances)
+                step = max(1, n // 30_000)
 
-            for i in range(0, n, step):
-                pt = self._world_to_widget(self._distances[i], self._elevations[i])
-                cls = int(self._classifications[i]) if self._classifications is not None else 0
+                for i in range(0, n, step):
+                    pt = self._world_to_widget(self._distances[i], self._elevations[i])
+                    cls = int(self._classifications[i]) if self._classifications is not None else 0
 
-                # Skip hidden classes
-                if self._class_visibility is not None and not self._class_visibility[cls]:
-                    continue
+                    # Skip hidden classes
+                    if self._class_visibility is not None and not self._class_visibility[cls]:
+                        continue
 
-                r, g, b = get_class_color(cls)
+                    r, g, b = get_class_color(cls)
 
-                if self._current_mask is not None and self._current_mask[i]:
-                    # Highlight selected points
-                    color = QColor(255, 50, 50, 220)
-                    radius = 3.5
-                else:
-                    color = QColor(int(r * 255), int(g * 255), int(b * 255), 200)
-                    radius = 2.0
+                    if self._current_mask is not None and self._current_mask[i]:
+                        # Highlight selected points
+                        color = QColor(255, 50, 50, 220)
+                        radius = 3.5
+                    else:
+                        color = QColor(int(r * 255), int(g * 255), int(b * 255), 200)
+                        radius = 2.0
 
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(QBrush(color))
+                    painter.drawEllipse(pt, radius, radius)
+
+            # Selection preview (while drawing)
+            if self._selecting and self._sel_start is not None and self._sel_end is not None:
+                painter.setPen(QPen(QColor("#ff4444"), 1, Qt.DashLine))
+
+                if self._select_mode in (SELECT_LINE_ABOVE, SELECT_LINE_BELOW):
+                    p1 = self._world_to_widget(*self._sel_start)
+                    p2 = self._world_to_widget(*self._sel_end)
+                    painter.drawLine(p1, p2)
+                elif self._select_mode == SELECT_RECTANGLE:
+                    p1 = self._world_to_widget(*self._sel_start)
+                    p2 = self._world_to_widget(*self._sel_end)
+                    rect = QRectF(p1, p2).normalized()
+                    painter.drawRect(rect)
+                elif self._select_mode == SELECT_BRUSH:
+                    pt = self._world_to_widget(*self._sel_end)
+                    rx = self._brush_radius * self._scale_x
+                    ry = self._brush_radius * self._scale_y
+                    painter.drawEllipse(pt, rx, ry)
+                elif self._select_mode == SELECT_RECT_BRUSH:
+                    d, z = self._sel_end
+                    p1 = self._world_to_widget(d - self._rect_width, z - self._rect_height)
+                    p2 = self._world_to_widget(d + self._rect_width, z + self._rect_height)
+                    rect = QRectF(p1, p2).normalized()
+                    painter.drawRect(rect)
+
+            # Persistent cursor indicator for click-to-place tools (brush / rect_brush)
+            if (not self._selecting and not self._width_adjusting
+                    and self._cursor_world is not None
+                    and self._select_mode in (SELECT_BRUSH, SELECT_RECT_BRUSH)):
+                painter.setPen(QPen(QColor("#ffaa00"), 1, Qt.DashLine))
+                if self._select_mode == SELECT_BRUSH:
+                    pt = self._world_to_widget(*self._cursor_world)
+                    rx = self._brush_radius * self._scale_x
+                    ry = self._brush_radius * self._scale_y
+                    painter.drawEllipse(pt, rx, ry)
+                elif self._select_mode == SELECT_RECT_BRUSH:
+                    d, z = self._cursor_world
+                    p1 = self._world_to_widget(d - self._rect_width, z - self._rect_height)
+                    p2 = self._world_to_widget(d + self._rect_width, z + self._rect_height)
+                    rect = QRectF(p1, p2).normalized()
+                    painter.drawRect(rect)
+
+            # Width-adjust mode overlay
+            if self._width_adjusting:
+                painter.setPen(QColor("#ffcc00"))
+                painter.drawText(
+                    10, 25,
+                    f"Width: {self._total_width:.1f} m — scroll to adjust, click to confirm"
+                )
+
+            # Point Info picked-point marker
+            if self._picked_point is not None and self._point_info_active:
+                px, py, pz, cls, intens, idx, d_val = self._picked_point
+                # Draw a bright crosshair at the picked point
+                z_val = pz
+                pt = self._world_to_widget(d_val, z_val)
+                cx, cy = pt.x(), pt.y()
+                r = 8
+                # Outer ring
+                painter.setPen(QPen(QColor(0, 255, 128, 220), 2.5))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(QPointF(cx, cy), r, r)
+                # Crosshair
+                painter.drawLine(QPointF(cx - r - 4, cy), QPointF(cx + r + 4, cy))
+                painter.drawLine(QPointF(cx, cy - r - 4), QPointF(cx, cy + r + 4))
+                # Inner dot
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(color))
-                painter.drawEllipse(pt, radius, radius)
-
-        # Selection preview (while drawing)
-        if self._selecting and self._sel_start is not None and self._sel_end is not None:
-            painter.setPen(QPen(QColor("#ff4444"), 1, Qt.DashLine))
-
-            if self._select_mode in (SELECT_LINE_ABOVE, SELECT_LINE_BELOW):
-                p1 = self._world_to_widget(*self._sel_start)
-                p2 = self._world_to_widget(*self._sel_end)
-                painter.drawLine(p1, p2)
-            elif self._select_mode == SELECT_RECTANGLE:
-                p1 = self._world_to_widget(*self._sel_start)
-                p2 = self._world_to_widget(*self._sel_end)
-                rect = QRectF(p1, p2).normalized()
-                painter.drawRect(rect)
-            elif self._select_mode == SELECT_BRUSH:
-                pt = self._world_to_widget(*self._sel_end)
-                rx = self._brush_radius * self._scale_x
-                ry = self._brush_radius * self._scale_y
-                painter.drawEllipse(pt, rx, ry)
-            elif self._select_mode == SELECT_RECT_BRUSH:
-                d, z = self._sel_end
-                p1 = self._world_to_widget(d - self._rect_width, z - self._rect_height)
-                p2 = self._world_to_widget(d + self._rect_width, z + self._rect_height)
-                rect = QRectF(p1, p2).normalized()
-                painter.drawRect(rect)
-
-        # Persistent cursor indicator for click-to-place tools (brush / rect_brush)
-        if (not self._selecting and not self._width_adjusting
-                and self._cursor_world is not None
-                and self._select_mode in (SELECT_BRUSH, SELECT_RECT_BRUSH)):
-            painter.setPen(QPen(QColor("#ffaa00"), 1, Qt.DashLine))
-            if self._select_mode == SELECT_BRUSH:
-                pt = self._world_to_widget(*self._cursor_world)
-                rx = self._brush_radius * self._scale_x
-                ry = self._brush_radius * self._scale_y
-                painter.drawEllipse(pt, rx, ry)
-            elif self._select_mode == SELECT_RECT_BRUSH:
-                d, z = self._cursor_world
-                p1 = self._world_to_widget(d - self._rect_width, z - self._rect_height)
-                p2 = self._world_to_widget(d + self._rect_width, z + self._rect_height)
-                rect = QRectF(p1, p2).normalized()
-                painter.drawRect(rect)
-
-        # Width-adjust mode overlay
-        if self._width_adjusting:
-            painter.setPen(QColor("#ffcc00"))
-            painter.drawText(
-                10, 25,
-                f"Width: {self._total_width:.1f} m — scroll to adjust, click to confirm"
-            )
-
-        # Point Info picked-point marker
-        if self._picked_point is not None and self._point_info_active:
-            px, py, pz, cls, intens, idx, d_val = self._picked_point
-            # Draw a bright crosshair at the picked point
-            z_val = pz
-            pt = self._world_to_widget(d_val, z_val)
-            cx, cy = pt.x(), pt.y()
-            r = 8
-            # Outer ring
-            painter.setPen(QPen(QColor(0, 255, 128, 220), 2.5))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawEllipse(QPointF(cx, cy), r, r)
-            # Crosshair
-            painter.drawLine(QPointF(cx - r - 4, cy), QPointF(cx + r + 4, cy))
-            painter.drawLine(QPointF(cx, cy - r - 4), QPointF(cx, cy + r + 4))
-            # Inner dot
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(QColor(0, 255, 128, 255)))
-            painter.drawEllipse(QPointF(cx, cy), 3, 3)
-
-        painter.end()
+                painter.setBrush(QBrush(QColor(0, 255, 128, 255)))
+                painter.drawEllipse(QPointF(cx, cy), 3, 3)
+        finally:
+            if painter.isActive():
+                painter.end()
 
     # ── mouse events ───────────────────────────────────────────────
 

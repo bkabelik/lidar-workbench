@@ -61,39 +61,54 @@ class _PreviewCanvas(QWidget):
         if self._pts_x is None or len(self._pts_x) == 0:
             return
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#1a1a2e"))
-        w, h = self.width(), self.height()
-        if w < 2 or h < 2:
-            p.end(); return
+        try:
+            p.fillRect(self.rect(), QColor("#1a1a2e"))
+            w, h = self.width(), self.height()
+            if w < 2 or h < 2:
+                return
 
-        # Scale to fit
-        pad = 0.05
-        x_min, x_max = float(self._pts_x.min()), float(self._pts_x.max())
-        y_min, y_max = float(self._pts_y.min()), float(self._pts_y.max())
-        rx, ry = x_max - x_min, y_max - y_min
-        if rx <= 0: rx = 1.0
-        if ry <= 0: ry = 1.0
-        sx = w * (1 - 2 * pad) / rx
-        sy = h * (1 - 2 * pad) / ry
-        s = min(sx, sy)
-        ox = (w - rx * s) / 2
-        oy = (h - ry * s) / 2
+            # Scale to fit
+            pad = 0.05
+            x_min, x_max = float(self._pts_x.min()), float(self._pts_x.max())
+            y_min, y_max = float(self._pts_y.min()), float(self._pts_y.max())
+            rx, ry = x_max - x_min, y_max - y_min
+            if rx <= 0: rx = 1.0
+            if ry <= 0: ry = 1.0
+            sx = w * (1 - 2 * pad) / rx
+            sy = h * (1 - 2 * pad) / ry
+            s = min(sx, sy)
+            ox = (w - rx * s) / 2
+            oy = (h - ry * s) / 2
 
-        # Draw kept points (blue)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QBrush(QColor(60, 120, 255, 180)))
-        for i in np.where(self._keep)[0]:
-            px = ox + (self._pts_x[i] - x_min) * s
-            py = oy + (y_max - self._pts_y[i]) * s
-            p.drawEllipse(int(px), int(py), 2, 2)
+            # Subsample for display if point cloud is large
+            n_pts = len(self._pts_x)
+            step = max(1, n_pts // 30_000)
 
-        # Draw noise points (red)
-        p.setBrush(QBrush(QColor(255, 60, 60, 220)))
-        for i in np.where(self._noise)[0]:
-            px = ox + (self._pts_x[i] - x_min) * s
-            py = oy + (y_max - self._pts_y[i]) * s
-            p.drawEllipse(int(px), int(py), 3, 3)
-        p.end()
+            keep_idx = np.where(self._keep)[0]
+            if len(keep_idx) > 0 and step > 1:
+                keep_idx = keep_idx[::step]
+
+            noise_idx = np.where(self._noise)[0]
+            if len(noise_idx) > 0 and step > 1:
+                noise_idx = noise_idx[::max(1, len(noise_idx) // 10_000)]
+
+            # Draw kept points (blue)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(QColor(60, 120, 255, 180)))
+            for i in keep_idx:
+                px = ox + (self._pts_x[i] - x_min) * s
+                py = oy + (y_max - self._pts_y[i]) * s
+                p.drawEllipse(int(px), int(py), 2, 2)
+
+            # Draw noise points (red)
+            p.setBrush(QBrush(QColor(255, 60, 60, 220)))
+            for i in noise_idx:
+                px = ox + (self._pts_x[i] - x_min) * s
+                py = oy + (y_max - self._pts_y[i]) * s
+                p.drawEllipse(int(px), int(py), 3, 3)
+        finally:
+            if p.isActive():
+                p.end()
 
 
 class SurfaceCleanupDialog(QDialog):

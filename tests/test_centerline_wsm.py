@@ -5,11 +5,18 @@ from pathlib import Path
 
 from centerline_wsm import (
     RiverCenterline,
-    slice_cross_section_points,
+    clip_polyline_to_bbox,
+    clip_segment_to_bbox,
+    detect_embankment_extents,
     detect_section_water_level,
+    drape_centerline_water_surface,
     enforce_downstream_monotonicity,
     interpolate_anchor_sections,
+    polyline_length_in_bbox,
+    project_points_to_centerline,
     rasterize_water_surface_model,
+    remove_station,
+    slice_cross_section_points,
 )
 
 class TestCenterlineWSM(unittest.TestCase):
@@ -231,6 +238,279 @@ class TestCenterlineWSM(unittest.TestCase):
         self.assertAlmostEqual(revisited[1], 104.95, delta=0.15)
         self.assertEqual(revisited[0], 105.0)
         self.assertEqual(revisited[2], 100.0)
+
+    def test_polyline_clipping_and_bbox_length(self):
+        # Segment crossing box
+        clipped = clip_segment_to_bbox([0.0, 5.0], [10.0, 5.0], 2.0, 0.0, 8.0, 10.0)
+        self.assertIsNotNone(clipped)
+        c0, c1 = clipped
+        self.assertTrue(np.allclose(c0, [2.0, 5.0]))
+        self.assertTrue(np.allclose(c1, [8.0, 5.0]))
+
+        # Segment outside box
+        self.assertIsNone(clip_segment_to_bbox([0.0, 15.0], [10.0, 15.0], 2.0, 0.0, 8.0, 10.0))
+
+        # Polyline length in bbox
+        v = np.array([[0.0, 5.0], [5.0, 5.0], [10.0, 5.0]])
+        l = polyline_length_in_bbox(v, (2.0, 0.0, 8.0, 10.0))
+        self.assertAlmostEqual(l, 6.0)
+
+        # Polyline clipping
+        chains = clip_polyline_to_bbox(v, (2.0, 0.0, 8.0, 10.0), buffer_m=0.0)
+        self.assertEqual(len(chains), 1)
+        self.assertTrue(np.allclose(chains[0][0], [2.0, 5.0]))
+        self.assertTrue(np.allclose(chains[0][-1], [8.0, 5.0]))
+
+        # S-curve centerline clipping
+        sc_chains = clip_polyline_to_bbox(self.verts, (0.0, 50.0, 60.0, 150.0), buffer_m=0.0)
+        self.assertGreaterEqual(len(sc_chains), 1)
+        for ch in sc_chains:
+            self.assertTrue(np.all(ch[:, 0] >= -1e-3))
+            self.assertTrue(np.all(ch[:, 0] <= 60.0 + 1e-3))
+            self.assertTrue(np.all(ch[:, 1] >= 50.0 - 1e-3))
+            self.assertTrue(np.all(ch[:, 1] <= 150.0 + 1e-3))
+
+    def test_drape_centerline_water_surface(self):
+        # Create 5 stations along centerline with:
+        # - High ground banks (Z=120m) at offset +/- 10m to 20m
+        # - High tree canopy (Z=135m) at offset 0m
+        # - Riverbed at Z=97.0 - 0.2*i
+        # - Water surface at Z=98.5 - 0.2*i
+        # - Station 2 has an artificial high bridge / canopy spike
+        stations = np.array([0.0, 10.0, 20.0, 30.0, 40.0])
+        cached_sections = []
+        for i, s in enumerate(stations):
+            # Bank ground points at offset +/- 15m, Z=120m
+            off_bank = np.array([-18.0, -15.0, -12.0, 12.0, 15.0, 18.0])
+            z_bank = np.full(6, 120.0)
+
+            # High tree canopy directly above river
+            off_tree = np.array([-0.5, 0.0, 0.5])
+            z_tree = np.full(3, 135.0)
+
+            true_surf = 98.5 - 0.2 * i
+            true_bed = 97.0 - 0.2 * i
+
+            if i == 2:
+                # Spike: dense canopy where laser did not reach water
+                off_chan = np.array([-0.2, 0.0, 0.2])
+                z_chan = np.full(3, 130.0)
+            else:
+                # In channel: riverbed points (97m) and water surface points (98.5m)
+                off_chan = np.array([-1.0, -0.5, 0.0, 0.5, 1.0, -0.8, -0.2, 0.3, 0.9])
+                z_chan = np.array([
+                    true_bed, true_bed + 0.1, true_bed,
+                    true_surf - 0.1, true_surf, true_surf - 0.05,
+                    true_surf, true_surf - 0.15, true_surf,
+                ])
+
+            all_off = np.concatenate([off_bank, off_tree, off_chan])
+            all_z = np.concatenate([z_bank, z_tree, z_chan])
+            cached_sections.append({"offset": all_off, "z": all_z})
+
+        levels = drape_centerline_water_surface(
+            self.centerline,
+            stations,
+            cached_sections=cached_sections,
+            center_strip_width=1.5,
+            max_water_depth=3.5,
+            outlier_threshold_m=0.60,
+            median_window=3,
+        )
+
+        self.assertEqual(len(levels), 5)
+        # Should be strictly monotonic downhill
+        self.assertTrue((np.diff(levels) <= 1e-9).all())
+        # Should ignore the 120m banks and 135m canopy completely
+        self.assertLess(float(levels.max()), 100.0)
+        self.assertGreater(float(levels.min()), 97.0)
+        # Station 0 should be around 98.5
+        self.assertAlmostEqual(levels[0], 98.5, delta=0.25)
+        # Station 2 spike should be filtered out by median filter
+        self.assertAlmostEqual(levels[2], 98.1, delta=0.35)
+
+    def test_centerline_trim(self):
+        # Original centerline total length is > 200m
+        orig_len = self.centerline.total_length
+        self.assertGreater(orig_len, 200.0)
+
+        # Trim reach [50m, 150m]
+        trimmed = self.centerline.trim(50.0, 150.0)
+        self.assertAlmostEqual(trimmed.total_length, 100.0, places=1)
+
+        # Station 0 on trimmed centerline must match station 50 on original
+        pos_orig_50, tan_orig_50, _ = self.centerline.evaluate(50.0)
+        pos_trim_0, tan_trim_0, _ = trimmed.evaluate(0.0)
+        self.assertTrue(np.allclose(pos_orig_50, pos_trim_0, atol=1e-3))
+        self.assertTrue(np.allclose(tan_orig_50, tan_trim_0, atol=1e-3))
+
+        # Station 100 on trimmed centerline must match station 150 on original
+        pos_orig_150, _, _ = self.centerline.evaluate(150.0)
+        pos_trim_end, _, _ = trimmed.evaluate(100.0)
+        self.assertTrue(np.allclose(pos_orig_150, pos_trim_end, atol=1e-3))
+
+    def test_project_points_to_centerline(self):
+        # Sample points along centerline at known stations s=20, 60, 110, with small transverse offsets
+        test_stations = [20.0, 60.0, 110.0]
+        test_xs = []
+        test_ys = []
+        for s in test_stations:
+            p, _, n = self.centerline.evaluate(s)
+            # Offset by 2m in normal direction
+            pt = p + 2.0 * n
+            test_xs.append(pt[0])
+            test_ys.append(pt[1])
+
+        proj_s = project_points_to_centerline(self.centerline, np.array(test_xs), np.array(test_ys))
+        self.assertEqual(len(proj_s), 3)
+        for expected, actual in zip(test_stations, proj_s):
+            self.assertAlmostEqual(expected, actual, delta=0.5)
+
+    def test_topo_priority_over_bathy_water_surface(self):
+        # Station with both bathymetric green returns (submerged, bed=96.0m)
+        # and Topo NIR returns (reflecting on surface=99.5m)
+        offsets = np.array([-1.0, -0.5, 0.0, 0.5, 1.0, -0.8, -0.2, 0.3, 0.9])
+        # Green bathy points at bed
+        bathy_mask = np.array([True, True, True, False, False, False, True, True, False])
+        # Topo NIR points at surface
+        topo_mask = ~bathy_mask
+
+        z = np.empty(len(offsets), dtype=np.float64)
+        z[bathy_mask] = np.random.uniform(95.8, 96.2, bathy_mask.sum())
+        z[topo_mask] = np.random.uniform(99.4, 99.6, topo_mask.sum())
+
+        st = np.ones(len(offsets), dtype=np.int32)  # NIR=1
+        st[bathy_mask] = 2  # Bathy=2
+
+        # 1. detect_section_water_level should pick the Topo water surface (~99.5m), NOT bed (~96.0m)
+        w_z, _, _ = detect_section_water_level(offsets, z, sensor_types=st)
+        self.assertAlmostEqual(w_z, 99.5, delta=0.20)
+
+        # 2. drape_centerline_water_surface should also pick Topo (~99.5m)
+        cached_sections = [{"offset": offsets, "z": z, "sensor_type": st}]
+        stations = np.array([50.0])
+        levels = drape_centerline_water_surface(
+            self.centerline,
+            stations,
+            cached_sections=cached_sections,
+            center_strip_width=2.0,
+            max_water_depth=5.0,
+        )
+        self.assertAlmostEqual(levels[0], 99.5, delta=0.20)
+
+        # 3. If only bathy returns exist (no topo returns in channel), it should fall back to bathy
+        st_bathy_only = np.full(len(offsets), 2, dtype=np.int32)
+        cached_bathy_only = [{"offset": offsets, "z": z, "sensor_type": st_bathy_only}]
+        levels_fallback = drape_centerline_water_surface(
+            self.centerline,
+            stations,
+            cached_sections=cached_bathy_only,
+            center_strip_width=2.0,
+            max_water_depth=5.0,
+        )
+        # In this case it uses the upper envelope of bathy
+        self.assertAlmostEqual(levels_fallback[0], float(np.percentile(z, 85.0)), delta=0.20)
+
+    def test_remove_station(self):
+        stations = np.array([0.0, 10.0, 20.0, 30.0, 40.0])
+        levels = np.array([100.0, 99.8, 99.5, 99.2, 99.0])
+        locked = np.array([True, False, False, True, False])
+        cached = [{"id": 0}, {"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}]
+
+        # Remove section at index 2 (station 20.0m - e.g. under a bridge)
+        up_s, up_l, up_lk, up_c, new_idx = remove_station(stations, levels, locked, cached, idx=2)
+
+        self.assertEqual(len(up_s), 4)
+        self.assertEqual(len(up_l), 4)
+        self.assertEqual(len(up_lk), 4)
+        self.assertEqual(len(up_c), 4)
+        # Verify 20.0m was removed and station 30.0m is now at index 2
+        np.testing.assert_array_equal(up_s, [0.0, 10.0, 30.0, 40.0])
+        np.testing.assert_array_equal(up_l, [100.0, 99.8, 99.2, 99.0])
+        np.testing.assert_array_equal(up_lk, [True, False, True, False])
+        self.assertEqual(up_c[2]["id"], 3)
+        self.assertEqual(new_idx, 2)
+
+        # Remove the last station (index 3 of remaining 4)
+        up_s2, up_l2, up_lk2, up_c2, new_idx2 = remove_station(up_s, up_l, up_lk, up_c, idx=3)
+        self.assertEqual(len(up_s2), 3)
+        np.testing.assert_array_equal(up_s2, [0.0, 10.0, 30.0])
+        # new_idx2 should clamp to 2 (last valid index)
+        self.assertEqual(new_idx2, 2)
+
+        # Removing when only 1 section remains should raise ValueError
+        single_s = np.array([10.0])
+        single_l = np.array([99.0])
+        single_lk = np.array([True])
+        single_c = [{"id": 0}]
+        with self.assertRaises(ValueError):
+            remove_station(single_s, single_l, single_lk, single_c, idx=0)
+
+    def test_detect_embankment_extents(self):
+        # Channel from -20m to +20m
+        # River bed at -5m to +5m, elevation 98.0m
+        # Water surface at 100.0m
+        # Embankments rise linearly from +/- 5m (elevation 98m) to +/- 10m (elevation 102m)
+        # Touch-point with water surface (100m) is exactly at +/- 7.5m
+        offsets = np.linspace(-20.0, 20.0, 81)
+        elevations = np.zeros_like(offsets)
+        for i, u in enumerate(offsets):
+            if abs(u) <= 5.0:
+                elevations[i] = 98.0
+            else:
+                # rise 0.8m per meter: at 7.5m, 98 + 0.8*(7.5 - 5) = 100.0m
+                elevations[i] = 98.0 + 0.8 * (abs(u) - 5.0)
+
+        # Margin = 2.0m: left_ext should be -7.5 - 2.0 = -9.5m, right_ext should be 7.5 + 2.0 = 9.5m
+        l_ext, r_ext = detect_embankment_extents(
+            offsets, elevations, water_z=100.0, corridor_width=40.0, margin=2.0
+        )
+        self.assertAlmostEqual(l_ext, -9.5, delta=0.5)
+        self.assertAlmostEqual(r_ext, 9.5, delta=0.5)
+
+        # Flat bathy bed across full corridor: clamps to corridor bounds
+        flat_elevations = np.full_like(offsets, 98.0)
+        l_flat, r_flat = detect_embankment_extents(
+            offsets, flat_elevations, water_z=100.0, corridor_width=40.0, margin=2.0
+        )
+        self.assertEqual(l_flat, -20.0)
+        self.assertEqual(r_flat, 20.0)
+
+        # Dry land (all points above water surface): falls back to corridor bounds
+        dry_elevations = np.full_like(offsets, 105.0)
+        l_dry, r_dry = detect_embankment_extents(
+            offsets, dry_elevations, water_z=100.0, corridor_width=40.0, margin=2.0
+        )
+        self.assertEqual(l_dry, -20.0)
+        self.assertEqual(r_dry, 20.0)
+
+    def test_rasterization_with_embankment_and_tilt(self):
+        stations = np.array([0.0, 20.0, 40.0])
+        w_levels = np.array([100.0, 99.0, 98.0])
+        # Trimmed bank offsets: -8m to +8m instead of full 30m corridor (-15m to +15m)
+        left_offsets = np.array([-8.0, -8.0, -8.0])
+        right_offsets = np.array([8.0, 8.0, 8.0])
+        # Add a 0.4m cross-stream tilt: left bank is 0.2m higher, right bank is 0.2m lower
+        z_left = w_levels + 0.20
+        z_right = w_levels - 0.20
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_tif = Path(tmpdir) / "test_wsm_tilt.tif"
+            surf, georef = rasterize_water_surface_model(
+                self.centerline, stations, w_levels,
+                corridor_width=30.0, output_path=out_tif, resolution=1.0, data_epsg=25832,
+                left_offsets=left_offsets,
+                right_offsets=right_offsets,
+                water_levels_left=z_left,
+                water_levels_right=z_right,
+            )
+            self.assertTrue(out_tif.is_file())
+            valid = surf[~np.isnan(surf)]
+            self.assertGreater(len(valid), 0)
+            # Max elevation should reach ~100.2m, min elevation should reach ~97.8m
+            self.assertAlmostEqual(float(np.max(valid)), 100.2, delta=0.15)
+            self.assertAlmostEqual(float(np.min(valid)), 97.8, delta=0.15)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,13 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "files.watcherExclude": {
+        "**/.git/objects/**": true,
+        "**/.git/subtree-cache/**": true,
+        "**/*.las": true,
+        "**/*.laz": true,
+        "**/*.tif": true,
+        "**/*.tiff": true,
+        "**/demo_project_*/**": true
+    }
 }

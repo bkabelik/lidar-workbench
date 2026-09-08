@@ -141,11 +141,14 @@ class _PreviewView(QWidget):
             return
         from PySide6.QtGui import QPainter
         p = QPainter(self)
-        p.setRenderHint(QPainter.SmoothPixmapTransform)
-        src = QRectF(0, 0, self._pixmap.width(), self._pixmap.height())
-        dst = QRectF(0, 0, self.width(), self.height())
-        p.drawPixmap(dst, self._pixmap, src)
-        p.end()
+        try:
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            src = QRectF(0, 0, self._pixmap.width(), self._pixmap.height())
+            dst = QRectF(0, 0, self.width(), self.height())
+            p.drawPixmap(dst, self._pixmap, src)
+        finally:
+            if p.isActive():
+                p.end()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
@@ -493,12 +496,17 @@ class PreviewDialog(QDialog):
         """Create a placeholder pixmap with the given text."""
         pm = QPixmap(400, 300)
         pm.fill(Qt.black)
-        from PySide6.QtGui import QPainter, QColor, QFont
+        from PySide6.QtGui import QPainter, QColor
         p = QPainter(pm)
-        p.setPen(QColor("#888888"))
-        p.setFont(QFont("sans-serif", 12))
-        p.drawText(pm.rect(), Qt.AlignCenter, text)
-        p.end()
+        try:
+            p.setPen(QColor("#888888"))
+            f = p.font()
+            f.setPointSize(12)
+            p.setFont(f)
+            p.drawText(pm.rect(), Qt.AlignCenter, text)
+        finally:
+            if p.isActive():
+                p.end()
         return pm
 
     # ── file management ────────────────────────────────────────────
