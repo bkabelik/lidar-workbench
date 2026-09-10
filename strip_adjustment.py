@@ -349,54 +349,45 @@ class StripAdjustmentSolver:
         if n_strips <= 1 or not tie_surfaces:
             return {sid: (0.0, 0.0, 0.0) for sid in self.strip_ids}
 
-        # 3 unknowns per strip (dx, dy, dz) -> total 3 * n_strips
-        n_params = 3 * n_strips
-        A_rows = []
-        b_vals = []
+        valid_ties = [
+            ts for ts in tie_surfaces
+            if ts.strip_a in self.strip_idx_map and ts.strip_b in self.strip_idx_map
+        ]
+        n_ties = len(valid_ties)
+        if n_ties == 0:
+            return {sid: (0.0, 0.0, 0.0) for sid in self.strip_ids}
 
-        for ts in tie_surfaces:
-            if ts.strip_a not in self.strip_idx_map or ts.strip_b not in self.strip_idx_map:
-                continue
+        if n_ties > 10000:
+            step = n_ties // 10000
+            valid_ties = valid_ties[::step][:10000]
+            n_ties = len(valid_ties)
+
+        n_params = 3 * n_strips
+        A = np.zeros((n_ties, n_params), dtype=np.float64)
+        b = np.zeros(n_ties, dtype=np.float64)
+
+        for i, ts in enumerate(valid_ties):
             ia = self.strip_idx_map[ts.strip_a]
             ib = self.strip_idx_map[ts.strip_b]
 
-            row = np.zeros(n_params, dtype=np.float64)
-            # Derivative w.r.t d_A: +n_B
-            row[ia * 3 + 0] = ts.normal_b[0]
-            row[ia * 3 + 1] = ts.normal_b[1]
-            row[ia * 3 + 2] = ts.normal_b[2]
-
-            # Derivative w.r.t d_B: -n_B
-            row[ib * 3 + 0] = -ts.normal_b[0]
-            row[ib * 3 + 1] = -ts.normal_b[1]
-            row[ib * 3 + 2] = -ts.normal_b[2]
-
-            # RHS: -( (p_A - c_B) · n_B )
-            rhs = -ts.residual
-            A_rows.append(row)
-            b_vals.append(rhs)
-
-        if not A_rows:
-            return {sid: (0.0, 0.0, 0.0) for sid in self.strip_ids}
-
-        A = np.array(A_rows, dtype=np.float64)
-        b = np.array(b_vals, dtype=np.float64)
+            A[i, ia * 3 : ia * 3 + 3] = ts.normal_b
+            A[i, ib * 3 : ib * 3 + 3] = -ts.normal_b
+            b[i] = -ts.residual
 
         # Fix the reference strip to 0 with high weight
         ref_idx = self.strip_idx_map[self.ref_strip_id]
-        weight_ref = 1e4
+        fix_A = np.zeros((3, n_params), dtype=np.float64)
         for k in range(3):
-            fix_row = np.zeros(n_params, dtype=np.float64)
-            fix_row[ref_idx * 3 + k] = weight_ref
-            A = np.vstack((A, fix_row))
-            b = np.append(b, 0.0)
+            fix_A[k, ref_idx * 3 + k] = 1e4
+        fix_b = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
         # Regularization (small ridge penalty to prevent singular horizontal drift)
         ridge = 1e-2
         reg_A = np.eye(n_params, dtype=np.float64) * ridge
         reg_b = np.zeros(n_params, dtype=np.float64)
-        A_full = np.vstack((A, reg_A))
-        b_full = np.append(b, reg_b)
+
+        A_full = np.vstack((A, fix_A, reg_A))
+        b_full = np.concatenate((b, fix_b, reg_b))
 
         solution, _, _, _ = np.linalg.lstsq(A_full, b_full, rcond=None)
 
@@ -453,76 +444,125 @@ class StripAdjustmentSolver:
             return {sid: (0.0, 0.0, 0.0) for sid in self.strip_ids}
 
         n_params = 3 * n_strips
-        A_rows = []
-        b_vals = []
-
         shifts = current_shifts or {sid: (0.0, 0.0, 0.0) for sid in self.strip_ids}
 
-        for ts in tie_surfaces:
-            if ts.strip_a not in self.strip_idx_map or ts.strip_b not in self.strip_idx_map:
-                continue
+        valid_ties = [
+            ts for ts in tie_surfaces
+            if ts.strip_a in self.strip_idx_map and ts.strip_b in self.strip_idx_map
+        ]
+        n_ties = len(valid_ties)
+        if n_ties == 0:
+            return {sid: (0.0, 0.0, 0.0) for sid in self.strip_ids}
 
+        # Subsample if excessively large to keep solving instantaneous (max 10,000)
+        if n_ties > 10000:
+            step = n_ties // 10000
+            valid_ties = valid_ties[::step][:10000]
+            n_ties = len(valid_ties)
+
+        # Vectorized batch-interpolation of sensor poses grouped by strip
+        poses_a: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = [None] * n_ties
+        poses_b: List[Tuple[np.ndarray, np.ndarray, np.ndarray]] = [None] * n_ties
+
+        strip_a_map: Dict[int, List[Tuple[int, float]]] = {}
+        strip_b_map: Dict[int, List[Tuple[int, float]]] = {}
+        for i, ts in enumerate(valid_ties):
+            strip_a_map.setdefault(ts.strip_a, []).append((i, ts.time_a))
+            strip_b_map.setdefault(ts.strip_b, []).append((i, ts.time_b))
+
+        for sid in self.strip_ids:
+            traj = self.trajectories.get(sid)
+            has_traj = (traj is not None and len(traj.times) > 0)
+
+            # Strip A occurrences
+            if sid in strip_a_map:
+                items_a = strip_a_map[sid]
+                if has_traj:
+                    q_times_a = np.array([t for _, t in items_a], dtype=np.float64)
+                    xs, ys, zs = traj.interpolate_position(q_times_a)
+                    _, _, yaws = traj.interpolate_attitude(q_times_a)
+                    rads = np.deg2rad(yaws)
+                    sin_y = np.sin(rads)
+                    cos_y = np.cos(rads)
+                    for k, (ts_idx, _) in enumerate(items_a):
+                        sp = np.array([xs[k], ys[k], zs[k]])
+                        ar = np.array([sin_y[k], cos_y[k], 0.0])
+                        ap = np.array([cos_y[k], -sin_y[k], 0.0])
+                        poses_a[ts_idx] = (sp, ar, ap)
+                else:
+                    sa = np.array(shifts.get(sid, (0.0, 0.0, 0.0)))
+                    for ts_idx, _ in items_a:
+                        pa = valid_ties[ts_idx].point_a + sa
+                        sp = pa + np.array([0.0, 0.0, 400.0])
+                        poses_a[ts_idx] = (sp, np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0]))
+
+            # Strip B occurrences
+            if sid in strip_b_map:
+                items_b = strip_b_map[sid]
+                if has_traj:
+                    q_times_b = np.array([t for _, t in items_b], dtype=np.float64)
+                    xs, ys, zs = traj.interpolate_position(q_times_b)
+                    _, _, yaws = traj.interpolate_attitude(q_times_b)
+                    rads = np.deg2rad(yaws)
+                    sin_y = np.sin(rads)
+                    cos_y = np.cos(rads)
+                    for k, (ts_idx, _) in enumerate(items_b):
+                        sp = np.array([xs[k], ys[k], zs[k]])
+                        ar = np.array([sin_y[k], cos_y[k], 0.0])
+                        ap = np.array([cos_y[k], -sin_y[k], 0.0])
+                        poses_b[ts_idx] = (sp, ar, ap)
+                else:
+                    sb = np.array(shifts.get(sid, (0.0, 0.0, 0.0)))
+                    for ts_idx, _ in items_b:
+                        cb = valid_ties[ts_idx].centroid_b + sb
+                        sp = cb + np.array([0.0, 0.0, 400.0])
+                        poses_b[ts_idx] = (sp, np.array([0.0, 1.0, 0.0]), np.array([1.0, 0.0, 0.0]))
+
+        # Fast pre-allocated matrix assembly
+        A = np.zeros((n_ties, n_params), dtype=np.float64)
+        b = np.zeros(n_ties, dtype=np.float64)
+        a_yaw = np.array([0.0, 0.0, 1.0])
+
+        for i, ts in enumerate(valid_ties):
             ia = self.strip_idx_map[ts.strip_a]
             ib = self.strip_idx_map[ts.strip_b]
 
-            # Shifted points from Step 1
             sa = np.array(shifts.get(ts.strip_a, (0.0, 0.0, 0.0)))
             sb = np.array(shifts.get(ts.strip_b, (0.0, 0.0, 0.0)))
             pa = ts.point_a + sa
             cb = ts.centroid_b + sb
 
-            # Get sensor position and attitude axes for Strip A and Strip B
-            sensor_a, a_roll_a, a_pitch_a, a_yaw_a = self._get_sensor_pose(ts.strip_a, ts.time_a, pa)
-            sensor_b, a_roll_b, a_pitch_b, a_yaw_b = self._get_sensor_pose(ts.strip_b, ts.time_b, cb)
+            sensor_a, ar_a, ap_a = poses_a[i]
+            sensor_b, ar_b, ap_b = poses_b[i]
 
             ra = pa - sensor_a
             rb = cb - sensor_b
 
             # Gradients along normal: (a_axis × r) · n
-            ga_roll = float(np.dot(np.cross(a_roll_a, ra), ts.normal_b))
-            ga_pitch = float(np.dot(np.cross(a_pitch_a, ra), ts.normal_b))
-            ga_yaw = float(np.dot(np.cross(a_yaw_a, ra), ts.normal_b))
+            A[i, ia * 3 + 0] = float(np.dot(np.cross(ar_a, ra), ts.normal_b))
+            A[i, ia * 3 + 1] = float(np.dot(np.cross(ap_a, ra), ts.normal_b))
+            A[i, ia * 3 + 2] = float(np.dot(np.cross(a_yaw, ra), ts.normal_b))
 
-            gb_roll = float(np.dot(np.cross(a_roll_b, rb), ts.normal_b))
-            gb_pitch = float(np.dot(np.cross(a_pitch_b, rb), ts.normal_b))
-            gb_yaw = float(np.dot(np.cross(a_yaw_b, rb), ts.normal_b))
+            A[i, ib * 3 + 0] = -float(np.dot(np.cross(ar_b, rb), ts.normal_b))
+            A[i, ib * 3 + 1] = -float(np.dot(np.cross(ap_b, rb), ts.normal_b))
+            A[i, ib * 3 + 2] = -float(np.dot(np.cross(a_yaw, rb), ts.normal_b))
 
-            row = np.zeros(n_params, dtype=np.float64)
-            # Strip A unknowns (radians)
-            row[ia * 3 + 0] = ga_roll
-            row[ia * 3 + 1] = ga_pitch
-            row[ia * 3 + 2] = ga_yaw
-
-            # Strip B unknowns (radians)
-            row[ib * 3 + 0] = -gb_roll
-            row[ib * 3 + 1] = -gb_pitch
-            row[ib * 3 + 2] = -gb_yaw
-
-            rhs = -float(np.dot(pa - cb, ts.normal_b))
-            A_rows.append(row)
-            b_vals.append(rhs)
-
-        if not A_rows:
-            return {sid: (0.0, 0.0, 0.0) for sid in self.strip_ids}
-
-        A = np.array(A_rows, dtype=np.float64)
-        b = np.array(b_vals, dtype=np.float64)
+            b[i] = -float(np.dot(pa - cb, ts.normal_b))
 
         # Fix reference strip rotation to 0
         ref_idx = self.strip_idx_map[self.ref_strip_id]
-        weight_ref = 1e5
+        fix_A = np.zeros((3, n_params), dtype=np.float64)
         for k in range(3):
-            fix_row = np.zeros(n_params, dtype=np.float64)
-            fix_row[ref_idx * 3 + k] = weight_ref
-            A = np.vstack((A, fix_row))
-            b = np.append(b, 0.0)
+            fix_A[k, ref_idx * 3 + k] = 1e5
+        fix_b = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
         # Damping regularization on angles
         ridge = 1e-1
         reg_A = np.eye(n_params, dtype=np.float64) * ridge
         reg_b = np.zeros(n_params, dtype=np.float64)
-        A_full = np.vstack((A, reg_A))
-        b_full = np.append(b, reg_b)
+
+        A_full = np.vstack((A, fix_A, reg_A))
+        b_full = np.concatenate((b, fix_b, reg_b))
 
         solution, _, _, _ = np.linalg.lstsq(A_full, b_full, rcond=None)
 

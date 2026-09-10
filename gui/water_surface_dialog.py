@@ -50,8 +50,10 @@ from ..centerline_wsm import (
     enforce_downstream_monotonicity,
     interpolate_anchor_sections,
     load_centerline_from_file,
+    load_water_surface_sections,
     polyline_length_in_bbox,
     rasterize_water_surface_model,
+    save_water_surface_sections,
     slice_cross_section_points,
 )
 
@@ -802,6 +804,17 @@ class WaterSurfaceDialog(QDialog):
         self._status_label = QLabel("Ready. Load or draw a centerline to begin.")
         bottom_layout.addWidget(self._status_label)
 
+        self._load_btn = QPushButton("📂 Load Profile…")
+        self._load_btn.setToolTip("Load saved water surface cross-sections and anchors from JSON")
+        self._load_btn.clicked.connect(self._on_load_sections)
+        bottom_layout.addWidget(self._load_btn)
+
+        self._save_btn = QPushButton("💾 Save Profile…")
+        self._save_btn.setToolTip("Save current cross-sections, anchors, and tilt adjustments to JSON")
+        self._save_btn.setEnabled(False)
+        self._save_btn.clicked.connect(self._on_save_sections)
+        bottom_layout.addWidget(self._save_btn)
+
         self._export_btn = QPushButton("💾 Export WSM GeoTIFF & Apply to Bathymetry")
         self._export_btn.setEnabled(False)
         self._export_btn.setStyleSheet("font-weight: bold; background-color: #1f6feb; color: white; padding: 6px 16px;")
@@ -1169,6 +1182,7 @@ class WaterSurfaceDialog(QDialog):
 
         self._curr_idx = 0
         self._update_current_view()
+        self._save_btn.setEnabled(True)
         self._export_btn.setEnabled(True)
         self._status_label.setText(
             f"Generated {n_sec} cross-sections ({sections_with_points} with LiDAR points). Review sections and adjust anchors."
@@ -1176,6 +1190,8 @@ class WaterSurfaceDialog(QDialog):
 
     def _get_section_data(self, idx: int) -> dict:
         if self._cached_sections[idx] is None:
+            if not self._ensure_points_loaded():
+                return {"offset": np.array([]), "z": np.array([])}
             pos, tangent, normal = self._centerline.evaluate(self._stations[idx])
             sec = slice_cross_section_points(
                 self._all_xs, self._all_ys, self._all_zs,
@@ -1361,10 +1377,10 @@ class WaterSurfaceDialog(QDialog):
         )
         self._ribbon.set_data(len(self._stations), self._curr_idx, self._locked_mask)
 
-    def _on_interpolate_anchors(self):
+    def _apply_interpolation(self):
         if len(self._stations) < 2:
             return
-        self._status_label.setText("Re-visiting in-between sections and fitting to real point cloud data...")
+        old_levels = self._water_levels.copy()
         self._water_levels = interpolate_anchor_sections(
             self._stations, self._water_levels, self._locked_mask,
             cached_sections=self._cached_sections, z_search_window=1.5,
@@ -1376,14 +1392,25 @@ class WaterSurfaceDialog(QDialog):
                 self._water_z_left[i] = self._water_levels[i]
                 self._water_z_right[i] = self._water_levels[i]
                 sec = self._cached_sections[i]
-                if sec is not None and len(sec["offset"]) > 0:
+                if sec is not None and len(sec.get("offset", [])) > 0:
                     l_off, r_off = detect_embankment_extents(
                         sec["offset"], sec["z"], self._water_levels[i],
                         corridor_width=self._corridor_width, margin=bank_margin,
                     )
                     self._left_offsets[i] = l_off
                     self._right_offsets[i] = r_off
+            else:
+                # Preserve intentional cross-stream tilt
+                if i < len(old_levels) and not np.isnan(old_levels[i]):
+                    dz = self._water_levels[i] - old_levels[i]
+                    self._water_z_left[i] += dz
+                    self._water_z_right[i] += dz
 
+    def _on_interpolate_anchors(self):
+        if len(self._stations) < 2:
+            return
+        self._status_label.setText("Re-visiting in-between sections and fitting to real point cloud data...")
+        self._apply_interpolation()
         self._update_current_view()
         self._status_label.setText("Re-evaluated intermediate sections against point cloud data between approved anchors.")
 
@@ -1506,6 +1533,16 @@ class WaterSurfaceDialog(QDialog):
             self._left_offsets = np.delete(self._left_offsets, idx)
             self._right_offsets = np.delete(self._right_offsets, idx)
 
+        # If removing the first or last section, ensure the new boundary stays locked
+        if len(self._stations) >= 2:
+            if idx == 0 and not self._locked_mask[0]:
+                self._locked_mask[0] = True
+            elif idx >= len(self._stations) and not self._locked_mask[-1]:
+                self._locked_mask[-1] = True
+
+        # Re-interpolate intermediate sections immediately to smoothly bridge the gap
+        self._apply_interpolation()
+
         self._curr_idx = new_idx
         self._update_current_view()
         self._status_label.setText(
@@ -1546,12 +1583,13 @@ class WaterSurfaceDialog(QDialog):
 
         try:
             self._status_label.setText("Rasterizing 3D Water Surface Model...")
-            # Make sure interpolation is clean before rasterizing
-            levels = interpolate_anchor_sections(self._stations, self._water_levels, self._locked_mask)
+            # Make sure interpolation and all bank/tilt arrays are synchronized before rasterizing
+            self._apply_interpolation()
+
             surf, georef = rasterize_water_surface_model(
                 centerline=self._centerline,
                 stations=self._stations,
-                water_levels=levels,
+                water_levels=self._water_levels,
                 corridor_width=self._corridor_width,
                 output_path=fn,
                 resolution=1.0,
@@ -1573,4 +1611,107 @@ class WaterSurfaceDialog(QDialog):
         except Exception as e:
             logger.exception("WSM export failed")
             QMessageBox.critical(self, "Export Error", f"Failed to export GeoTIFF: {e}")
+
+    def _on_save_sections(self):
+        if len(self._stations) == 0:
+            QMessageBox.warning(self, "No Sections", "No cross-sections to save.")
+            return
+
+        default_fn = str(self._project_dir / "water_surface_profile.json")
+        fn, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Water Surface Profile Sections",
+            default_fn,
+            "JSON Profile Files (*.json *.wsp.json);;All Files (*)",
+        )
+        if not fn:
+            return
+
+        try:
+            save_water_surface_sections(
+                file_path=fn,
+                stations=self._stations,
+                water_levels=self._water_levels,
+                locked_mask=self._locked_mask,
+                water_levels_left=self._water_z_left,
+                water_levels_right=self._water_z_right,
+                left_offsets=self._left_offsets,
+                right_offsets=self._right_offsets,
+                corridor_width=self._corridor_width,
+                section_spacing=self._section_spacing,
+                bank_margin=self._embank_spin.value(),
+                data_epsg=self._data_epsg,
+                centerline=self._centerline,
+            )
+            self._status_label.setText(f"Saved {len(self._stations)} sections to {Path(fn).name}.")
+            QMessageBox.information(
+                self, "Profile Saved",
+                f"Water surface profile saved successfully:\n{fn}\n\n"
+                f"Contains {len(self._stations)} cross-sections with water levels, anchors, tilt, and embankment offsets."
+            )
+        except Exception as e:
+            logger.exception("Failed to save water surface profile")
+            QMessageBox.critical(self, "Save Error", f"Could not save profile: {e}")
+
+    def _on_load_sections(self):
+        default_fn = str(self._project_dir / "water_surface_profile.json")
+        fn, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Water Surface Profile Sections",
+            default_fn,
+            "JSON Profile Files (*.json *.wsp.json);;All Files (*)",
+        )
+        if not fn:
+            return
+
+        try:
+            data = load_water_surface_sections(fn)
+
+            # Restore centerline if present in profile file
+            if data.get("centerline_vertices") is not None and len(data["centerline_vertices"]) >= 2:
+                verts = data["centerline_vertices"]
+                self._full_centerline = RiverCenterline(verts)
+                self._centerline = self._full_centerline
+                self._centerline_path_edit.setText(f"[Loaded Profile: {len(verts)} vertices, {self._centerline.total_length:.1f} m]")
+
+            # Restore parameters
+            self._corridor_width = data["corridor_width"]
+            self._section_spacing = data["section_spacing"]
+            self._width_spin.blockSignals(True)
+            self._width_spin.setValue(self._corridor_width)
+            self._width_spin.blockSignals(False)
+            self._spacing_spin.blockSignals(True)
+            self._spacing_spin.setValue(self._section_spacing)
+            self._spacing_spin.blockSignals(False)
+            self._embank_spin.blockSignals(True)
+            self._embank_spin.setValue(data["bank_margin"])
+            self._embank_spin.blockSignals(False)
+
+            if data.get("data_epsg") and not self._data_epsg:
+                self._data_epsg = data["data_epsg"]
+
+            # Restore section arrays
+            self._stations = data["stations"]
+            self._water_levels = data["water_levels"]
+            self._water_z_left = data["water_levels_left"]
+            self._water_z_right = data["water_levels_right"]
+            self._left_offsets = data["left_offsets"]
+            self._right_offsets = data["right_offsets"]
+            self._locked_mask = data["locked_mask"]
+            self._cached_sections = [None] * len(self._stations)
+
+            self._curr_idx = 0
+            self._save_btn.setEnabled(True)
+            self._export_btn.setEnabled(True)
+            self._update_current_view()
+            self._status_label.setText(f"Loaded {len(self._stations)} sections from {Path(fn).name}.")
+            QMessageBox.information(
+                self, "Profile Loaded",
+                f"Loaded {len(self._stations)} cross-sections from:\n{fn}\n\n"
+                f"Corridor width: {self._corridor_width:.1f} m, Bank margin: {data['bank_margin']:.1f} m\n"
+                f"Anchors locked: {int(np.sum(self._locked_mask))} of {len(self._stations)}."
+            )
+        except Exception as e:
+            logger.exception("Failed to load water surface profile")
+            QMessageBox.critical(self, "Load Error", f"Could not load profile: {e}")
 

@@ -887,10 +887,46 @@ def rasterize_water_surface_model(
     else:
         z_right = np.asarray(water_levels, dtype=np.float64)
 
-    left_x = pos[:, 0] + l_off * normal[:, 0]
-    left_y = pos[:, 1] + l_off * normal[:, 1]
-    right_x = pos[:, 0] + r_off * normal[:, 0]
-    right_y = pos[:, 1] + r_off * normal[:, 1]
+    # Subdivide station intervals along curved centerline so the quad mesh
+    # accurately tracks river bends, especially where sections were removed or spaced apart.
+    max_step = max(resolution, min(corridor_width * 0.25, 5.0))
+
+    sub_stations = []
+    sub_l_off = []
+    sub_r_off = []
+    sub_z_left = []
+    sub_z_right = []
+
+    for i in range(len(stations) - 1):
+        s0, s1 = stations[i], stations[i + 1]
+        ds = s1 - s0
+        n_sub = max(1, int(np.ceil(ds / max_step)))
+        for k in range(n_sub):
+            t = k / n_sub
+            sub_stations.append(s0 + t * ds)
+            sub_l_off.append((1.0 - t) * l_off[i] + t * l_off[i + 1])
+            sub_r_off.append((1.0 - t) * r_off[i] + t * r_off[i + 1])
+            sub_z_left.append((1.0 - t) * z_left[i] + t * z_left[i + 1])
+            sub_z_right.append((1.0 - t) * z_right[i] + t * z_right[i + 1])
+
+    # Append the final station
+    sub_stations.append(stations[-1])
+    sub_l_off.append(l_off[-1])
+    sub_r_off.append(r_off[-1])
+    sub_z_left.append(z_left[-1])
+    sub_z_right.append(z_right[-1])
+
+    sub_stations = np.array(sub_stations, dtype=np.float64)
+    sub_l_off = np.array(sub_l_off, dtype=np.float64)
+    sub_r_off = np.array(sub_r_off, dtype=np.float64)
+    sub_z_left = np.array(sub_z_left, dtype=np.float64)
+    sub_z_right = np.array(sub_z_right, dtype=np.float64)
+
+    pos, tangent, normal = centerline.evaluate(sub_stations)
+    left_x = pos[:, 0] + sub_l_off * normal[:, 0]
+    left_y = pos[:, 1] + sub_l_off * normal[:, 1]
+    right_x = pos[:, 0] + sub_r_off * normal[:, 0]
+    right_y = pos[:, 1] + sub_r_off * normal[:, 1]
 
     all_x = np.concatenate([left_x, right_x])
     all_y = np.concatenate([left_y, right_y])
@@ -907,16 +943,16 @@ def rasterize_water_surface_model(
     tri_vertices = []
     tri_z = []
 
-    for i in range(len(stations) - 1):
+    for i in range(len(sub_stations) - 1):
         p_li = (left_x[i], left_y[i])
         p_ri = (right_x[i], right_y[i])
         p_li1 = (left_x[i + 1], left_y[i + 1])
         p_ri1 = (right_x[i + 1], right_y[i + 1])
 
-        z_li = z_left[i]
-        z_ri = z_right[i]
-        z_li1 = z_left[i + 1]
-        z_ri1 = z_right[i + 1]
+        z_li = sub_z_left[i]
+        z_ri = sub_z_right[i]
+        z_li1 = sub_z_left[i + 1]
+        z_ri1 = sub_z_right[i + 1]
 
         tri_vertices.append([p_li, p_ri, p_li1])
         tri_z.append((z_li, z_ri, z_li1))
@@ -1439,5 +1475,139 @@ out body geom;
         logger.debug("Failed to write OSM waterways cache: %s", ce)
 
     return valid_ways
+
+
+def save_water_surface_sections(
+    file_path: str | Path,
+    stations: np.ndarray,
+    water_levels: np.ndarray,
+    locked_mask: np.ndarray,
+    water_levels_left: Optional[np.ndarray] = None,
+    water_levels_right: Optional[np.ndarray] = None,
+    left_offsets: Optional[np.ndarray] = None,
+    right_offsets: Optional[np.ndarray] = None,
+    corridor_width: float = 40.0,
+    section_spacing: float = 10.0,
+    bank_margin: float = 2.5,
+    data_epsg: Optional[int] = None,
+    centerline: Optional[RiverCenterline] = None,
+) -> Path:
+    """
+    Save the current cross-section profile, elevations, anchors, offsets, and centerline to JSON.
+    """
+    import json
+    from datetime import datetime, timezone
+
+    file_path = Path(file_path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    n = len(stations)
+    z_l = water_levels_left if water_levels_left is not None else water_levels
+    z_r = water_levels_right if water_levels_right is not None else water_levels
+    half_w = corridor_width * 0.5
+    l_off = left_offsets if left_offsets is not None else np.full(n, -half_w)
+    r_off = right_offsets if right_offsets is not None else np.full(n, half_w)
+
+    sections_list = []
+    for i in range(n):
+        sections_list.append({
+            "station": round(float(stations[i]), 3),
+            "water_z": round(float(water_levels[i]), 3),
+            "water_z_left": round(float(z_l[i]), 3),
+            "water_z_right": round(float(z_r[i]), 3),
+            "left_offset": round(float(l_off[i]), 3),
+            "right_offset": round(float(r_off[i]), 3),
+            "is_locked": bool(locked_mask[i]),
+        })
+
+    payload = {
+        "file_type": "lidar_workbench_water_surface_profile",
+        "version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "data_epsg": data_epsg,
+        "corridor_width": float(corridor_width),
+        "section_spacing": float(section_spacing),
+        "bank_margin": float(bank_margin),
+        "centerline": {
+            "total_length": round(float(centerline.total_length), 2) if centerline else 0.0,
+            "vertices": centerline.vertices.tolist() if centerline else [],
+        },
+        "sections": sections_list,
+    }
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    return file_path
+
+
+def load_water_surface_sections(file_path: str | Path) -> dict:
+    """
+    Load cross-section profile and metadata from a saved JSON file.
+
+    Returns dict with keys:
+        'stations': np.ndarray,
+        'water_levels': np.ndarray,
+        'water_levels_left': np.ndarray,
+        'water_levels_right': np.ndarray,
+        'left_offsets': np.ndarray,
+        'right_offsets': np.ndarray,
+        'locked_mask': np.ndarray,
+        'corridor_width': float,
+        'section_spacing': float,
+        'bank_margin': float,
+        'data_epsg': Optional[int],
+        'centerline_vertices': Optional[np.ndarray],
+    """
+    import json
+
+    file_path = Path(file_path)
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict) or "sections" not in data:
+        raise ValueError(f"Invalid water surface profile file format: {file_path.name}")
+
+    sections = data.get("sections", [])
+    n = len(sections)
+
+    stations = np.zeros(n, dtype=np.float64)
+    water_levels = np.zeros(n, dtype=np.float64)
+    water_levels_left = np.zeros(n, dtype=np.float64)
+    water_levels_right = np.zeros(n, dtype=np.float64)
+    left_offsets = np.zeros(n, dtype=np.float64)
+    right_offsets = np.zeros(n, dtype=np.float64)
+    locked_mask = np.zeros(n, dtype=bool)
+
+    for i, s in enumerate(sections):
+        stations[i] = float(s.get("station", 0.0))
+        water_levels[i] = float(s.get("water_z", np.nan))
+        water_levels_left[i] = float(s.get("water_z_left", water_levels[i]))
+        water_levels_right[i] = float(s.get("water_z_right", water_levels[i]))
+        left_offsets[i] = float(s.get("left_offset", -20.0))
+        right_offsets[i] = float(s.get("right_offset", 20.0))
+        locked_mask[i] = bool(s.get("is_locked", False))
+
+    cl_verts = None
+    if "centerline" in data and "vertices" in data["centerline"]:
+        verts_list = data["centerline"]["vertices"]
+        if verts_list and len(verts_list) >= 2:
+            cl_verts = np.array(verts_list, dtype=np.float64)
+
+    return {
+        "stations": stations,
+        "water_levels": water_levels,
+        "water_levels_left": water_levels_left,
+        "water_levels_right": water_levels_right,
+        "left_offsets": left_offsets,
+        "right_offsets": right_offsets,
+        "locked_mask": locked_mask,
+        "corridor_width": float(data.get("corridor_width", 40.0)),
+        "section_spacing": float(data.get("section_spacing", 10.0)),
+        "bank_margin": float(data.get("bank_margin", 2.5)),
+        "data_epsg": data.get("data_epsg"),
+        "centerline_vertices": cl_verts,
+    }
+
 
 

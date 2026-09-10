@@ -12,10 +12,12 @@ from centerline_wsm import (
     drape_centerline_water_surface,
     enforce_downstream_monotonicity,
     interpolate_anchor_sections,
+    load_water_surface_sections,
     polyline_length_in_bbox,
     project_points_to_centerline,
     rasterize_water_surface_model,
     remove_station,
+    save_water_surface_sections,
     slice_cross_section_points,
 )
 
@@ -510,6 +512,73 @@ class TestCenterlineWSM(unittest.TestCase):
             # Max elevation should reach ~100.2m, min elevation should reach ~97.8m
             self.assertAlmostEqual(float(np.max(valid)), 100.2, delta=0.15)
             self.assertAlmostEqual(float(np.min(valid)), 97.8, delta=0.15)
+
+    def test_save_and_load_water_surface_sections(self):
+        stations = np.array([0.0, 20.0, 50.0])
+        levels = np.array([100.0, 99.5, 99.0])
+        locked = np.array([True, False, True])
+        z_left = np.array([100.2, 99.5, 99.1])
+        z_right = np.array([99.8, 99.5, 98.9])
+        l_off = np.array([-7.5, -8.0, -7.0])
+        r_off = np.array([8.0, 8.5, 7.5])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            json_path = Path(tmpdir) / "profile.json"
+            saved_path = save_water_surface_sections(
+                file_path=json_path,
+                stations=stations,
+                water_levels=levels,
+                locked_mask=locked,
+                water_levels_left=z_left,
+                water_levels_right=z_right,
+                left_offsets=l_off,
+                right_offsets=r_off,
+                corridor_width=35.0,
+                section_spacing=15.0,
+                bank_margin=3.0,
+                data_epsg=25833,
+                centerline=self.centerline,
+            )
+            self.assertTrue(saved_path.is_file())
+
+            # Load back and verify identical attributes
+            loaded = load_water_surface_sections(json_path)
+            np.testing.assert_allclose(loaded["stations"], stations)
+            np.testing.assert_allclose(loaded["water_levels"], levels)
+            np.testing.assert_allclose(loaded["water_levels_left"], z_left)
+            np.testing.assert_allclose(loaded["water_levels_right"], z_right)
+            np.testing.assert_allclose(loaded["left_offsets"], l_off)
+            np.testing.assert_allclose(loaded["right_offsets"], r_off)
+            np.testing.assert_array_equal(loaded["locked_mask"], locked)
+            self.assertEqual(loaded["corridor_width"], 35.0)
+            self.assertEqual(loaded["section_spacing"], 15.0)
+            self.assertEqual(loaded["bank_margin"], 3.0)
+            self.assertEqual(loaded["data_epsg"], 25833)
+            self.assertIsNotNone(loaded["centerline_vertices"])
+            self.assertGreaterEqual(len(loaded["centerline_vertices"]), 2)
+
+    def test_rasterize_with_gap_subdivision(self):
+        # A curved river with a large gap (e.g. stations 0.0 and 80.0 where intermediate sections were removed)
+        stations = np.array([0.0, 80.0])
+        w_levels = np.array([100.0, 98.0])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_tif = Path(tmpdir) / "test_gap_wsm.tif"
+            surf, georef = rasterize_water_surface_model(
+                self.centerline, stations, w_levels,
+                corridor_width=30.0, output_path=out_tif, resolution=1.0, data_epsg=25832,
+            )
+            self.assertTrue(out_tif.is_file())
+            valid = surf[~np.isnan(surf)]
+            self.assertGreater(len(valid), 0)
+            # Centerline curves in an S-shape (X in [0, 50]), so the valid pixels should span across that curved X range
+            # rather than being restricted to a straight chord
+            transform = georef["transform"]
+            rows, cols = surf.shape
+            valid_r, valid_c = np.where(~np.isnan(surf))
+            valid_x = transform[2] + (valid_c + 0.5) * transform[0]
+            # Since S-curve reaches up to X ≈ 50m, valid_x max should be >= 45m
+            self.assertGreater(float(np.max(valid_x)), 40.0)
 
 
 if __name__ == "__main__":

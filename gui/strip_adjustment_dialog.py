@@ -158,9 +158,13 @@ class _StripAdjustmentWorker(QThread):
                             "gps_time": ts[mask],
                         }
 
-                    # Extract tie surfaces for all active strip pairs in this tile
+                    # Extract tie surfaces for active strip pairs in this tile
+                    # Limit candidates per pair and per tile to ensure fast streaming
+                    tile_ties_count = 0
                     for i in range(len(present)):
                         for j in range(i + 1, len(present)):
+                            if tile_ties_count >= 50:
+                                break
                             s1, s2 = present[i], present[j]
                             ties = extract_tie_planes(
                                 tile_subsets[s1],
@@ -169,10 +173,16 @@ class _StripAdjustmentWorker(QThread):
                                 patch_radius=1.5,
                                 min_patch_pts=15,
                                 max_roughness=0.04,
-                                max_samples=250,
+                                max_samples=40,
                             )
                             if ties:
                                 all_tie_surfaces.extend(ties)
+                                tile_ties_count += len(ties)
+
+            # Subsample across the whole dataset if total tie surfaces exceed 8,000
+            if len(all_tie_surfaces) > 8000:
+                step = len(all_tie_surfaces) // 8000
+                all_tie_surfaces = all_tie_surfaces[::step][:8000]
 
             # ── Mode B: In-memory fallback (used in standalone unit tests) ─
             elif self.strip_data_map is not None:
@@ -506,85 +516,116 @@ class StripAdjustmentDialog(QDialog):
         self._on_auto_match_trajectories(silent=True)
 
     def _scan_tiles_for_strips(self):
-        """Fast sample scan across target tiles to discover flightlines, sensor types, and GPS bounds."""
+        """Discover flightlines, sensor types, and spanning tiles directly from database, sampling GPS bounds."""
         target_tids = self._get_active_tile_ids()
         self._strip_meta.clear()
 
         if not target_tids:
             return
 
-        # Query database for strip sensor mapping if available
-        strip_sensors: Dict[int, str] = {}
+        target_set = set(target_tids)
+        import json
+        import laspy
+
+        # 1. Primary path: query SQLite database for accurate flightline metadata & spanning tiles
         if self._db:
             try:
                 with self._db.connect() as conn:
-                    rows = conn.execute("SELECT flightline_sensor_types FROM tiles").fetchall()
-                    for (fl_json,) in rows:
-                        if not fl_json:
+                    rows = conn.execute("SELECT id, point_count, flightline_sensor_types FROM tiles").fetchall()
+                    for tid, pt_cnt, fl_json in rows:
+                        if tid not in target_set or not fl_json:
                             continue
-                        import json
                         mapping = json.loads(fl_json) if isinstance(fl_json, str) else fl_json
+                        k = max(1, len(mapping))
                         for sid_str, stype in mapping.items():
-                            strip_sensors[int(sid_str)] = stype
-            except Exception:
-                pass
+                            sid_int = int(sid_str)
+                            if sid_int not in self._strip_meta:
+                                sensor = stype if stype else ("bathy" if sid_int >= 7 else "topo")
+                                self._strip_meta[sid_int] = {
+                                    "count": 0,
+                                    "sensor": sensor,
+                                    "t_min": float("inf"),
+                                    "t_max": float("-inf"),
+                                    "tiles": set(),
+                                }
+                            self._strip_meta[sid_int]["tiles"].add(tid)
+                            self._strip_meta[sid_int]["count"] += int((pt_cnt or 0) / k)
+            except Exception as exc:
+                logger.warning("Could not query strip info from database: %s", exc)
 
-        import laspy
+        # 2. GPS bounds sampling: inspect first matching tile per strip
+        for sid, meta in self._strip_meta.items():
+            if meta["t_min"] != float("inf"):
+                continue
+            for tid in sorted(list(meta["tiles"])):
+                tile_path = self._tm.tile_las_path(tid) if self._tm else None
+                if not tile_path or not os.path.exists(tile_path):
+                    direct = Path(self._project_dir) / "tiles" / f"{tid}.las"
+                    if direct.is_file():
+                        tile_path = direct
+                    else:
+                        continue
+                try:
+                    with laspy.open(tile_path) as r:
+                        if r.header.point_count == 0:
+                            continue
+                        for chunk in r.chunk_iterator(500000):
+                            mask = chunk.point_source_id == sid
+                            if np.any(mask):
+                                gt = chunk.gps_time[mask]
+                                if len(gt) and gt.max() > 0:
+                                    meta["t_min"] = min(meta["t_min"], float(gt.min()))
+                                    meta["t_max"] = max(meta["t_max"], float(gt.max()))
+                                    break
+                except Exception:
+                    pass
+                if meta["t_min"] != float("inf"):
+                    break
 
-        for tid in target_tids:
-            tile_path = self._tm.tile_las_path(tid) if self._tm else None
-            if not tile_path or not os.path.exists(tile_path):
-                direct = Path(self._project_dir) / "tiles" / f"{tid}.las"
-                if direct.is_file():
-                    tile_path = direct
-                else:
-                    continue
-
-            try:
-                with laspy.open(tile_path) as r:
-                    n_pts = r.header.point_count
-                    if n_pts == 0:
+        # 3. Fallback path (e.g. if DB is empty or missing flightline metadata)
+        if not self._strip_meta:
+            for tid in target_tids:
+                tile_path = self._tm.tile_las_path(tid) if self._tm else None
+                if not tile_path or not os.path.exists(tile_path):
+                    direct = Path(self._project_dir) / "tiles" / f"{tid}.las"
+                    if direct.is_file():
+                        tile_path = direct
+                    else:
                         continue
 
-                    # Sample points to inspect point_source_id and gps_time quickly
-                    sample_n = min(n_pts, 50000)
-                    chunk = r.read_points(sample_n)
-                    sids = np.unique(chunk.point_source_id)
-                    gt = chunk.gps_time if hasattr(chunk, "gps_time") else np.zeros(sample_n)
+                try:
+                    with laspy.open(tile_path) as r:
+                        n_pts = r.header.point_count
+                        if n_pts == 0:
+                            continue
 
-                    for sid in sids:
-                        sid_int = int(sid)
-                        if sid_int not in self._strip_meta:
-                            # Sensor identification
-                            stype = strip_sensors.get(sid_int)
-                            if not stype:
-                                stype = "bathy" if sid_int >= 7 else "topo"
-
-                            self._strip_meta[sid_int] = {
-                                "count": 0,
-                                "sensor": stype,
-                                "t_min": float("inf"),
-                                "t_max": float("-inf"),
-                                "tiles": set(),
-                            }
-
-                        mask = chunk.point_source_id == sid
-                        pts_in_sample = int(mask.sum())
-                        est_count = int(round((pts_in_sample / sample_n) * n_pts))
-                        self._strip_meta[sid_int]["count"] += est_count
-                        self._strip_meta[sid_int]["tiles"].add(tid)
-
-                        t_sub = gt[mask]
-                        if len(t_sub) > 0 and t_sub.max() > 0:
-                            self._strip_meta[sid_int]["t_min"] = min(
-                                self._strip_meta[sid_int]["t_min"], float(t_sub.min())
-                            )
-                            self._strip_meta[sid_int]["t_max"] = max(
-                                self._strip_meta[sid_int]["t_max"], float(t_sub.max())
-                            )
-
-            except Exception:
-                continue
+                        for chunk in r.chunk_iterator(500000):
+                            sids = np.unique(chunk.point_source_id)
+                            gt = chunk.gps_time if hasattr(chunk, "gps_time") else np.zeros(len(chunk))
+                            for sid in sids:
+                                sid_int = int(sid)
+                                if sid_int not in self._strip_meta:
+                                    stype = "bathy" if sid_int >= 7 else "topo"
+                                    self._strip_meta[sid_int] = {
+                                        "count": 0,
+                                        "sensor": stype,
+                                        "t_min": float("inf"),
+                                        "t_max": float("-inf"),
+                                        "tiles": set(),
+                                    }
+                                mask = chunk.point_source_id == sid
+                                self._strip_meta[sid_int]["count"] += int(mask.sum())
+                                self._strip_meta[sid_int]["tiles"].add(tid)
+                                t_sub = gt[mask]
+                                if len(t_sub) > 0 and t_sub.max() > 0:
+                                    self._strip_meta[sid_int]["t_min"] = min(
+                                        self._strip_meta[sid_int]["t_min"], float(t_sub.min())
+                                    )
+                                    self._strip_meta[sid_int]["t_max"] = max(
+                                        self._strip_meta[sid_int]["t_max"], float(t_sub.max())
+                                    )
+                except Exception:
+                    continue
 
     def _populate_strip_table(self):
         self._strip_table.setRowCount(0)
@@ -610,7 +651,15 @@ class StripAdjustmentDialog(QDialog):
             n_pts = meta["count"]
             t_min = meta["t_min"]
             t_max = meta["t_max"]
-            t_span_str = f"{t_min:.1f} – {t_max:.1f}" if t_max > 0 and t_min != float("inf") else "N/A"
+            traj = self._trajectories.get(sid)
+
+            if t_max > 0 and t_min != float("inf"):
+                t_span_str = f"{t_min:.1f} – {t_max:.1f}"
+            elif traj is not None:
+                t_span_str = f"{traj.t_min:.1f} – {traj.t_max:.1f} (traj)"
+            else:
+                t_span_str = "N/A"
+
             n_tiles_str = f"{len(meta['tiles']):,} tiles"
 
             stype = meta.get("sensor", "").lower()
@@ -638,7 +687,6 @@ class StripAdjustmentDialog(QDialog):
             self._strip_table.setItem(row, 5, QTableWidgetItem(n_tiles_str))
 
             # Trajectory status
-            traj = self._trajectories.get(sid)
             if traj is not None:
                 filename = os.path.basename(traj.filepath) if traj.filepath else "Custom"
                 n_rec = f"{len(traj.times):,}"
@@ -690,10 +738,12 @@ class StripAdjustmentDialog(QDialog):
 
                     t_min = meta["t_min"]
                     t_max = meta["t_max"]
-                    if t_max <= 0 or t_min == float("inf"):
-                        continue
-                    # Check timestamp overlap
-                    if not (t_max < traj.t_min or t_min > traj.t_max):
+                    # Check timestamp overlap if available, else match per sensor
+                    if t_max > 0 and t_min != float("inf"):
+                        if not (t_max < traj.t_min or t_min > traj.t_max):
+                            self._trajectories[sid] = traj
+                            matched_count += 1
+                    else:
                         self._trajectories[sid] = traj
                         matched_count += 1
             except Exception:
