@@ -16,9 +16,13 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import re
 from typing import List, Optional, Tuple
 
 import numpy as np
+from scipy.spatial import cKDTree
+from scipy.sparse import csgraph
+import pyqtgraph as pg
 
 from PySide6.QtCore import Qt, Signal, QThread
 from PySide6.QtGui import QColor
@@ -41,6 +45,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSpinBox,
+    QSplitter,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -103,6 +108,588 @@ class _CheckboxTableWidgetItem(QTableWidgetItem):
             c2 = 1 if other.checkState() == Qt.Checked else 0
             return c1 < c2
         return super().__lt__(other)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Roof & Patch Helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+def parse_roof_point_name(name: str) -> Tuple[str, str]:
+    """
+    Parse a surveyor point name to determine (patch_id, point_id).
+
+    Conventions handled:
+      - 6-digit numeric IDs: e.g. '010203' -> GCP '01', House '02', Point '03'
+        Returns ('0102', '03') to guarantee houses remain unique across GCPs.
+      - Delimited 3-part: '01_02_03', '01-02-03', 'GCP1_H2_P3' -> ('01_02', '03')
+      - Delimited 2-part: 'H1_1', 'ROOF2-P1' -> ('H1', '1'), ('ROOF2', 'P1')
+      - Fallback: (name, '1')
+    """
+    s = str(name).strip()
+    # 1) 6-digit format GGRRPP (e.g. 010101 -> GCP 01, House 01, Point 01)
+    m6 = re.match(r"^(\d{2})(\d{2})(\d{2})$", s)
+    if m6:
+        return f"{m6.group(1)}{m6.group(2)}", m6.group(3)
+    # 2) Delimited 3-part (e.g. 01_01_01, 1-2-3, 01.02.03)
+    m3 = re.match(r"^(.*?)[_\-\.\/](\w+)[_\-\.\/]([pP]?\d+|\w+)$", s)
+    if m3:
+        return f"{m3.group(1)}_{m3.group(2)}", m3.group(3)
+    # 3) Delimited 2-part (e.g. H1_1, ROOF1-2, P1_P2)
+    m2 = re.match(r"^(.*?)[_\-\.\/]([pP]?\d+)$", s)
+    if m2:
+        return m2.group(1), m2.group(2)
+    return s, "1"
+
+
+def cluster_roof_points_spatially(coords_xy: np.ndarray, radius: float = 10.0) -> np.ndarray:
+    """
+    Group 2D coordinates within `radius` (meters) into patches using connected components.
+    Returns integer cluster labels for each point.
+    """
+    coords = np.asarray(coords_xy)
+    if len(coords) == 0:
+        return np.array([], dtype=int)
+    if len(coords) == 1:
+        return np.array([0], dtype=int)
+    tree = cKDTree(coords)
+    adj = tree.sparse_distance_matrix(tree, max_distance=radius)
+    _, labels = csgraph.connected_components(adj)
+    return labels
+
+
+def sort_vertices_angular(verts: np.ndarray, clockwise: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Sort polygon vertices angularly around their 2D centroid to eliminate zigzag/hourglass polygons.
+
+    Parameters
+    ----------
+    verts : np.ndarray
+        Array of shape (N, 2) or (N, 3).
+    clockwise : bool
+        If True, sort clockwise; otherwise counter-clockwise (default).
+
+    Returns
+    -------
+    sorted_verts : np.ndarray
+    sort_indices : np.ndarray
+    """
+    verts_arr = np.asarray(verts)
+    if len(verts_arr) <= 2:
+        return verts_arr, np.arange(len(verts_arr))
+    cx = float(np.mean(verts_arr[:, 0]))
+    cy = float(np.mean(verts_arr[:, 1]))
+    angles = np.arctan2(verts_arr[:, 1] - cy, verts_arr[:, 0] - cx)
+    order = np.argsort(-angles if clockwise else angles)
+    return verts_arr[order], order
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 2-View Inspector (XY Plan + Z Elevation)
+# ═══════════════════════════════════════════════════════════════════════
+
+class _Roof2ViewInspector(QWidget):
+    """
+    Two-view interactive inspector and manual nudge editor for roof & ground patches.
+      - Top View: XY Plan View (top-down) with LiDAR scatter, inliers, and control polygon.
+      - Bottom View: Z Elevation Profile View (cross-section along slope/normal).
+      - Step size selector and nudge buttons for XY and Z.
+      - Live metric status and 'Reset to Auto-Fit' button.
+    """
+
+    offset_changed = Signal(str, float, float, float)  # patch_name, dx, dy, dz
+    use_toggled = Signal(str, bool)                     # patch_name, used
+    delete_requested = Signal(str)                      # patch_name
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._current_patch: Optional[dict] = None
+        self._dx: float = 0.0
+        self._dy: float = 0.0
+        self._dz: float = 0.0
+        self._base_dx: float = 0.0
+        self._base_dy: float = 0.0
+        self._base_dz: float = 0.0
+        self._step_size: float = 0.05
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+
+        # Header bar
+        head_box = QHBoxLayout()
+        self._title_label = QLabel("<b>Select a patch from the results to inspect</b>")
+        self._title_label.setStyleSheet("font-size: 12px;")
+        head_box.addWidget(self._title_label, 1)
+
+        self._use_chk = QCheckBox("☑ Use in Shift")
+        self._use_chk.setChecked(True)
+        self._use_chk.setToolTip("Include or exclude this patch from the XYZ shift calculation")
+        self._use_chk.toggled.connect(self._on_use_toggled)
+        self._use_chk.setEnabled(False)
+        head_box.addWidget(self._use_chk)
+
+        self._reset_btn = QPushButton("↺ Reset to Auto-Fit")
+        self._reset_btn.setToolTip("Reset manual nudges back to RANSAC calculated offset")
+        self._reset_btn.clicked.connect(self._reset_to_autofit)
+        self._reset_btn.setEnabled(False)
+        head_box.addWidget(self._reset_btn)
+
+        self._del_btn = QPushButton("🗑 Delete")
+        self._del_btn.setToolTip("Delete this bad or wrong patch from the surface model")
+        self._del_btn.setStyleSheet("QPushButton { color: #e74c3c; font-weight: bold; }")
+        self._del_btn.clicked.connect(self._on_delete_clicked)
+        self._del_btn.setEnabled(False)
+        head_box.addWidget(self._del_btn)
+        layout.addLayout(head_box)
+
+        # Splitter between XY View and Z View
+        splitter = QSplitter(Qt.Vertical)
+
+        # ── View 1: XY Plan View ──
+        xy_container = QWidget()
+        xy_layout = QVBoxLayout(xy_container)
+        xy_layout.setContentsMargins(0, 0, 0, 0)
+        xy_layout.setSpacing(2)
+
+        self._plot_xy = pg.PlotWidget(title="XY Plan View (Yellow: GCP Boundary | Cyan: Shifted Cloud)")
+        self._plot_xy.showGrid(x=True, y=True, alpha=0.3)
+        self._plot_xy.setAspectLocked(True)
+        self._plot_xy.setLabel("bottom", "X (Easting)", units="m")
+        self._plot_xy.setLabel("left", "Y (Northing)", units="m")
+
+        self._scatter_xy_pts = pg.ScatterPlotItem(size=4, pen=None, brush=pg.mkBrush(140, 140, 140, 100))
+        self._scatter_xy_inl = pg.ScatterPlotItem(size=6, pen=None, brush=pg.mkBrush(0, 220, 255, 220))
+        self._poly_xy_orig = pg.PlotCurveItem(pen=pg.mkPen(color=(255, 200, 0), width=2))
+        self._poly_xy_shifted = pg.PlotCurveItem(pen=pg.mkPen(color=(50, 255, 50, 0), width=0))
+        self._scatter_xy_verts = pg.ScatterPlotItem(size=9, pen=pg.mkPen('w', width=1), brush=pg.mkBrush(255, 60, 60))
+
+        self._plot_xy.addItem(self._scatter_xy_pts)
+        self._plot_xy.addItem(self._scatter_xy_inl)
+        self._plot_xy.addItem(self._poly_xy_orig)
+        self._plot_xy.addItem(self._poly_xy_shifted)
+        self._plot_xy.addItem(self._scatter_xy_verts)
+        xy_layout.addWidget(self._plot_xy, 1)
+
+        # XY Legend Bar
+        xy_legend = QHBoxLayout()
+        xy_legend.setContentsMargins(4, 1, 4, 1)
+        xy_legend.setSpacing(10)
+        lbl_gcp_poly = QLabel("🟡 <b>GCP Outline</b> (Fixed Truth)")
+        lbl_gcp_poly.setStyleSheet("color: #f1c40f; font-size: 11px;")
+        lbl_gcp_pts = QLabel("🔴 <b>GCP Corners</b>")
+        lbl_gcp_pts.setStyleSheet("color: #e74c3c; font-size: 11px;")
+        lbl_cld_inl = QLabel("🔵 <b>Shifted Cloud Inliers</b>")
+        lbl_cld_inl.setStyleSheet("color: #00dcf5; font-size: 11px;")
+        lbl_cld_all = QLabel("⚪ <b>Surrounding Cloud</b>")
+        lbl_cld_all.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        xy_legend.addWidget(lbl_gcp_poly)
+        xy_legend.addWidget(lbl_gcp_pts)
+        xy_legend.addWidget(lbl_cld_inl)
+        xy_legend.addWidget(lbl_cld_all)
+        xy_legend.addStretch(1)
+        xy_layout.addLayout(xy_legend)
+
+        # XY Controls
+        xy_ctrl = QHBoxLayout()
+        xy_ctrl.addWidget(QLabel("Step:"))
+        self._step_combo = QComboBox()
+        for s in ["0.01", "0.02", "0.05", "0.10", "0.20", "0.50", "1.00"]:
+            self._step_combo.addItem(f"{s} m", float(s))
+        self._step_combo.setCurrentIndex(2)  # 0.05 m default
+        self._step_combo.currentIndexChanged.connect(self._on_step_changed)
+        xy_ctrl.addWidget(self._step_combo)
+
+        btn_left = QPushButton("← -X")
+        btn_left.setFixedWidth(52)
+        btn_left.clicked.connect(lambda: self._nudge("x", -1))
+        xy_ctrl.addWidget(btn_left)
+
+        btn_right = QPushButton("→ +X")
+        btn_right.setFixedWidth(52)
+        btn_right.clicked.connect(lambda: self._nudge("x", +1))
+        xy_ctrl.addWidget(btn_right)
+
+        xy_ctrl.addWidget(QLabel("ΔX:"))
+        self._spin_dx = QDoubleSpinBox()
+        self._spin_dx.setRange(-100.0, 100.0)
+        self._spin_dx.setDecimals(3)
+        self._spin_dx.setSingleStep(0.01)
+        self._spin_dx.setSuffix(" m")
+        self._spin_dx.valueChanged.connect(self._on_spin_changed)
+        xy_ctrl.addWidget(self._spin_dx)
+
+        btn_down = QPushButton("↓ -Y")
+        btn_down.setFixedWidth(52)
+        btn_down.clicked.connect(lambda: self._nudge("y", -1))
+        xy_ctrl.addWidget(btn_down)
+
+        btn_up = QPushButton("↑ +Y")
+        btn_up.setFixedWidth(52)
+        btn_up.clicked.connect(lambda: self._nudge("y", +1))
+        xy_ctrl.addWidget(btn_up)
+
+        xy_ctrl.addWidget(QLabel("ΔY:"))
+        self._spin_dy = QDoubleSpinBox()
+        self._spin_dy.setRange(-100.0, 100.0)
+        self._spin_dy.setDecimals(3)
+        self._spin_dy.setSingleStep(0.01)
+        self._spin_dy.setSuffix(" m")
+        self._spin_dy.valueChanged.connect(self._on_spin_changed)
+        xy_ctrl.addWidget(self._spin_dy)
+        xy_ctrl.addStretch()
+
+        xy_layout.addLayout(xy_ctrl)
+        splitter.addWidget(xy_container)
+
+        # ── View 2: Z Elevation View ──
+        z_container = QWidget()
+        z_layout = QVBoxLayout(z_container)
+        z_layout.setContentsMargins(0, 0, 0, 0)
+        z_layout.setSpacing(2)
+
+        self._plot_z = pg.PlotWidget(title="Z Profile (Yellow: GCP Plane | Green: Shifted Cloud Plane)")
+        self._plot_z.showGrid(x=True, y=True, alpha=0.3)
+        self._plot_z.setLabel("bottom", "Profile Distance (Along Slope)", units="m")
+        self._plot_z.setLabel("left", "Elevation Z", units="m")
+
+        self._scatter_z_pts = pg.ScatterPlotItem(size=4, pen=None, brush=pg.mkBrush(140, 140, 140, 100))
+        self._scatter_z_inl = pg.ScatterPlotItem(size=6, pen=None, brush=pg.mkBrush(0, 220, 255, 220))
+        self._line_z_cloud = pg.PlotCurveItem(pen=pg.mkPen(color=(0, 180, 220, 120), width=1, style=Qt.DotLine))
+        self._line_z_orig = pg.PlotCurveItem(pen=pg.mkPen(color=(255, 200, 0), width=2, style=Qt.DashLine))
+        self._line_z_shifted = pg.PlotCurveItem(pen=pg.mkPen(color=(50, 255, 50), width=2))
+        self._scatter_z_verts = pg.ScatterPlotItem(size=9, pen=pg.mkPen('w', width=1), brush=pg.mkBrush(255, 60, 60))
+
+        self._plot_z.addItem(self._scatter_z_pts)
+        self._plot_z.addItem(self._scatter_z_inl)
+        self._plot_z.addItem(self._line_z_cloud)
+        self._plot_z.addItem(self._line_z_orig)
+        self._plot_z.addItem(self._line_z_shifted)
+        self._plot_z.addItem(self._scatter_z_verts)
+        z_layout.addWidget(self._plot_z, 1)
+
+        # Z Legend Bar
+        z_legend = QHBoxLayout()
+        z_legend.setContentsMargins(4, 1, 4, 1)
+        z_legend.setSpacing(10)
+        lbl_z_gcp = QLabel("🟡 <b>GCP Plane</b> (Fixed Truth)")
+        lbl_z_gcp.setStyleSheet("color: #f1c40f; font-size: 11px;")
+        lbl_z_shift = QLabel("🟢 <b>Shifted Cloud Plane</b>")
+        lbl_z_shift.setStyleSheet("color: #2ecc71; font-size: 11px;")
+        lbl_z_inl = QLabel("🔵 <b>Shifted Points</b>")
+        lbl_z_inl.setStyleSheet("color: #00dcf5; font-size: 11px;")
+        lbl_z_raw = QLabel("┈ <b>Raw Cloud Plane</b>")
+        lbl_z_raw.setStyleSheet("color: #00b4dc; font-size: 11px;")
+        z_legend.addWidget(lbl_z_gcp)
+        z_legend.addWidget(lbl_z_shift)
+        z_legend.addWidget(lbl_z_inl)
+        z_legend.addWidget(lbl_z_raw)
+        z_legend.addStretch(1)
+        z_layout.addLayout(z_legend)
+
+        # Z Controls
+        z_ctrl = QHBoxLayout()
+        btn_z_down = QPushButton("▼ -Z")
+        btn_z_down.setFixedWidth(52)
+        btn_z_down.clicked.connect(lambda: self._nudge("z", -1))
+        z_ctrl.addWidget(btn_z_down)
+
+        btn_z_up = QPushButton("▲ +Z")
+        btn_z_up.setFixedWidth(52)
+        btn_z_up.clicked.connect(lambda: self._nudge("z", +1))
+        z_ctrl.addWidget(btn_z_up)
+
+        z_ctrl.addWidget(QLabel("ΔZ:"))
+        self._spin_dz = QDoubleSpinBox()
+        self._spin_dz.setRange(-100.0, 100.0)
+        self._spin_dz.setDecimals(3)
+        self._spin_dz.setSingleStep(0.01)
+        self._spin_dz.setSuffix(" m")
+        self._spin_dz.valueChanged.connect(self._on_spin_changed)
+        z_ctrl.addWidget(self._spin_dz)
+
+        legend_lbl = QLabel(
+            "<span style='color:#00d2ff'>― LiDAR Plane</span> &nbsp; "
+            "<span style='color:#ffc800'>-- Raw Input</span> &nbsp; "
+            "<span style='color:#32ff32'>― Shifted Input</span> &nbsp; "
+            "<span style='color:#ff3c3c'>■ Vertices</span>"
+        )
+        z_ctrl.addSpacing(15)
+        z_ctrl.addWidget(legend_lbl)
+        z_ctrl.addStretch()
+
+        z_layout.addLayout(z_ctrl)
+        splitter.addWidget(z_container)
+
+        layout.addWidget(splitter, 1)
+
+        # Bottom Metrics Bar
+        self._metrics_label = QLabel("<i>No patch loaded</i>")
+        self._metrics_label.setWordWrap(True)
+        self._metrics_label.setStyleSheet(
+            "background-color: #2b2b2b; color: #f0f0f0; padding: 6px; border-radius: 4px;"
+        )
+        layout.addWidget(self._metrics_label)
+
+    def _on_step_changed(self):
+        val = self._step_combo.currentData()
+        if val is not None:
+            self._step_size = float(val)
+
+    def _nudge(self, axis: str, direction: int):
+        if not self._current_patch:
+            return
+        delta = direction * self._step_size
+        if axis == "x":
+            self._spin_dx.setValue(self._spin_dx.value() + delta)
+        elif axis == "y":
+            self._spin_dy.setValue(self._spin_dy.value() + delta)
+        elif axis == "z":
+            self._spin_dz.setValue(self._spin_dz.value() + delta)
+
+    def _on_spin_changed(self):
+        if not self._current_patch:
+            return
+        self._dx = float(self._spin_dx.value())
+        self._dy = float(self._spin_dy.value())
+        self._dz = float(self._spin_dz.value())
+        self._update_plots()
+        self._update_metrics()
+        self.offset_changed.emit(
+            str(self._current_patch.get("name", "")),
+            self._dx, self._dy, self._dz,
+        )
+
+    def _reset_to_autofit(self):
+        if not self._current_patch:
+            return
+        self._spin_dx.blockSignals(True)
+        self._spin_dy.blockSignals(True)
+        self._spin_dz.blockSignals(True)
+        self._spin_dx.setValue(self._base_dx)
+        self._spin_dy.setValue(self._base_dy)
+        self._spin_dz.setValue(self._base_dz)
+        self._spin_dx.blockSignals(False)
+        self._spin_dy.blockSignals(False)
+        self._spin_dz.blockSignals(False)
+    def _on_use_toggled(self, checked: bool):
+        if not self._current_patch:
+            return
+        self._current_patch["used"] = checked
+        self._update_title_label()
+        self.use_toggled.emit(str(self._current_patch.get("name", "")), checked)
+
+    def _on_delete_clicked(self):
+        if not self._current_patch:
+            return
+        self.delete_requested.emit(str(self._current_patch.get("name", "")))
+
+    def set_used(self, used: bool):
+        if self._current_patch:
+            self._current_patch["used"] = used
+        self._use_chk.blockSignals(True)
+        self._use_chk.setChecked(used)
+        self._use_chk.blockSignals(False)
+        self._update_title_label()
+
+    def _update_title_label(self):
+        if not self._current_patch:
+            self._title_label.setText("<b>Select a patch from the results to inspect</b>")
+            return
+        name = self._current_patch.get("name", "Unnamed")
+        ptype = self._current_patch.get("type", "roof")
+        type_icon = "🏠 Roof" if ptype == "roof" else "🌱 Ground"
+        n_verts = self._current_patch.get("n_verts", len(self._current_patch.get("verts", [])))
+        n_nearby = self._current_patch.get("n_nearby", 0)
+        is_used = self._current_patch.get("used", True)
+        status_tag = "" if is_used else " &nbsp;<span style='color:#e74c3c; font-weight:bold;'>[DISMISSED / EXCLUDED]</span>"
+        self._title_label.setText(
+            f"<b>Patch:</b> {name} &nbsp; ({type_icon}) &nbsp; "
+            f"| <b>Vertices:</b> {n_verts} &nbsp; | <b>Nearby Points:</b> {n_nearby}{status_tag}"
+        )
+
+    def clear_patch(self):
+        self._current_patch = None
+        self._title_label.setText("<b>Select a patch from the results to inspect</b>")
+        self._use_chk.setEnabled(False)
+        self._reset_btn.setEnabled(False)
+        self._del_btn.setEnabled(False)
+        self._scatter_xy_pts.clear()
+        self._scatter_xy_inl.clear()
+        self._poly_xy_orig.clear()
+        self._poly_xy_shifted.clear()
+        self._scatter_xy_verts.clear()
+        self._scatter_z_pts.clear()
+        self._scatter_z_inl.clear()
+        self._line_z_cloud.clear()
+        self._line_z_orig.clear()
+        self._line_z_shifted.clear()
+        self._scatter_z_verts.clear()
+        self._metrics_label.setText("<i>No patch loaded</i>")
+
+    def load_patch(self, patch: dict):
+        self._current_patch = patch
+        is_used = patch.get("used", True)
+        self._use_chk.setEnabled(True)
+        self._use_chk.blockSignals(True)
+        self._use_chk.setChecked(is_used)
+        self._use_chk.blockSignals(False)
+        self._reset_btn.setEnabled(True)
+        self._del_btn.setEnabled(True)
+        self._update_title_label()
+
+        self._dx = float(patch.get("dx", 0.0) or 0.0)
+        self._dy = float(patch.get("dy", 0.0) or 0.0)
+        self._dz = float(patch.get("dz", 0.0) or 0.0)
+        self._base_dx = float(patch.get("base_dx", self._dx))
+        self._base_dy = float(patch.get("base_dy", self._dy))
+        self._base_dz = float(patch.get("base_dz", self._dz))
+
+        self._spin_dx.blockSignals(True)
+        self._spin_dy.blockSignals(True)
+        self._spin_dz.blockSignals(True)
+        self._spin_dx.setValue(self._dx)
+        self._spin_dy.setValue(self._dy)
+        self._spin_dz.setValue(self._dz)
+        self._spin_dx.blockSignals(False)
+        self._spin_dy.blockSignals(False)
+        self._spin_dz.blockSignals(False)
+
+        self._update_plots()
+        self._update_metrics()
+
+    def _update_plots(self):
+        if not self._current_patch:
+            return
+
+        verts = self._current_patch.get("verts")
+        if verts is None:
+            return
+        verts = np.asarray(verts, dtype=np.float64)
+        if len(verts) == 0:
+            return
+
+        pts = self._current_patch.get("local_pts")
+        inl = self._current_patch.get("inlier_mask")
+        norm = self._current_patch.get("cloud_normal")
+        cloud_mean = self._current_patch.get("cloud_mean")
+
+        # ── XY Plan View ──
+        if pts is not None and len(pts) > 0:
+            self._scatter_xy_pts.setData(x=pts[:, 0], y=pts[:, 1])
+            if inl is not None and len(inl) == len(pts) and inl.any():
+                self._scatter_xy_inl.setData(
+                    x=pts[inl, 0] + self._dx,
+                    y=pts[inl, 1] + self._dy,
+                )
+            else:
+                self._scatter_xy_inl.clear()
+        else:
+            self._scatter_xy_pts.clear()
+            self._scatter_xy_inl.clear()
+
+        # Closed polygon loop of surveyor GCP (FIXED ground truth reference)
+        poly_x = np.append(verts[:, 0], verts[0, 0])
+        poly_y = np.append(verts[:, 1], verts[0, 1])
+        self._poly_xy_orig.setData(poly_x, poly_y)
+        self._poly_xy_shifted.clear()
+        self._scatter_xy_verts.setData(x=verts[:, 0], y=verts[:, 1])
+
+        # ── Z Elevation View ──
+        cx = float(np.mean(verts[:, 0]))
+        cy = float(np.mean(verts[:, 1]))
+        cz = float(np.mean(verts[:, 2]))
+
+        if norm is not None:
+            nh = float(np.hypot(norm[0], norm[1]))
+            if nh > 1e-5:
+                ux = float(norm[0] / nh)
+                uy = float(norm[1] / nh)
+                slope = float(nh / max(float(norm[2]), 0.01))
+            else:
+                ux, uy = 1.0, 0.0
+                slope = 0.0
+        else:
+            ux, uy = 1.0, 0.0
+            slope = 0.0
+
+        d_shift = self._dx * ux + self._dy * uy
+
+        if pts is not None and len(pts) > 0:
+            d_pts = (pts[:, 0] - cx) * ux + (pts[:, 1] - cy) * uy
+            z_pts = pts[:, 2]
+            self._scatter_z_pts.setData(x=d_pts, y=z_pts)
+            if inl is not None and len(inl) == len(pts) and inl.any():
+                self._scatter_z_inl.setData(
+                    x=d_pts[inl] + d_shift,
+                    y=z_pts[inl] + self._dz,
+                )
+            else:
+                self._scatter_z_inl.clear()
+
+            d_min = float(np.min(d_pts)) - 1.0
+            d_max = float(np.max(d_pts)) + 1.0
+        else:
+            d_verts_raw = (verts[:, 0] - cx) * ux + (verts[:, 1] - cy) * uy
+            d_min = float(np.min(d_verts_raw)) - 2.0
+            d_max = float(np.max(d_verts_raw)) + 2.0
+            self._scatter_z_pts.clear()
+            self._scatter_z_inl.clear()
+
+        d_grid = np.array([d_min, d_max])
+
+        # Raw cloud plane line (faint dotted) & Shifted cloud plane line (bright solid green)
+        if cloud_mean is not None and norm is not None:
+            c_cloud_z = float(cloud_mean[2])
+            d_cloud_center = (float(cloud_mean[0]) - cx) * ux + (float(cloud_mean[1]) - cy) * uy
+            z_cloud_line = c_cloud_z - slope * (d_grid - d_cloud_center)
+            self._line_z_cloud.setData(d_grid, z_cloud_line)
+
+            z_shifted_cloud = (c_cloud_z + self._dz) - slope * (d_grid - (d_cloud_center + d_shift))
+            self._line_z_shifted.setData(d_grid, z_shifted_cloud)
+        else:
+            self._line_z_cloud.clear()
+            self._line_z_shifted.clear()
+
+        # Fixed surveyor GCP target line and corner vertices
+        d_verts_raw = (verts[:, 0] - cx) * ux + (verts[:, 1] - cy) * uy
+        self._scatter_z_verts.setData(x=d_verts_raw, y=verts[:, 2])
+        z_orig_line = cz - slope * d_grid
+        self._line_z_orig.setData(d_grid, z_orig_line)
+
+    def _update_metrics(self):
+        if not self._current_patch:
+            self._metrics_label.setText("<i>No patch loaded</i>")
+            return
+
+        mag = float(np.sqrt(self._dx**2 + self._dy**2 + self._dz**2))
+        norm = self._current_patch.get("cloud_normal")
+        rmse = self._current_patch.get("plane_rmse")
+        n_nearby = self._current_patch.get("n_nearby", 0)
+        inl = self._current_patch.get("inlier_mask")
+        n_inl = int(inl.sum()) if inl is not None else 0
+
+        slope_str = "N/A"
+        if norm is not None:
+            nh = float(np.hypot(norm[0], norm[1]))
+            nz = max(abs(float(norm[2])), 1e-6)
+            dip_deg = float(np.degrees(np.arctan(nh / nz)))
+            slope_str = f"{dip_deg:.1f}°"
+
+        rmse_str = f"{rmse*100:.1f} cm" if rmse is not None else "N/A"
+
+        self._metrics_label.setText(
+            f"<b>Tile Point Cloud Shift:</b> &nbsp; "
+            f"ΔX = <b>{self._dx:+.3f}</b> m, &nbsp; "
+            f"ΔY = <b>{self._dy:+.3f}</b> m, &nbsp; "
+            f"ΔZ = <b>{self._dz:+.3f}</b> m &nbsp; "
+            f"(<b>|Shift| = {mag:.3f} m</b>)<br>"
+            f"<b>Surface Metrics:</b> &nbsp; "
+            f"Slope / Dip = {slope_str} &nbsp; | &nbsp; "
+            f"Plane RMSE = {rmse_str} &nbsp; | &nbsp; "
+            f"Inliers = {n_inl}/{n_nearby}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -213,12 +800,13 @@ class _GroundControlWorker(QThread):
     # ── Roofs ────────────────────────────────────────────────────────
 
     def _run_roofs(self):
-        surfaces = self._params["surfaces"]  # list of (name, [(x,y,z),…])
-        radius = self._params.get("radius", 5.0)
+        surfaces = self._params["surfaces"]  # list of (name, verts) or (name, verts, type)
+        radius = self._params.get("radius", 10.0)
 
         xs = self._data["x"]
         ys = self._data["y"]
         zs = self._data["z"]
+        cls = self._data.get("classification")
 
         from scipy.spatial import cKDTree
         tree = cKDTree(np.column_stack((xs, ys)))
@@ -226,69 +814,197 @@ class _GroundControlWorker(QThread):
         n_surf = len(surfaces)
         results = []
 
-        for i, (name, verts) in enumerate(surfaces):
+        for i, surf_item in enumerate(surfaces):
             pct = (i + 1) / n_surf * 100
-            self.progress.emit(f"Processing surface {name}…", pct)
+            if len(surf_item) == 3:
+                name, verts, ptype = surf_item
+            else:
+                name, verts = surf_item
+                ptype = "roof"
+
+            self.progress.emit(f"Processing surface {name} ({ptype})…", pct)
 
             verts_arr = np.array(verts, dtype=np.float64)
             centroid = verts_arr.mean(axis=0)
 
-            # Find nearby points
+            # Find nearby points within search radius
             indices = tree.query_ball_point(centroid[:2], radius)
             if len(indices) < 3:
                 results.append({
-                    "name": name, "n_verts": len(verts),
+                    "name": name, "type": ptype, "n_verts": len(verts),
+                    "verts": verts_arr, "centroid": centroid,
+                    "centroid_x": float(centroid[0]),
+                    "centroid_y": float(centroid[1]),
+                    "centroid_z": float(centroid[2]),
                     "n_nearby": len(indices),
                     "dx": None, "dy": None, "dz": None, "shift_mag": None,
                     "warning": f"Not enough nearby points ({len(indices)})",
                 })
                 continue
 
-            nearby_xyz = np.column_stack((xs[indices], ys[indices], zs[indices]))
+            nearby_idx = np.asarray(indices, dtype=np.int64)
+            nearby_xyz = np.column_stack((xs[nearby_idx], ys[nearby_idx], zs[nearby_idx]))
 
-            # Compute input plane normal from vertices
-            input_normal = self._fit_plane_normal(verts_arr)
+            # Class-specific candidate filtering
+            cand_pts = nearby_xyz
+            if cls is not None and len(cls) == len(xs):
+                nearby_cls = cls[nearby_idx]
+                if ptype == "ground":
+                    # Filter for Ground (class 2) or Water bottom (class 9)
+                    gnd_mask = np.isin(nearby_cls, [2, 9])
+                    if gnd_mask.sum() >= 4:
+                        cand_pts = nearby_xyz[gnd_mask]
+                else:
+                    # Roof: prioritize Building (class 6)
+                    bldg_mask = (nearby_cls == 6)
+                    if bldg_mask.sum() >= 4:
+                        cand_pts = nearby_xyz[bldg_mask]
+                    else:
+                        # Exclude ground returns and filter to elevations near centroid
+                        not_gnd = (nearby_cls != 2)
+                        elev_mask = np.abs(nearby_xyz[:, 2] - centroid[2]) <= 2.5
+                        if (not_gnd & elev_mask).sum() >= 4:
+                            cand_pts = nearby_xyz[not_gnd & elev_mask]
+                        elif not_gnd.sum() >= 4:
+                            cand_pts = nearby_xyz[not_gnd]
+                        elif elev_mask.sum() >= 4:
+                            cand_pts = nearby_xyz[elev_mask]
+            else:
+                # Unclassified: filter by elevation around roof/surface centroid
+                elev_mask = np.abs(nearby_xyz[:, 2] - centroid[2]) <= 2.5
+                if elev_mask.sum() >= 4:
+                    cand_pts = nearby_xyz[elev_mask]
 
-            # Fit plane to nearby point cloud via RANSAC
-            cloud_normal, cloud_centroid_z = self._fit_ransac_plane(nearby_xyz)
+            # Fit plane to candidate points via RANSAC
+            cloud_normal, cloud_mean, inlier_mask, rmse = self._fit_ransac_plane_detailed(cand_pts)
 
-            # Compute 3-D shift vector between input surface and cloud
             if cloud_normal is not None:
-                cloud_mean = nearby_xyz.mean(axis=0)
-
-                # Signed distances from cloud points to cloud plane
-                d_cloud = np.dot(nearby_xyz - cloud_mean, cloud_normal)
+                # Signed distances from cloud inliers to cloud plane
+                d_cloud = np.dot(cand_pts[inlier_mask] - cloud_mean, cloud_normal)
                 cloud_median = float(np.median(d_cloud))
 
                 # Signed distances from input vertices to cloud plane
                 d_input = np.dot(verts_arr - cloud_mean, cloud_normal)
                 input_median = float(np.median(d_input))
 
-                # Scalar offset: positive = input is "above" cloud along normal
+                # Scalar offset: positive = input (GCP) is above cloud along normal
+                # Shift vector to add to point cloud to align point cloud with GCP
                 offset = input_median - cloud_median
-
-                # 3-D shift vector (what to add to cloud points to align)
-                shift_vec = cloud_normal * (-offset)
+                shift_vec = cloud_normal * offset
                 dx, dy, dz = float(shift_vec[0]), float(shift_vec[1]), float(shift_vec[2])
             else:
                 # Fallback: simple Z difference
-                cloud_z_median = float(np.median(nearby_xyz[:, 2]))
+                cloud_z_median = float(np.median(cand_pts[:, 2])) if len(cand_pts) else float(centroid[2])
                 input_z_mean = float(verts_arr[:, 2].mean())
                 dx, dy = 0.0, 0.0
                 dz = input_z_mean - cloud_z_median
-                offset = dz
+                cloud_mean = cand_pts.mean(axis=0) if len(cand_pts) else centroid
+                cloud_normal = np.array([0.0, 0.0, 1.0])
+                inlier_mask = np.ones(len(cand_pts), dtype=bool)
+                rmse = 0.0
+
+            # Subsample nearby points for responsive UI rendering
+            if len(cand_pts) > 1500:
+                sub_idx = np.random.choice(len(cand_pts), 1500, replace=False)
+                ui_pts = cand_pts[sub_idx]
+                ui_inl = inlier_mask[sub_idx] if inlier_mask is not None else None
+            else:
+                ui_pts = cand_pts
+                ui_inl = inlier_mask
 
             results.append({
-                "name": name, "n_verts": len(verts),
-                "n_nearby": len(indices),
+                "name": name,
+                "type": ptype,
+                "n_verts": len(verts),
+                "verts": verts_arr,
+                "n_nearby": len(cand_pts),
                 "dx": dx, "dy": dy, "dz": dz,
-                "shift_mag": float(np.sqrt(dx*dx + dy*dy + dz*dz)),
+                "base_dx": dx, "base_dy": dy, "base_dz": dz,
+                "shift_mag": float(np.sqrt(dx*dx + dy*dy + dz*dz)) if dx is not None else None,
+                "centroid": centroid,
                 "centroid_x": float(centroid[0]),
                 "centroid_y": float(centroid[1]),
                 "centroid_z": float(centroid[2]),
+                "cloud_normal": cloud_normal,
+                "cloud_mean": cloud_mean,
+                "plane_rmse": rmse,
+                "local_pts": ui_pts,
+                "inlier_mask": ui_inl,
             })
 
         self.finished_roofs.emit(results)
+
+    @staticmethod
+    def _fit_plane_normal(verts: np.ndarray) -> np.ndarray:
+        """Fit a plane to *verts* (N×3) via SVD, return unit normal."""
+        centroid = verts.mean(axis=0)
+        _, _, vh = np.linalg.svd(verts - centroid)
+        normal = vh[2]
+        if normal[2] < 0:
+            normal = -normal
+        return normal
+
+    @staticmethod
+    def _fit_ransac_plane(xyz: np.ndarray, n_iter: int = 200,
+                          threshold: float = 0.3) -> Tuple[Optional[np.ndarray], float]:
+        """RANSAC plane fit. Returns (normal, centroid_z) or (None, median_z)."""
+        norm, mean, _, _ = _GroundControlWorker._fit_ransac_plane_detailed(xyz, n_iter, threshold)
+        if norm is not None:
+            return norm, float(mean[2])
+        return None, float(np.median(xyz[:, 2])) if len(xyz) else 0.0
+
+    @staticmethod
+    def _fit_ransac_plane_detailed(xyz: np.ndarray, n_iter: int = 200,
+                                  threshold: float = 0.20) -> Tuple[Optional[np.ndarray], np.ndarray, Optional[np.ndarray], float]:
+        """
+        Robust RANSAC plane fit.
+        Returns: (unit_normal with nz >= 0, cloud_mean, inlier_mask, rmse)
+        """
+        if len(xyz) < 3:
+            mean = xyz.mean(axis=0) if len(xyz) > 0 else np.zeros(3)
+            return None, mean, None, 0.0
+
+        best_inliers = 0
+        best_normal = None
+        best_mean = xyz.mean(axis=0)
+
+        for _ in range(n_iter):
+            idx = np.random.choice(len(xyz), 3, replace=False)
+            sample = xyz[idx]
+            v1 = sample[1] - sample[0]
+            v2 = sample[2] - sample[0]
+            normal = np.cross(v1, v2)
+            nrm = float(np.linalg.norm(normal))
+            if nrm < 1e-10:
+                continue
+            normal /= nrm
+            if normal[2] < 0:
+                normal = -normal
+
+            centroid = sample.mean(axis=0)
+            dists = np.abs(np.dot(xyz - centroid, normal))
+            inliers = int((dists < threshold).sum())
+
+            if inliers > best_inliers:
+                best_inliers = inliers
+                best_normal = normal
+                best_mean = centroid
+
+        if best_normal is not None:
+            dists = np.abs(np.dot(xyz - best_mean, best_normal))
+            inlier_mask = dists < threshold
+            if inlier_mask.sum() >= 3:
+                pts_inl = xyz[inlier_mask]
+                best_mean = pts_inl.mean(axis=0)
+                _, _, vh = np.linalg.svd(pts_inl - best_mean)
+                best_normal = vh[2]
+                if best_normal[2] < 0:
+                    best_normal = -best_normal
+                d_inl = np.dot(pts_inl - best_mean, best_normal)
+                rmse = float(np.sqrt(np.mean(d_inl**2)))
+                return best_normal, best_mean, inlier_mask, rmse
+
+        return best_normal, best_mean, np.ones(len(xyz), dtype=bool), 0.0
 
     @staticmethod
     def _compare_gcp_to_surface(gx: float, gy: float, gz: float,
@@ -371,53 +1087,108 @@ class _GroundControlWorker(QThread):
 
         return z_surf, gz - z_surf, std_res
 
-    @staticmethod
-    def _fit_plane_normal(verts: np.ndarray) -> np.ndarray:
-        """Fit a plane to *verts* (N×3) via SVD, return unit normal."""
-        centroid = verts.mean(axis=0)
-        _, _, vh = np.linalg.svd(verts - centroid)
-        return vh[2]  # smallest singular value → normal
 
-    @staticmethod
-    def _fit_ransac_plane(xyz: np.ndarray, n_iter: int = 200,
-                          threshold: float = 0.3) -> Tuple[Optional[np.ndarray], float]:
-        """RANSAC plane fit. Returns (normal, centroid_z) or (None, median_z)."""
-        if len(xyz) < 3:
-            return None, float(np.median(xyz[:, 2]))
+# ═══════════════════════════════════════════════════════════════════════
+# Tile Selection Dialog
+# ═══════════════════════════════════════════════════════════════════════
 
-        best_inliers = 0
-        best_normal = None
+class _TileSelectionDialog(QDialog):
+    """Modal dialog for interactively selecting target tiles for shift application."""
 
-        for _ in range(n_iter):
-            idx = np.random.choice(len(xyz), 3, replace=False)
-            sample = xyz[idx]
-            v1 = sample[1] - sample[0]
-            v2 = sample[2] - sample[0]
-            normal = np.cross(v1, v2)
-            nrm = np.linalg.norm(normal)
-            if nrm < 1e-10:
-                continue
-            normal /= nrm
+    def __init__(self, all_tile_ids: List[str], selected_tile_ids: List[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Tiles for Ground Control Shift")
+        self.setMinimumWidth(450)
+        self.setMinimumHeight(420)
+        self.resize(500, 500)
 
-            # Distance of all points to this plane
-            centroid = sample.mean(axis=0)
-            dists = np.abs(np.dot(xyz - centroid, normal))
-            inliers = (dists < threshold).sum()
+        self._all_tile_ids = list(all_tile_ids)
+        self._initial_selected = set(selected_tile_ids)
 
-            if inliers > best_inliers:
-                best_inliers = inliers
-                best_normal = normal
+        layout = QVBoxLayout(self)
 
-        if best_normal is not None:
-            # Refit using all inliers within threshold
-            centroid = xyz.mean(axis=0)
-            dists = np.abs(np.dot(xyz - centroid, best_normal))
-            inlier_mask = dists < threshold
-            if inlier_mask.sum() >= 3:
-                _, _, vh = np.linalg.svd(xyz[inlier_mask] - xyz[inlier_mask].mean(axis=0))
-                best_normal = vh[2]
+        info_lbl = QLabel(
+            "<b>Select the tiles to which the ground control shift will be applied:</b>"
+        )
+        layout.addWidget(info_lbl)
 
-        return best_normal, float(np.median(xyz[:, 2]))
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Filter:"))
+        self._filter_edit = QLineEdit()
+        self._filter_edit.setPlaceholderText("Filter tile names…")
+        self._filter_edit.textChanged.connect(self._apply_filter)
+        filter_row.addWidget(self._filter_edit)
+        layout.addLayout(filter_row)
+
+        self._list_widget = QListWidget()
+        for tid in self._all_tile_ids:
+            item = QListWidgetItem(tid)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if tid in self._initial_selected else Qt.Unchecked)
+            self._list_widget.addItem(item)
+        self._list_widget.itemChanged.connect(self._update_count)
+        layout.addWidget(self._list_widget, 1)
+
+        act_row = QHBoxLayout()
+        btn_all = QPushButton("Select All")
+        btn_all.clicked.connect(self._select_all)
+        act_row.addWidget(btn_all)
+
+        btn_none = QPushButton("Deselect All")
+        btn_none.clicked.connect(self._deselect_all)
+        act_row.addWidget(btn_none)
+
+        self._count_lbl = QLabel()
+        act_row.addStretch(1)
+        act_row.addWidget(self._count_lbl)
+        layout.addLayout(act_row)
+
+        self._update_count()
+
+        bbox = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bbox.accepted.connect(self.accept)
+        bbox.rejected.connect(self.reject)
+        layout.addWidget(bbox)
+
+    def _apply_filter(self, text: str):
+        query = text.strip().lower()
+        for i in range(self._list_widget.count()):
+            item = self._list_widget.item(i)
+            item.setHidden(query not in item.text().lower() if query else False)
+
+    def _select_all(self):
+        self._list_widget.blockSignals(True)
+        for i in range(self._list_widget.count()):
+            item = self._list_widget.item(i)
+            if not item.isHidden():
+                item.setCheckState(Qt.Checked)
+        self._list_widget.blockSignals(False)
+        self._update_count()
+
+    def _deselect_all(self):
+        self._list_widget.blockSignals(True)
+        for i in range(self._list_widget.count()):
+            item = self._list_widget.item(i)
+            if not item.isHidden():
+                item.setCheckState(Qt.Unchecked)
+        self._list_widget.blockSignals(False)
+        self._update_count()
+
+    def _update_count(self):
+        checked = sum(
+            1 for i in range(self._list_widget.count())
+            if self._list_widget.item(i).checkState() == Qt.Checked
+        )
+        total = self._list_widget.count()
+        self._count_lbl.setText(f"Selected: <b>{checked}</b> / {total} tiles")
+
+    def get_selected_tile_ids(self) -> List[str]:
+        chosen = []
+        for i in range(self._list_widget.count()):
+            item = self._list_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                chosen.append(item.text())
+        return chosen
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -430,14 +1201,15 @@ class GroundControlDialog(QDialog):
 
     Signals
     -------
-    shift_applied(float, float, float):
-        Emitted when the user clicks 'Apply Shift'. Args: (dx, dy, dz).
+    shift_applied(float, float, float, list):
+        Emitted when the user clicks 'Apply Shift'. Args: (dx, dy, dz, tile_ids).
+        Overloaded with (float, float, float) for backward-compatibility.
     visualize_point(float, float, float, object, str):
         Emitted when user navigates to a GCP or surface.
         Args: (x, y, z_gcp, z_cloud, label).
     """
 
-    shift_applied = Signal(float, float, float)
+    shift_applied = Signal((float, float, float, list), (float, float, float))
     visualize_point = Signal(float, float, float, object, str)
 
     SEPARATORS = {
@@ -449,6 +1221,7 @@ class GroundControlDialog(QDialog):
 
     def __init__(self, tile_data: dict, parent=None, data_epsg: Optional[int] = None,
                  tile_ids: Optional[list] = None,
+                 current_tile_id: Optional[str] = None,
                  tile_manager=None, database=None):
         super().__init__(parent)
         self._data = tile_data
@@ -456,9 +1229,31 @@ class GroundControlDialog(QDialog):
         self._worker: Optional[_GroundControlWorker] = None
 
         # Multi-tile support
-        self._tile_ids: list = tile_ids or []
+        self._selected_tile_ids: list = list(tile_ids) if tile_ids else []
+        self._tile_ids: list = self._selected_tile_ids  # backward-compatibility
+        self._current_tile_id: Optional[str] = current_tile_id
         self._tm = tile_manager       # TileManager for loading tile data
         self._db = database           # Database for bbox queries
+
+        # Discover all project tiles
+        self._all_tile_ids: list = []
+        if self._tm:
+            try:
+                self._all_tile_ids = list(self._tm.tile_ids())
+            except Exception:
+                pass
+        if not self._all_tile_ids and self._db:
+            try:
+                self._all_tile_ids = [t["id"] for t in self._db.get_all_tiles() if t.get("id")]
+            except Exception:
+                pass
+        if not self._all_tile_ids:
+            if self._selected_tile_ids:
+                self._all_tile_ids = list(self._selected_tile_ids)
+            elif self._current_tile_id:
+                self._all_tile_ids = [self._current_tile_id]
+
+        self._custom_tile_ids: list = list(self._selected_tile_ids or self._all_tile_ids)
 
         # GCP state
         self._gcp_points: List[Tuple[str, float, float, float]] = []
@@ -468,7 +1263,9 @@ class GroundControlDialog(QDialog):
         self._gcp_source_epsg: Optional[int] = None  # EPSG of the GCP CSV
 
         # Roof state
-        self._roof_surfaces: List[Tuple[str, List[Tuple[float, float, float]]]] = []
+        self._roof_raw_records: list = []
+        self._roof_data_lines: list = []
+        self._roof_surfaces: List[Tuple[str, List[Tuple[float, float, float]], str]] = []
         self._roof_results: list = []
         self._roof_shift: Optional[Tuple[float, float, float]] = None
 
@@ -477,8 +1274,9 @@ class GroundControlDialog(QDialog):
         self._vis_index: int = 0
 
         self.setWindowTitle("Ground Control")
-        self.setMinimumWidth(700)
-        self.setMinimumHeight(600)
+        self.setMinimumWidth(1100)
+        self.setMinimumHeight(750)
+        self.resize(1200, 800)
         self._setup_ui()
 
         # Show tile info if multi-tile mode
@@ -548,6 +1346,7 @@ class GroundControlDialog(QDialog):
         layout.addLayout(btn_layout)
 
         self._update_vis_nav()
+        self._populate_scope_combos()
 
     # ═══════════════════════════════════════════════════════════════════
     # Tab 1 — Ground Control Points
@@ -769,6 +1568,7 @@ class GroundControlDialog(QDialog):
         layout.addWidget(res_group)
 
         # ── Apply shift ──
+        layout.addWidget(self._create_scope_selector_widget("gcp"))
         self._gcp_apply_btn = QPushButton("⬆ Apply Z Shift to Current Tile")
         self._gcp_apply_btn.setEnabled(False)
         self._gcp_apply_btn.setStyleSheet(
@@ -786,15 +1586,24 @@ class GroundControlDialog(QDialog):
 
     def _build_roofs_tab(self) -> QWidget:
         w = QWidget()
-        layout = QVBoxLayout(w)
+        main_layout = QVBoxLayout(w)
+        main_layout.setContentsMargins(4, 4, 4, 4)
 
-        # ── CSV import ──
-        csv_group = QGroupBox("1. Import Surfaces CSV")
+        splitter = QSplitter(Qt.Horizontal)
+
+        # ── LEFT PANE: Import, Options, Tables, Run ──
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(2, 2, 2, 2)
+        left_layout.setSpacing(6)
+
+        # 1. CSV import
+        csv_group = QGroupBox("1. Import Points / Surfaces CSV")
         cf = QFormLayout(csv_group)
 
         info = QLabel(
-            "CSV must group polygon vertices by a surface ID/name column. "
-            "Each row = one vertex (X, Y, Z). At least 3 vertices per surface."
+            "Load surveyor CSV points (e.g. 010101, 01_01_01, or delimited). "
+            "Patches are automatically detected and grouped for roofs and ground surfaces."
         )
         info.setWordWrap(True)
         cf.addRow(info)
@@ -827,19 +1636,14 @@ class GroundControlDialog(QDialog):
 
         self._roof_preview = QTextEdit()
         self._roof_preview.setReadOnly(True)
-        self._roof_preview.setMaximumHeight(80)
+        self._roof_preview.setMaximumHeight(65)
         self._roof_preview.setPlaceholderText("CSV preview…")
         cf.addRow("Preview:", self._roof_preview)
 
-        layout.addWidget(csv_group)
-
-        # ── Column mapping ──
-        map_group = QGroupBox("2. Column Mapping")
-        mf = QFormLayout(map_group)
-
+        # Column mapping row
         col_row = QHBoxLayout()
         self._roof_id_col = QComboBox()
-        col_row.addWidget(QLabel("Surface ID:"))
+        col_row.addWidget(QLabel("ID:"))
         col_row.addWidget(self._roof_id_col)
         self._roof_x_col = QComboBox()
         col_row.addWidget(QLabel("X:"))
@@ -851,59 +1655,147 @@ class GroundControlDialog(QDialog):
         col_row.addWidget(QLabel("Z:"))
         col_row.addWidget(self._roof_z_col)
         col_row.addStretch()
-        mf.addRow("Columns:", col_row)
+        cf.addRow("Columns:", col_row)
 
-        layout.addWidget(map_group)
+        self._roof_id_col.currentIndexChanged.connect(self._update_roof_records_from_combos)
+        self._roof_x_col.currentIndexChanged.connect(self._update_roof_records_from_combos)
+        self._roof_y_col.currentIndexChanged.connect(self._update_roof_records_from_combos)
+        self._roof_z_col.currentIndexChanged.connect(self._update_roof_records_from_combos)
 
-        # ── Parameters ──
-        param_group = QGroupBox("3. Parameters")
-        pf = QFormLayout(param_group)
+        left_layout.addWidget(csv_group)
+
+        # 2. Patch Detection & Grouping
+        grp_group = QGroupBox("2. Patch Detection & Vertex Sorting")
+        gf = QFormLayout(grp_group)
+
+        self._roof_detect_mode = QComboBox()
+        self._roof_detect_mode.addItem("Auto (Naming then 10m Proximity)", "auto")
+        self._roof_detect_mode.addItem("Naming Convention (010101 / Delimited)", "naming")
+        self._roof_detect_mode.addItem("Spatial Proximity (10m Radius)", "spatial")
+        self._roof_detect_mode.addItem("CSV Surface ID Column", "csv_id")
+        self._roof_detect_mode.currentIndexChanged.connect(self._detect_and_group_roof_points)
+        gf.addRow("Group Mode:", self._roof_detect_mode)
+
+        param_row = QHBoxLayout()
         self._roof_radius_spin = QDoubleSpinBox()
-        self._roof_radius_spin.setRange(0.1, 200.0)
+        self._roof_radius_spin.setRange(0.5, 200.0)
         self._roof_radius_spin.setDecimals(1)
-        self._roof_radius_spin.setValue(5.0)
+        self._roof_radius_spin.setValue(10.0)
         self._roof_radius_spin.setSuffix(" m")
-        self._roof_radius_spin.setToolTip("Search radius around surface centroid")
-        pf.addRow("Search Radius:", self._roof_radius_spin)
-        layout.addWidget(param_group)
+        self._roof_radius_spin.setToolTip("Search radius for spatial clustering (10m default) and LiDAR plane fitting")
+        self._roof_radius_spin.valueChanged.connect(self._on_roof_radius_changed)
+        param_row.addWidget(QLabel("Radius:"))
+        param_row.addWidget(self._roof_radius_spin)
 
-        # ── Run button ──
-        run_row = QHBoxLayout()
-        self._roof_run_btn = QPushButton("▶ Calculate Surface Offsets")
-        self._roof_run_btn.clicked.connect(self._on_run_roofs)
-        self._roof_run_btn.setEnabled(False)
-        run_row.addWidget(self._roof_run_btn)
-        run_row.addStretch()
-        layout.addLayout(run_row)
+        self._roof_sort_chk = QCheckBox("Sort vertices angularly (CW/CCW)")
+        self._roof_sort_chk.setChecked(True)
+        self._roof_sort_chk.setToolTip("Sorts vertices by polar angle around centroid to eliminate zigzag / crossed hourglass shapes")
+        self._roof_sort_chk.toggled.connect(self._rebuild_roof_surfaces_from_table)
+        param_row.addWidget(self._roof_sort_chk)
+        param_row.addStretch()
+        gf.addRow("", param_row)
 
-        # ── Results table ──
-        res_group = QGroupBox("4. Results")
-        rl = QVBoxLayout(res_group)
-        self._roof_table = QTableWidget(0, 7)
+        left_layout.addWidget(grp_group)
+
+        # 3. Sub-tabs: Points List vs Detected Patches
+        subtabs = QTabWidget()
+        self._roof_subtabs = subtabs
+
+        # Tab: Points (with editable House / Patch No. and Type)
+        pts_tab = QWidget()
+        pts_vbox = QVBoxLayout(pts_tab)
+        pts_vbox.setContentsMargins(2, 2, 2, 2)
+        pts_hint = QLabel("<i>Double-click 'Patch / House No.' to edit grouping, or select Type dropdown.</i>")
+        pts_hint.setStyleSheet("color: #888; font-size: 11px;")
+        pts_vbox.addWidget(pts_hint)
+
+        self._roof_points_table = QTableWidget(0, 6)
+        self._roof_points_table.setHorizontalHeaderLabels(
+            ["Point Name", "Patch / House No. ✎", "Type ✎", "X", "Y", "Z"]
+        )
+        self._roof_points_table.horizontalHeader().setStretchLastSection(True)
+        self._roof_points_table.setSelectionBehavior(QTableWidget.SelectRows)
+        self._roof_points_table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self._roof_points_table.itemChanged.connect(self._on_roof_point_item_changed)
+        pts_vbox.addWidget(self._roof_points_table)
+
+        pts_btn_row = QHBoxLayout()
+        btn_regroup = QPushButton("↻ Re-detect / Reset Groups")
+        btn_regroup.clicked.connect(self._detect_and_group_roof_points)
+        pts_btn_row.addWidget(btn_regroup)
+
+        self._roof_del_point_btn = QPushButton("🗑 Delete Selected Point(s)")
+        self._roof_del_point_btn.setToolTip("Delete selected corner points from the table and regroup patches")
+        self._roof_del_point_btn.clicked.connect(self._on_delete_roof_points)
+        pts_btn_row.addWidget(self._roof_del_point_btn)
+        pts_vbox.addLayout(pts_btn_row)
+
+        subtabs.addTab(pts_tab, "Points (Editable Groups)")
+
+        # Tab: Detected Patches & Offsets
+        patches_tab = QWidget()
+        pat_vbox = QVBoxLayout(patches_tab)
+        pat_vbox.setContentsMargins(2, 2, 2, 2)
+
+        pat_toolbar = QHBoxLayout()
+        self._roof_toggle_use_btn = QPushButton("⇄ Toggle Use / Dismiss")
+        self._roof_toggle_use_btn.setToolTip("Toggle inclusion of selected patch in mean XYZ shift calculation")
+        self._roof_toggle_use_btn.clicked.connect(self._on_toggle_selected_patch_use)
+        pat_toolbar.addWidget(self._roof_toggle_use_btn)
+
+        self._roof_del_patch_btn = QPushButton("🗑 Delete Selected Patch")
+        self._roof_del_patch_btn.setToolTip("Delete selected patch and its points from the surface model")
+        self._roof_del_patch_btn.setStyleSheet("QPushButton { color: #e74c3c; }")
+        self._roof_del_patch_btn.clicked.connect(self._on_delete_selected_patch)
+        pat_toolbar.addWidget(self._roof_del_patch_btn)
+        pat_toolbar.addStretch()
+        pat_vbox.addLayout(pat_toolbar)
+
+        self._roof_table = QTableWidget(0, 9)
         self._roof_table.setHorizontalHeaderLabels(
-            ["Surface", "Vertices", "Nearby pts", "ΔX (m)", "ΔY (m)", "ΔZ (m)", "|Shift|"]
+            ["Use", "Patch", "Type", "Vertices", "Nearby", "ΔX (m)", "ΔY (m)", "ΔZ (m)", "|Shift|"]
         )
         self._roof_table.horizontalHeader().setStretchLastSection(True)
         self._roof_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._roof_table.setSelectionBehavior(QTableWidget.SelectRows)
-        rl.addWidget(self._roof_table)
+        self._roof_table.itemSelectionChanged.connect(self._on_roof_table_selection_changed)
+        self._roof_table.itemChanged.connect(self._on_roof_table_item_changed)
+        pat_vbox.addWidget(self._roof_table)
+
+        subtabs.addTab(patches_tab, "Detected Patches & Offsets")
+        left_layout.addWidget(subtabs, 1)
+
+        # 4. Run & Apply buttons
+        run_box = QVBoxLayout()
+        self._roof_run_btn = QPushButton("▶ Calculate Surface Offsets")
+        self._roof_run_btn.setStyleSheet("QPushButton { font-weight: bold; padding: 6px; }")
+        self._roof_run_btn.clicked.connect(self._on_run_roofs)
+        self._roof_run_btn.setEnabled(False)
+        run_box.addWidget(self._roof_run_btn)
 
         self._roof_stats = QLabel("")
         self._roof_stats.setWordWrap(True)
-        rl.addWidget(self._roof_stats)
-
-        layout.addWidget(res_group)
-
-        # ── Apply shift ──
+        run_box.addWidget(self._roof_stats)
+        run_box.addWidget(self._create_scope_selector_widget("roof"))
         self._roof_apply_btn = QPushButton("⬆ Apply XYZ Shift to Current Tile")
         self._roof_apply_btn.setEnabled(False)
-        self._roof_apply_btn.setStyleSheet(
-            "QPushButton { font-weight: bold; padding: 6px 14px; }"
-        )
+        self._roof_apply_btn.setStyleSheet("QPushButton { font-weight: bold; padding: 6px 14px; }")
         self._roof_apply_btn.clicked.connect(self._on_apply_roofs)
-        layout.addWidget(self._roof_apply_btn)
+        run_box.addWidget(self._roof_apply_btn)
 
-        layout.addStretch()
+        left_layout.addLayout(run_box)
+        splitter.addWidget(left_widget)
+
+        # ── RIGHT PANE: 2-View Inspector ──
+        self._roof_inspector = _Roof2ViewInspector(self)
+        self._roof_inspector.offset_changed.connect(self._on_patch_offset_modified)
+        self._roof_inspector.use_toggled.connect(self._on_inspector_use_toggled)
+        self._roof_inspector.delete_requested.connect(self.delete_roof_patch)
+        splitter.addWidget(self._roof_inspector)
+
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 6)
+        main_layout.addWidget(splitter)
         return w
 
     # ── Helper: get active separator ─────────────────────────────────
@@ -1329,18 +2221,34 @@ class GroundControlDialog(QDialog):
             self._roof_preview.setText(f"Error reading file: {exc}")
             return
 
-        lines = content.splitlines()
-        preview = "\n".join(lines[:10])
-        if len(lines) > 10:
-            preview += f"\n… ({len(lines)} total lines)"
+        raw_lines = content.splitlines()
+        preview = "\n".join(raw_lines[:10])
+        if len(raw_lines) > 10:
+            preview += f"\n… ({len(raw_lines)} total lines)"
         self._roof_preview.setText(preview)
 
-        reader = csv.reader(io.StringIO(content), delimiter=sep)
-        try:
-            header = next(reader)
-        except StopIteration:
+        parsed_lines = []
+        for line in raw_lines:
+            if line.strip() == "":
+                continue
+            fields = self._split_csv_line(line, sep)
+            if fields:
+                parsed_lines.append(fields)
+
+        if not parsed_lines:
             self._roof_preview.setText("Empty file")
             return
+
+        first_is_data = self._line_looks_like_data(parsed_lines[0])
+        if first_is_data:
+            n_cols = max(len(fl) for fl in parsed_lines)
+            header = [f"Col {i}" for i in range(n_cols)]
+            data_lines = parsed_lines
+        else:
+            header = parsed_lines[0]
+            data_lines = parsed_lines[1:]
+
+        self._roof_data_lines = data_lines
 
         self._populate_column_combos(
             header,
@@ -1348,21 +2256,49 @@ class GroundControlDialog(QDialog):
             self._roof_y_col, self._roof_z_col,
         )
 
-        # Read vertices, group by surface ID
-        rows = list(reader)
-        groups: dict = {}
+        # Positional defaults if auto-detection failed
+        if self._roof_x_col.currentData() is None or self._roof_x_col.currentData() < 0:
+            n_cols = len(header)
+            self._roof_id_col.blockSignals(True)
+            self._roof_x_col.blockSignals(True)
+            self._roof_y_col.blockSignals(True)
+            self._roof_z_col.blockSignals(True)
+            if n_cols >= 4:
+                self._roof_id_col.setCurrentIndex(1)  # Col 0 -> Name/ID
+                self._roof_x_col.setCurrentIndex(2)   # Col 1 -> X
+                self._roof_y_col.setCurrentIndex(3)   # Col 2 -> Y
+                self._roof_z_col.setCurrentIndex(4)   # Col 3 -> Z
+            elif n_cols == 3:
+                self._roof_x_col.setCurrentIndex(1)
+                self._roof_y_col.setCurrentIndex(2)
+                self._roof_z_col.setCurrentIndex(3)
+            self._roof_id_col.blockSignals(False)
+            self._roof_x_col.blockSignals(False)
+            self._roof_y_col.blockSignals(False)
+            self._roof_z_col.blockSignals(False)
+
+        self._update_roof_records_from_combos()
+
+    def _update_roof_records_from_combos(self):
+        """Parse raw records from stored CSV lines using current column combo selection."""
+        if not hasattr(self, "_roof_data_lines") or not self._roof_data_lines:
+            return
+
+        id_idx = self._roof_id_col.currentData()
+        x_idx = self._roof_x_col.currentData()
+        y_idx = self._roof_y_col.currentData()
+        z_idx = self._roof_z_col.currentData()
+
+        if x_idx is None or y_idx is None or z_idx is None or x_idx < 0 or y_idx < 0 or z_idx < 0:
+            return
+
+        records = []
         auto_name = 0
-        for row in rows:
+        for row in self._roof_data_lines:
             if not row or all(c.strip() == "" for c in row):
                 continue
-            id_idx = self._roof_id_col.currentData()
-            x_idx = self._roof_x_col.currentData()
-            y_idx = self._roof_y_col.currentData()
-            z_idx = self._roof_z_col.currentData()
-
-            if x_idx is None or y_idx is None or z_idx is None or x_idx < 0 or y_idx < 0 or z_idx < 0:
+            if max(x_idx, y_idx, z_idx) >= len(row):
                 continue
-
             try:
                 vx = _safe_float(row[x_idx])
                 vy = _safe_float(row[y_idx])
@@ -1370,25 +2306,485 @@ class GroundControlDialog(QDialog):
             except (ValueError, IndexError):
                 continue
 
-            if id_idx is not None and id_idx >= 0 and id_idx < len(row):
-                sid = row[id_idx].strip()
+            if id_idx is not None and 0 <= id_idx < len(row) and row[id_idx].strip():
+                name = row[id_idx].strip()
             else:
                 auto_name += 1
-                sid = str(auto_name)
+                name = str(auto_name)
 
-            groups.setdefault(sid, []).append((vx, vy, vz))
+            records.append({
+                "name": name,
+                "raw_id": name,
+                "x": vx,
+                "y": vy,
+                "z": vz,
+            })
 
-        self._roof_surfaces = [
-            (sid, verts) for sid, verts in groups.items()
-            if len(verts) >= 3
+        self._roof_raw_records = records
+        self._detect_and_group_roof_points()
+
+    def _on_roof_radius_changed(self):
+        if self._roof_detect_mode.currentData() in ("spatial", "auto"):
+            self._detect_and_group_roof_points()
+
+    def _detect_and_group_roof_points(self):
+        """Group raw points into patches based on naming, proximity, or surface ID."""
+        if not hasattr(self, "_roof_raw_records") or not self._roof_raw_records:
+            return
+
+        mode = self._roof_detect_mode.currentData()
+        radius = self._roof_radius_spin.value()
+        records = self._roof_raw_records
+
+        groups = []
+        if mode == "naming":
+            for r in records:
+                grp, _ = parse_roof_point_name(r["name"])
+                groups.append(grp)
+        elif mode == "spatial":
+            coords = np.array([[r["x"], r["y"]] for r in records])
+            labels = cluster_roof_points_spatially(coords, radius=radius)
+            groups = [f"Patch {lbl + 1}" for lbl in labels]
+        elif mode == "csv_id":
+            for r in records:
+                groups.append(r.get("raw_id") or "1")
+        else:  # "auto"
+            naming_groups = [parse_roof_point_name(r["name"])[0] for r in records]
+            unique_grps = set(naming_groups)
+            counts = {g: naming_groups.count(g) for g in unique_grps}
+            valid_naming_patches = sum(1 for c in counts.values() if c >= 3)
+
+            # If naming convention produces >= 1 patch with >= 3 vertices and multiple groups
+            if valid_naming_patches >= 1 and (len(unique_grps) > 1 or len(records) <= 8):
+                groups = naming_groups
+            else:
+                # Spatial clustering fallback
+                coords = np.array([[r["x"], r["y"]] for r in records])
+                labels = cluster_roof_points_spatially(coords, radius=radius)
+                groups = [f"Patch {lbl + 1}" for lbl in labels]
+
+        # Populate _roof_points_table
+        self._roof_points_table.blockSignals(True)
+        self._roof_points_table.setRowCount(len(records))
+        for row, (rec, grp) in enumerate(zip(records, groups)):
+            # Col 0: Point Name
+            name_item = QTableWidgetItem(str(rec["name"]))
+            name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+            self._roof_points_table.setItem(row, 0, name_item)
+
+            # Col 1: Patch / House No. (EDITABLE by user)
+            house_item = QTableWidgetItem(str(grp))
+            house_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            self._roof_points_table.setItem(row, 1, house_item)
+
+            # Col 2: Type combobox
+            combo = QComboBox()
+            combo.addItem("🏠 Roof", "roof")
+            combo.addItem("🌱 Ground", "ground")
+            low_name = (str(rec["name"]) + " " + str(grp)).lower()
+            if any(k in low_name for k in ("ground", "gnd", "boden", "flur", "terrain", "pad", "slab")):
+                combo.setCurrentIndex(1)
+            else:
+                combo.setCurrentIndex(0)
+            combo.currentIndexChanged.connect(self._rebuild_roof_surfaces_from_table)
+            self._roof_points_table.setCellWidget(row, 2, combo)
+
+            # Col 3, 4, 5: X, Y, Z
+            for c_idx, val in enumerate((rec["x"], rec["y"], rec["z"]), start=3):
+                it = QTableWidgetItem(f"{val:.3f}")
+                it.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                self._roof_points_table.setItem(row, c_idx, it)
+
+        self._roof_points_table.blockSignals(False)
+        self._roof_points_table.resizeColumnsToContents()
+        self._rebuild_roof_surfaces_from_table()
+
+    def _on_roof_point_item_changed(self, item: QTableWidgetItem):
+        if item.column() == 1:  # Patch / House No.
+            self._rebuild_roof_surfaces_from_table()
+
+    def _rebuild_roof_surfaces_from_table(self):
+        """Collect points grouped by House No. column and build surfaces with optional angular sorting."""
+        n_rows = self._roof_points_table.rowCount()
+        if n_rows == 0:
+            self._roof_surfaces = []
+            self._roof_table.setRowCount(0)
+            self._roof_run_btn.setEnabled(False)
+            return
+
+        groups: dict = {}
+        for row in range(n_rows):
+            name_it = self._roof_points_table.item(row, 0)
+            house_it = self._roof_points_table.item(row, 1)
+            type_widget = self._roof_points_table.cellWidget(row, 2)
+            x_it = self._roof_points_table.item(row, 3)
+            y_it = self._roof_points_table.item(row, 4)
+            z_it = self._roof_points_table.item(row, 5)
+
+            if not house_it or not x_it or not y_it or not z_it:
+                continue
+
+            house_no = house_it.text().strip()
+            if not house_no:
+                continue
+
+            try:
+                x = _safe_float(x_it.text())
+                y = _safe_float(y_it.text())
+                z = _safe_float(z_it.text())
+            except ValueError:
+                continue
+
+            pt_type = type_widget.currentData() if isinstance(type_widget, QComboBox) else "roof"
+            if house_no not in groups:
+                groups[house_no] = {"verts": [], "names": [], "type": pt_type}
+            groups[house_no]["verts"].append((x, y, z))
+            groups[house_no]["names"].append(name_it.text() if name_it else "")
+
+        # Build surfaces list
+        surfaces = []
+        sort_angular = self._roof_sort_chk.isChecked()
+
+        for sid, data in groups.items():
+            verts = np.array(data["verts"], dtype=np.float64)
+            if len(verts) < 3:
+                continue
+            if sort_angular:
+                verts, _ = sort_vertices_angular(verts)
+            surfaces.append((sid, [tuple(v) for v in verts], data["type"]))
+
+        self._roof_surfaces = surfaces
+
+        # Refresh patches summary preview
+        self._roof_table.blockSignals(True)
+        self._roof_table.setRowCount(len(surfaces))
+        for r_idx, (sid, verts, ptype) in enumerate(surfaces):
+            type_str = "🏠 Roof" if ptype == "roof" else "🌱 Ground"
+            chk_item = _CheckboxTableWidgetItem(checked=True)
+            chk_item.setData(Qt.UserRole, r_idx)
+            self._roof_table.setItem(r_idx, 0, chk_item)
+            self._roof_table.setItem(r_idx, 1, QTableWidgetItem(str(sid)))
+            self._roof_table.setItem(r_idx, 2, QTableWidgetItem(type_str))
+            self._roof_table.setItem(r_idx, 3, QTableWidgetItem(str(len(verts))))
+            self._roof_table.setItem(r_idx, 4, QTableWidgetItem("-"))
+            self._roof_table.setItem(r_idx, 5, QTableWidgetItem("-"))
+            self._roof_table.setItem(r_idx, 6, QTableWidgetItem("-"))
+            self._roof_table.setItem(r_idx, 7, QTableWidgetItem("-"))
+            self._roof_table.setItem(r_idx, 8, QTableWidgetItem("-"))
+
+        self._roof_table.blockSignals(False)
+        self._roof_table.resizeColumnsToContents()
+        self._roof_run_btn.setEnabled(len(surfaces) > 0)
+        self._status.setText(f"Detected {len(surfaces)} patch(es) from {n_rows} point(s)")
+
+    def _on_roof_table_selection_changed(self):
+        sel = self._roof_table.selectedItems()
+        if not sel:
+            return
+        row = sel[0].row()
+        if hasattr(self, "_roof_results") and self._roof_results and row < len(self._roof_results):
+            res = self._roof_results[row]
+            self._roof_inspector.load_patch(res)
+        elif self._roof_surfaces and row < len(self._roof_surfaces):
+            sid, verts, ptype = self._roof_surfaces[row]
+            verts_arr = np.array(verts, dtype=np.float64)
+            patch_preview = {
+                "name": sid,
+                "type": ptype,
+                "verts": verts_arr,
+                "n_verts": len(verts),
+                "centroid": verts_arr.mean(axis=0),
+                "dx": 0.0, "dy": 0.0, "dz": 0.0,
+                "base_dx": 0.0, "base_dy": 0.0, "base_dz": 0.0,
+                "shift_mag": 0.0,
+                "used": True,
+            }
+            self._roof_inspector.load_patch(patch_preview)
+
+    def _on_patch_offset_modified(self, patch_name: str, dx: float, dy: float, dz: float):
+        if not hasattr(self, "_roof_results") or not self._roof_results:
+            return
+
+        target_res = None
+        for r in self._roof_results:
+            if str(r.get("name")) == str(patch_name):
+                target_res = r
+                break
+        if not target_res:
+            return
+
+        target_res["dx"] = dx
+        target_res["dy"] = dy
+        target_res["dz"] = dz
+        target_res["shift_mag"] = float(np.sqrt(dx*dx + dy*dy + dz*dz))
+
+        # Update table row (Col 1 is Patch Name, Cols 5..8 are ΔX, ΔY, ΔZ, |Shift|)
+        self._roof_table.blockSignals(True)
+        for row in range(self._roof_table.rowCount()):
+            it = self._roof_table.item(row, 1)
+            if it and it.text() == str(patch_name):
+                self._roof_table.setItem(row, 5, _NumericTableWidgetItem(dx, f"{dx:+.3f}"))
+                self._roof_table.setItem(row, 6, _NumericTableWidgetItem(dy, f"{dy:+.3f}"))
+                self._roof_table.setItem(row, 7, _NumericTableWidgetItem(dz, f"{dz:+.3f}"))
+                self._roof_table.setItem(row, 8, _NumericTableWidgetItem(target_res['shift_mag'], f"{target_res['shift_mag']:.3f}"))
+                break
+        self._roof_table.blockSignals(False)
+
+        # Recompute overall statistics using active/used patches
+        self._recalculate_roof_statistics()
+
+    def _on_roof_table_item_changed(self, item: QTableWidgetItem):
+        if item.column() == 0:
+            orig_idx = item.data(Qt.UserRole)
+            is_checked = (item.checkState() == Qt.Checked)
+            if hasattr(self, "_roof_results") and self._roof_results:
+                if orig_idx is not None and 0 <= orig_idx < len(self._roof_results):
+                    self._roof_results[orig_idx]["used"] = is_checked
+                    patch_name = str(self._roof_results[orig_idx].get("name", ""))
+                    if self._roof_inspector._current_patch and str(self._roof_inspector._current_patch.get("name", "")) == patch_name:
+                        self._roof_inspector.set_used(is_checked)
+            self._recalculate_roof_statistics()
+
+    def _on_inspector_use_toggled(self, patch_name: str, used: bool):
+        if not hasattr(self, "_roof_results") or not self._roof_results:
+            return
+        for r in self._roof_results:
+            if str(r.get("name", "")) == str(patch_name):
+                r["used"] = used
+                break
+
+        # Sync table checkbox
+        self._roof_table.blockSignals(True)
+        for row in range(self._roof_table.rowCount()):
+            name_item = self._roof_table.item(row, 1)
+            if name_item and name_item.text() == str(patch_name):
+                use_item = self._roof_table.item(row, 0)
+                if use_item:
+                    use_item.setCheckState(Qt.Checked if used else Qt.Unchecked)
+                break
+        self._roof_table.blockSignals(False)
+
+        self._recalculate_roof_statistics()
+
+    def _on_toggle_selected_patch_use(self):
+        sel = self._roof_table.selectedItems()
+        if not sel:
+            return
+        row = sel[0].row()
+        use_item = self._roof_table.item(row, 0)
+        if not use_item:
+            return
+        cur_state = use_item.checkState()
+        new_state = Qt.Unchecked if cur_state == Qt.Checked else Qt.Checked
+        use_item.setCheckState(new_state)
+
+    def delete_roof_patch(self, patch_name: str, confirm: bool = True):
+        """Delete an entire bad/wrong patch, removing its points and surfaces."""
+        if confirm:
+            reply = QMessageBox.question(
+                self, "Delete Patch",
+                f"Are you sure you want to delete patch '{patch_name}'?\n\n"
+                f"This will remove all associated corner points and exclude it from calculations.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        # 1. Remove points from _roof_points_table whose Patch / House No. matches patch_name
+        self._roof_points_table.blockSignals(True)
+        rows_to_delete = []
+        for row in range(self._roof_points_table.rowCount()):
+            house_item = self._roof_points_table.item(row, 1)
+            if house_item and house_item.text().strip() == str(patch_name).strip():
+                rows_to_delete.append(row)
+        for row in reversed(rows_to_delete):
+            self._roof_points_table.removeRow(row)
+        self._roof_points_table.blockSignals(False)
+
+        # 2. Also sync raw records if present
+        if hasattr(self, "_roof_raw_records") and self._roof_raw_records:
+            new_records = []
+            for row in range(self._roof_points_table.rowCount()):
+                name_it = self._roof_points_table.item(row, 0)
+                x_it = self._roof_points_table.item(row, 3)
+                y_it = self._roof_points_table.item(row, 4)
+                z_it = self._roof_points_table.item(row, 5)
+                if name_it and x_it and y_it and z_it:
+                    try:
+                        new_records.append({
+                            "name": name_it.text(),
+                            "raw_id": self._roof_points_table.item(row, 1).text().strip() if self._roof_points_table.item(row, 1) else "",
+                            "x": _safe_float(x_it.text()),
+                            "y": _safe_float(y_it.text()),
+                            "z": _safe_float(z_it.text()),
+                        })
+                    except ValueError:
+                        pass
+            self._roof_raw_records = new_records
+
+        # 3. Rebuild surfaces from the points table
+        self._rebuild_roof_surfaces_from_table()
+
+        # 4. Remove from _roof_results
+        if hasattr(self, "_roof_results") and self._roof_results:
+            self._roof_results = [r for r in self._roof_results if str(r.get("name", "")).strip() != str(patch_name).strip()]
+
+        # 5. Remove from _roof_table
+        self._roof_table.blockSignals(True)
+        for row in range(self._roof_table.rowCount()):
+            name_item = self._roof_table.item(row, 1)
+            if name_item and name_item.text().strip() == str(patch_name).strip():
+                self._roof_table.removeRow(row)
+                break
+        # Re-index UserRole in column 0
+        for row in range(self._roof_table.rowCount()):
+            use_item = self._roof_table.item(row, 0)
+            if use_item:
+                use_item.setData(Qt.UserRole, row)
+        self._roof_table.blockSignals(False)
+
+        # 6. Clear or reload inspector
+        if self._roof_inspector._current_patch and str(self._roof_inspector._current_patch.get("name", "")).strip() == str(patch_name).strip():
+            self._roof_inspector.clear_patch()
+            if hasattr(self, "_roof_results") and self._roof_results:
+                self._roof_table.selectRow(0)
+                self._roof_inspector.load_patch(self._roof_results[0])
+
+        # 7. Recalculate stats
+        self._recalculate_roof_statistics()
+        self._status.setText(f"Deleted patch '{patch_name}' ({len(rows_to_delete)} points removed)")
+
+    def _on_delete_selected_patch(self):
+        sel = self._roof_table.selectedItems()
+        patch_name = None
+        if sel:
+            row = sel[0].row()
+            name_item = self._roof_table.item(row, 1)
+            if name_item:
+                patch_name = name_item.text()
+        elif self._roof_inspector._current_patch:
+            patch_name = self._roof_inspector._current_patch.get("name")
+
+        if patch_name:
+            self.delete_roof_patch(patch_name)
+        else:
+            QMessageBox.information(self, "No Patch Selected", "Please select a patch in the table to delete.")
+
+    def _on_delete_roof_points(self, confirm: bool = True):
+        selected_rows = set()
+        for item in self._roof_points_table.selectedItems():
+            selected_rows.add(item.row())
+
+        if not selected_rows:
+            QMessageBox.information(self, "No Points Selected", "Please select one or more rows in the points table to delete.")
+            return
+
+        sorted_rows = sorted(selected_rows, reverse=True)
+        if confirm:
+            reply = QMessageBox.question(
+                self, "Delete Selected Points",
+                f"Delete {len(sorted_rows)} selected point(s)?\n\n"
+                f"Remaining points will be regrouped automatically.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self._roof_points_table.blockSignals(True)
+        for row in sorted_rows:
+            self._roof_points_table.removeRow(row)
+        self._roof_points_table.blockSignals(False)
+
+        # Sync raw records
+        if hasattr(self, "_roof_raw_records") and self._roof_raw_records:
+            new_records = []
+            for row in range(self._roof_points_table.rowCount()):
+                name_it = self._roof_points_table.item(row, 0)
+                x_it = self._roof_points_table.item(row, 3)
+                y_it = self._roof_points_table.item(row, 4)
+                z_it = self._roof_points_table.item(row, 5)
+                if name_it and x_it and y_it and z_it:
+                    try:
+                        new_records.append({
+                            "name": name_it.text(),
+                            "raw_id": self._roof_points_table.item(row, 1).text().strip() if self._roof_points_table.item(row, 1) else "",
+                            "x": _safe_float(x_it.text()),
+                            "y": _safe_float(y_it.text()),
+                            "z": _safe_float(z_it.text()),
+                        })
+                    except ValueError:
+                        pass
+            self._roof_raw_records = new_records
+
+        self._rebuild_roof_surfaces_from_table()
+        self._status.setText(f"Deleted {len(sorted_rows)} point(s) and rebuilt surfaces")
+
+    def _recalculate_roof_statistics(self):
+        """Recalculate mean XYZ shift and stats using only active (used) patches with valid fit."""
+        if not hasattr(self, "_roof_results") or not self._roof_results:
+            self._roof_shift = None
+            self._roof_apply_btn.setEnabled(False)
+            self._roof_stats.setText("")
+            return
+
+        used_patches = [
+            r for r in self._roof_results
+            if r.get("used", True) and r.get("dx") is not None
         ]
-        skipped = len(groups) - len(self._roof_surfaces)
-        msg = f"Loaded {len(self._roof_surfaces)} surface(s)"
-        if skipped:
-            msg += f" ({skipped} skipped — need ≥ 3 vertices)"
 
-        self._roof_run_btn.setEnabled(len(self._roof_surfaces) > 0)
-        self._status.setText(msg)
+        if used_patches:
+            dxs = [r["dx"] for r in used_patches]
+            dys = [r["dy"] for r in used_patches]
+            dzs = [r["dz"] for r in used_patches]
+            m_dx, m_dy, m_dz = float(np.mean(dxs)), float(np.mean(dys)), float(np.mean(dzs))
+            mag_arr = np.sqrt(np.array(dxs)**2 + np.array(dys)**2 + np.array(dzs)**2)
+            med_mag = float(np.median(mag_arr))
+            mean_mag = float(np.mean(mag_arr))
+            total_patches = len(self._roof_results)
+
+            self._roof_stats.setText(
+                f"<b>Statistics (using {len(used_patches)} of {total_patches} surfaces):</b><br>"
+                f"Mean ΔX = <b>{m_dx:+.3f} m</b>  |  "
+                f"Mean ΔY = <b>{m_dy:+.3f} m</b>  |  "
+                f"Mean ΔZ = <b>{m_dz:+.3f} m</b><br>"
+                f"Median |Shift| = {med_mag:.3f} m  |  "
+                f"Mean |Shift| = {mean_mag:.3f} m"
+            )
+            self._roof_shift = (m_dx, m_dy, m_dz)
+            self._roof_apply_btn.setEnabled(True)
+            self._update_apply_buttons_text()
+            self._status.setText(
+                f"Roof calculation: using {len(used_patches)}/{total_patches} surfaces (Mean shift: {m_dx:+.3f}, {m_dy:+.3f}, {m_dz:+.3f} m)"
+            )
+        else:
+            self._roof_shift = None
+            self._roof_apply_btn.setEnabled(False)
+            self._roof_stats.setText(
+                "<span style='color:#c0392b; font-weight:bold;'>"
+                "No active surfaces in calculation. Check at least one surface to apply shift.</span>"
+            )
+            self._status.setText("Roof calculation: no active surfaces selected")
+
+        # Synchronize inspector if showing a patch
+        if hasattr(self, "_roof_inspector") and self._roof_inspector._current_patch:
+            cur_name = str(self._roof_inspector._current_patch.get("name", ""))
+            for r in self._roof_results:
+                if str(r.get("name", "")) == cur_name:
+                    self._roof_inspector.set_used(r.get("used", True))
+                    break
+
+        # Synchronize visual check navigation checkbox if in roofs mode
+        if self._vis_mode == "roofs" and hasattr(self, "_vis_use_chk"):
+            if 0 <= self._vis_index < len(self._roof_results):
+                r = self._roof_results[self._vis_index]
+                is_valid = (r.get("dx") is not None)
+                is_used = r.get("used", True) and is_valid
+                self._vis_use_chk.blockSignals(True)
+                self._vis_use_chk.setEnabled(is_valid)
+                self._vis_use_chk.setChecked(is_used)
+                self._vis_use_chk.blockSignals(False)
 
     def _on_roof_sep_changed(self):
         self._roof_custom_sep.setVisible(
@@ -1566,23 +2962,31 @@ class GroundControlDialog(QDialog):
             self._recalculate_gcp_statistics()
 
     def _on_vis_use_toggled(self, checked: bool):
-        if self._vis_mode != "gcp" or not self._gcp_results:
-            return
-        if not (0 <= self._vis_index < len(self._gcp_results)):
-            return
+        if self._vis_mode == "gcp":
+            if not self._gcp_results or not (0 <= self._vis_index < len(self._gcp_results)):
+                return
 
-        self._gcp_results[self._vis_index]["used"] = checked
+            self._gcp_results[self._vis_index]["used"] = checked
 
-        # Synchronize corresponding checkbox item in table
-        self._gcp_table.blockSignals(True)
-        for row in range(self._gcp_table.rowCount()):
-            use_item = self._gcp_table.item(row, 0)
-            if use_item and use_item.data(Qt.UserRole) == self._vis_index:
-                use_item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
-                break
-        self._gcp_table.blockSignals(False)
+            # Synchronize corresponding checkbox item in table
+            self._gcp_table.blockSignals(True)
+            for row in range(self._gcp_table.rowCount()):
+                use_item = self._gcp_table.item(row, 0)
+                if use_item and use_item.data(Qt.UserRole) == self._vis_index:
+                    use_item.setCheckState(Qt.Checked if checked else Qt.Unchecked)
+                    break
+            self._gcp_table.blockSignals(False)
 
-        self._recalculate_gcp_statistics()
+            self._recalculate_gcp_statistics()
+        elif self._vis_mode == "roofs":
+            if not self._roof_results or not (0 <= self._vis_index < len(self._roof_results)):
+                return
+
+            patch_name = str(self._roof_results[self._vis_index].get("name", ""))
+            self._on_inspector_use_toggled(patch_name, checked)
+            if hasattr(self, "_roof_inspector") and self._roof_inspector._current_patch:
+                if str(self._roof_inspector._current_patch.get("name", "")) == patch_name:
+                    self._roof_inspector.set_used(checked)
 
     def _recalculate_gcp_statistics(self):
         """Recalculate GCP statistics using only enabled/checked points."""
@@ -1635,9 +3039,7 @@ class GroundControlDialog(QDialog):
 
             self._gcp_shift = median_dz
             self._gcp_apply_btn.setEnabled(True)
-            self._gcp_apply_btn.setText(
-                f"⬆ Apply Z Shift ({self._gcp_shift:+.3f} m) from {len(used_dzs)} Active Points to Current Tile"
-            )
+            self._update_apply_buttons_text()
             self._status.setText(f"GCP calculation: using {len(used_dzs)}/{total_pts} points (Median shift: {median_dz:+.3f} m)")
         else:
             self._gcp_shift = None
@@ -1756,17 +3158,18 @@ class GroundControlDialog(QDialog):
     # ── Run Roofs ────────────────────────────────────────────────────
 
     def _on_run_roofs(self):
-        self._reparse_current_roofs()
+        self._rebuild_roof_surfaces_from_table()
 
         if not self._roof_surfaces:
             QMessageBox.warning(self, "No Roof Surfaces",
-                                "No valid roof surfaces could be parsed from the CSV.\n"
-                                "Check the file, separator, and column mapping.")
+                                "No valid surfaces could be constructed from the points table.\n"
+                                "Ensure at least 3 points belong to each patch/house number.")
             return
 
-        # Load point data — roofs pass centroid of each surface
+        # Load point data — pass centroid of each surface
         centroids = []
-        for sid, verts in self._roof_surfaces:
+        for item in self._roof_surfaces:
+            sid, verts = item[0], item[1]
             if not verts:
                 continue
             xs = [v[0] for v in verts]
@@ -1800,131 +3203,288 @@ class GroundControlDialog(QDialog):
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
-    def _reparse_current_roofs(self):
-        if not self._roof_csv_edit.text():
-            return
-        sep = self._get_separator(self._roof_sep_combo, self._roof_custom_sep)
-        try:
-            with open(self._roof_csv_edit.text(), "r", encoding="utf-8-sig") as f:
-                content = f.read()
-        except Exception:
-            return
-        reader = csv.reader(io.StringIO(content), delimiter=sep)
-        try:
-            next(reader)
-        except StopIteration:
-            return
-        groups: dict = {}
-        auto_name = 0
-        for row in reader:
-            id_idx = self._roof_id_col.currentData()
-            x_idx = self._roof_x_col.currentData()
-            y_idx = self._roof_y_col.currentData()
-            z_idx = self._roof_z_col.currentData()
-            if x_idx is None or y_idx is None or z_idx is None or x_idx < 0 or y_idx < 0 or z_idx < 0:
-                continue
-            try:
-                vx = _safe_float(row[x_idx])
-                vy = _safe_float(row[y_idx])
-                vz = _safe_float(row[z_idx])
-            except (ValueError, IndexError):
-                continue
-            if id_idx is not None and id_idx >= 0 and id_idx < len(row):
-                sid = row[id_idx].strip()
-            else:
-                auto_name += 1
-                sid = str(auto_name)
-            groups.setdefault(sid, []).append((vx, vy, vz))
-        self._roof_surfaces = [(sid, v) for sid, v in groups.items() if len(v) >= 3]
-
     def _on_roofs_finished(self, results: list):
         self._roof_results = results
+        for r in self._roof_results:
+            if "used" not in r:
+                r["used"] = (r.get("dx") is not None)
+
         self._roof_run_btn.setEnabled(True)
         self._progress.setVisible(False)
 
+        self._roof_table.blockSignals(True)
+        self._roof_table.setSortingEnabled(False)
         self._roof_table.setRowCount(0)
-        dxs, dys, dzs = [], [], []
-        for r in results:
+
+        for i, r in enumerate(results):
             row = self._roof_table.rowCount()
             self._roof_table.insertRow(row)
-            self._roof_table.setItem(row, 0, QTableWidgetItem(str(r["name"])))
-            self._roof_table.setItem(row, 1, QTableWidgetItem(str(r.get("n_verts", "?"))))
-            self._roof_table.setItem(row, 2, QTableWidgetItem(str(r.get("n_nearby", 0))))
-            if r["dx"] is not None:
-                self._roof_table.setItem(row, 3, QTableWidgetItem(f"{r['dx']:+.3f}"))
-                self._roof_table.setItem(row, 4, QTableWidgetItem(f"{r['dy']:+.3f}"))
-                self._roof_table.setItem(row, 5, QTableWidgetItem(f"{r['dz']:+.3f}"))
-                mag = r.get("shift_mag", 0) or 0
-                self._roof_table.setItem(row, 6, QTableWidgetItem(f"{mag:.3f}"))
-                dxs.append(r["dx"]); dys.append(r["dy"]); dzs.append(r["dz"])
+
+            is_valid = (r.get("dx") is not None)
+            is_used = r.get("used", True) and is_valid
+            chk_item = _CheckboxTableWidgetItem(checked=is_used)
+            chk_item.setData(Qt.UserRole, i)
+            if not is_valid:
+                chk_item.setFlags(Qt.ItemIsSelectable)
+            self._roof_table.setItem(row, 0, chk_item)
+
+            self._roof_table.setItem(row, 1, QTableWidgetItem(str(r["name"])))
+            ptype_str = "🏠 Roof" if r.get("type") == "roof" else "🌱 Ground"
+            self._roof_table.setItem(row, 2, QTableWidgetItem(ptype_str))
+            self._roof_table.setItem(row, 3, QTableWidgetItem(str(r.get("n_verts", "?"))))
+            self._roof_table.setItem(row, 4, QTableWidgetItem(str(r.get("n_nearby", 0))))
+            if is_valid:
+                mag = r.get("shift_mag", 0.0) or 0.0
+                self._roof_table.setItem(row, 5, _NumericTableWidgetItem(r['dx'], f"{r['dx']:+.3f}"))
+                self._roof_table.setItem(row, 6, _NumericTableWidgetItem(r['dy'], f"{r['dy']:+.3f}"))
+                self._roof_table.setItem(row, 7, _NumericTableWidgetItem(r['dz'], f"{r['dz']:+.3f}"))
+                self._roof_table.setItem(row, 8, _NumericTableWidgetItem(mag, f"{mag:.3f}"))
             else:
                 warn = r.get("warning", "N/A")
-                self._roof_table.setItem(row, 3, QTableWidgetItem(warn))
-                self._roof_table.setItem(row, 4, QTableWidgetItem(""))
-                self._roof_table.setItem(row, 5, QTableWidgetItem(""))
-                self._roof_table.setItem(row, 6, QTableWidgetItem(""))
-        self._roof_table.resizeColumnsToContents()
+                self._roof_table.setItem(row, 5, _NumericTableWidgetItem(None, warn))
+                self._roof_table.setItem(row, 6, _NumericTableWidgetItem(None, ""))
+                self._roof_table.setItem(row, 7, _NumericTableWidgetItem(None, ""))
+                self._roof_table.setItem(row, 8, _NumericTableWidgetItem(None, ""))
 
-        if dxs:
-            dx_arr = np.array(dxs); dy_arr = np.array(dys); dz_arr = np.array(dzs)
-            mag_arr = np.sqrt(dx_arr**2 + dy_arr**2 + dz_arr**2)
-            mx, my, mz = float(np.mean(dx_arr)), float(np.mean(dy_arr)), float(np.mean(dz_arr))
-            med_mag = float(np.median(mag_arr))
-            mean_mag = float(np.mean(mag_arr))
-            self._roof_stats.setText(
-                f"<b>Statistics ({len(dxs)} surfaces):</b>  "
-                f"Mean ΔX = {mx:+.3f} m  |  "
-                f"Mean ΔY = {my:+.3f} m  |  "
-                f"Mean ΔZ = {mz:+.3f} m\n"
-                f"Median |Shift| = {med_mag:.3f} m  |  "
-                f"Mean |Shift| = {mean_mag:.3f} m"
-            )
-            self._roof_shift = (mx, my, mz)
-            self._roof_apply_btn.setEnabled(True)
-            self._roof_apply_btn.setText(
-                f"⬆ Apply XYZ Shift ({mx:+.3f}, {my:+.3f}, {mz:+.3f}) m to Current Tile"
-            )
+        self._roof_table.resizeColumnsToContents()
+        self._roof_table.setSortingEnabled(False)
+        self._roof_table.blockSignals(False)
+        self._roof_subtabs.setCurrentIndex(1)
+
+        self._recalculate_roof_statistics()
+
+        if self._roof_results:
+            self._roof_table.selectRow(0)
+            valid_results = [r for r in self._roof_results if r.get("dx") is not None]
+            if valid_results:
+                self._roof_inspector.load_patch(valid_results[0])
             self._vis_mode = "roofs"
             self._vis_index = 0
             self._update_vis_nav()
-        else:
-            self._roof_stats.setText("No valid results — check search radius")
-            self._roof_apply_btn.setEnabled(False)
 
-        self._status.setText(f"Roof calculation done: {len(dxs)} valid surfaces")
+        valid_count = sum(1 for r in results if r.get("dx") is not None)
+        self._status.setText(f"Roof calculation done: {valid_count} valid surfaces")
+
+    # ── Target Scope Management ──────────────────────────────────────
+
+    def _create_scope_selector_widget(self, tab_name: str) -> QWidget:
+        """Create a target scope selector bar for applying shifts to all, selected, or custom tiles."""
+        w = QWidget()
+        lay = QHBoxLayout(w)
+        lay.setContentsMargins(0, 4, 0, 4)
+        lay.setSpacing(6)
+
+        lbl = QLabel("<b>Apply Shift Target:</b>")
+        lay.addWidget(lbl)
+
+        combo = QComboBox()
+        combo.setToolTip("Select which tiles in the project will receive the ground control shift")
+        lay.addWidget(combo, 1)
+
+        btn = QPushButton("📂 Choose Tiles…")
+        btn.setToolTip("Open dialog to pick specific project tiles")
+        lay.addWidget(btn)
+
+        if tab_name == "gcp":
+            self._gcp_scope_combo = combo
+            self._gcp_scope_btn = btn
+            btn.clicked.connect(self._open_tile_selection_dialog)
+            combo.currentIndexChanged.connect(lambda: self._on_scope_changed("gcp"))
+        else:
+            self._roof_scope_combo = combo
+            self._roof_scope_btn = btn
+            btn.clicked.connect(self._open_tile_selection_dialog)
+            combo.currentIndexChanged.connect(lambda: self._on_scope_changed("roof"))
+
+        return w
+
+    def _populate_scope_combos(self):
+        combos = []
+        if hasattr(self, "_gcp_scope_combo"):
+            combos.append(self._gcp_scope_combo)
+        if hasattr(self, "_roof_scope_combo"):
+            combos.append(self._roof_scope_combo)
+        if not combos:
+            return
+
+        n_all = len(self._all_tile_ids)
+        n_sel = len(self._selected_tile_ids)
+        n_custom = len(self._custom_tile_ids)
+
+        for cb in combos:
+            cb.blockSignals(True)
+            prev_data = cb.currentData() or ("selected" if n_sel > 0 and n_sel < n_all else "all")
+            cb.clear()
+
+            cb.addItem(f"All Project Tiles ({n_all} tiles)", "all")
+            if n_sel > 0 and n_sel < n_all:
+                cb.addItem(f"Selected Tiles ({n_sel} tiles)", "selected")
+            if self._current_tile_id:
+                cb.addItem(f"Current Tile only ({self._current_tile_id})", "current")
+            cb.addItem(f"Custom Selection ({n_custom} tiles)…", "custom")
+
+            idx = cb.findData(prev_data)
+            if idx >= 0:
+                cb.setCurrentIndex(idx)
+            else:
+                cb.setCurrentIndex(0)
+            cb.blockSignals(False)
+
+        self._update_apply_buttons_text()
+
+    def _on_scope_changed(self, source: str):
+        target_cb = self._roof_scope_combo if source == "gcp" else self._gcp_scope_combo
+        source_cb = self._gcp_scope_combo if source == "gcp" else self._roof_scope_combo
+
+        if hasattr(self, "_gcp_scope_combo") and hasattr(self, "_roof_scope_combo"):
+            chosen_data = source_cb.currentData()
+            if target_cb.currentData() != chosen_data:
+                target_cb.blockSignals(True)
+                idx = target_cb.findData(chosen_data)
+                if idx >= 0:
+                    target_cb.setCurrentIndex(idx)
+                target_cb.blockSignals(False)
+
+        self._update_apply_buttons_text()
+
+    def _open_tile_selection_dialog(self):
+        current_chosen = self.get_target_tile_ids()
+        dlg = _TileSelectionDialog(self._all_tile_ids, current_chosen, parent=self)
+        if dlg.exec():
+            selected = dlg.get_selected_tile_ids()
+            if selected:
+                self._custom_tile_ids = selected
+                self._populate_scope_combos()
+                for cb in [getattr(self, "_gcp_scope_combo", None), getattr(self, "_roof_scope_combo", None)]:
+                    if cb:
+                        cb.blockSignals(True)
+                        idx = cb.findData("custom")
+                        if idx >= 0:
+                            cb.setCurrentIndex(idx)
+                        cb.blockSignals(False)
+                self._update_apply_buttons_text()
+
+    def get_target_tile_ids(self) -> List[str]:
+        scope = "all"
+        for cb in [getattr(self, "_roof_scope_combo", None), getattr(self, "_gcp_scope_combo", None)]:
+            if cb and cb.count() > 0:
+                scope = cb.currentData() or "all"
+                break
+
+        if scope == "all":
+            return list(self._all_tile_ids)
+        elif scope == "selected":
+            return list(self._selected_tile_ids) if self._selected_tile_ids else list(self._all_tile_ids)
+        elif scope == "current":
+            if self._current_tile_id:
+                return [self._current_tile_id]
+            elif self._selected_tile_ids:
+                return [self._selected_tile_ids[0]]
+            elif self._all_tile_ids:
+                return [self._all_tile_ids[0]]
+            return []
+        elif scope == "custom":
+            return list(self._custom_tile_ids)
+        return list(self._all_tile_ids)
+
+    def _get_scope_display_label(self) -> str:
+        scope = "all"
+        for cb in [getattr(self, "_roof_scope_combo", None), getattr(self, "_gcp_scope_combo", None)]:
+            if cb and cb.count() > 0:
+                scope = cb.currentData() or "all"
+                break
+
+        if scope == "all":
+            return "All Project Tiles"
+        elif scope == "selected":
+            return "Selected Tiles"
+        elif scope == "current":
+            return f"Current Tile ({self._current_tile_id})" if self._current_tile_id else "Current Tile"
+        elif scope == "custom":
+            return "Custom Tiles"
+        return "Tiles"
+
+    def _update_apply_buttons_text(self):
+        target_tids = self.get_target_tile_ids()
+        count = len(target_tids)
+        scope_lbl = self._get_scope_display_label()
+
+        if hasattr(self, "_roof_apply_btn"):
+            if self._roof_shift is not None:
+                mx, my, mz = self._roof_shift
+                self._roof_apply_btn.setText(
+                    f"⬆ Apply XYZ Shift ({mx:+.3f}, {my:+.3f}, {mz:+.3f}) m to {scope_lbl} ({count})"
+                )
+            else:
+                self._roof_apply_btn.setText(f"⬆ Apply XYZ Shift to {scope_lbl} ({count})")
+
+        if hasattr(self, "_gcp_apply_btn"):
+            if self._gcp_shift is not None:
+                self._gcp_apply_btn.setText(
+                    f"⬆ Apply Z Shift ({self._gcp_shift:+.3f} m) to {scope_lbl} ({count})"
+                )
+            else:
+                self._gcp_apply_btn.setText(f"⬆ Apply Z Shift to {scope_lbl} ({count})")
 
     # ── Apply shift ──────────────────────────────────────────────────
 
     def _on_apply_gcp(self):
         if self._gcp_shift is not None:
+            target_tids = self.get_target_tile_ids()
+            if not target_tids:
+                QMessageBox.warning(
+                    self, "No Tiles Selected",
+                    "Please select at least one tile to apply the ground control shift."
+                )
+                return
+
+            n = len(target_tids)
+            scope_lbl = self._get_scope_display_label()
+            tiles_preview = ", ".join(target_tids[:6]) + (f" … (+{n - 6} more)" if n > 6 else "")
+
             reply = QMessageBox.question(
-                self, "Apply Z Shift",
-                f"Apply a Z shift of {self._gcp_shift:+.3f} m to all points "
-                f"in the current tile?\n\n"
-                f"This will add {self._gcp_shift:+.3f} m to every point's Z coordinate.",
+                self, "Apply Z Shift to Tiles",
+                f"Apply a Z shift of {self._gcp_shift:+.3f} m to {n} tile(s) [{scope_lbl}]?\n\n"
+                f"Target Tiles ({n}):\n"
+                f"  {tiles_preview}\n\n"
+                f"This will add {self._gcp_shift:+.3f} m to every point's Z coordinate in the LAS files on disk.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
             if reply == QMessageBox.Yes:
-                self.shift_applied.emit(0.0, 0.0, self._gcp_shift)
+                self.shift_applied.emit(0.0, 0.0, self._gcp_shift, target_tids)
 
     def _on_apply_roofs(self):
         if self._roof_shift is not None:
+            target_tids = self.get_target_tile_ids()
+            if not target_tids:
+                QMessageBox.warning(
+                    self, "No Tiles Selected",
+                    "Please select at least one tile to apply the ground control shift."
+                )
+                return
+
             dx, dy, dz = self._roof_shift
             mag = float(np.sqrt(dx*dx + dy*dy + dz*dz))
+            n = len(target_tids)
+            scope_lbl = self._get_scope_display_label()
+            tiles_preview = ", ".join(target_tids[:6]) + (f" … (+{n - 6} more)" if n > 6 else "")
+
             reply = QMessageBox.question(
-                self, "Apply XYZ Shift",
-                f"Apply the 3-D shift to all points in the current tile?\n\n"
+                self, "Apply XYZ Shift to Tiles",
+                f"Apply the 3-D ground control shift to {n} tile(s) [{scope_lbl}]?\n\n"
                 f"  ΔX = {dx:+.3f} m\n"
                 f"  ΔY = {dy:+.3f} m\n"
                 f"  ΔZ = {dz:+.3f} m\n"
                 f"  |Shift| = {mag:.3f} m\n\n"
-                f"This will translate every point by (ΔX, ΔY, ΔZ).",
+                f"Target Tiles ({n}):\n"
+                f"  {tiles_preview}\n\n"
+                f"This will translate every point by (ΔX, ΔY, ΔZ) in the LAS files on disk.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
             if reply == QMessageBox.Yes:
-                self.shift_applied.emit(dx, dy, dz)
+                self.shift_applied.emit(dx, dy, dz, target_tids)
 
     # ── Visual check navigation ──────────────────────────────────────
 
@@ -1975,8 +3535,6 @@ class GroundControlDialog(QDialog):
                 self._vis_use_chk.setChecked(is_used)
                 self._vis_use_chk.blockSignals(False)
         else:
-            if hasattr(self, "_vis_use_chk"):
-                self._vis_use_chk.setVisible(False)
             cx = item.get("centroid_x", 0)
             cy = item.get("centroid_y", 0)
             dx = item.get("dx")
@@ -1986,9 +3544,24 @@ class GroundControlDialog(QDialog):
                 shift_str = f"Δ=({dx:+.2f}, {dy:+.2f}, {dz_val:+.2f}) m"
             else:
                 shift_str = "N/A"
+            is_valid = (dx is not None)
+            is_used = item.get("used", True) and is_valid
+            status_tag = " [ACTIVE]" if is_used else " [DISMISSED / EXCLUDED]"
             self._vis_label.setText(
-                f"[{self._vis_index + 1}/{n}]  {name}  @ ({cx:.2f}, {cy:.2f})  {shift_str}"
+                f"[{self._vis_index + 1}/{n}]  {name}  @ ({cx:.2f}, {cy:.2f})  {shift_str}{status_tag}"
             )
+            if hasattr(self, "_vis_use_chk"):
+                self._vis_use_chk.setVisible(True)
+                self._vis_use_chk.blockSignals(True)
+                self._vis_use_chk.setEnabled(is_valid)
+                self._vis_use_chk.setChecked(is_used)
+                self._vis_use_chk.blockSignals(False)
+            if hasattr(self, "_roof_inspector") and item:
+                self._roof_inspector.load_patch(item)
+            if hasattr(self, "_roof_table") and self._vis_index < self._roof_table.rowCount():
+                self._roof_table.blockSignals(True)
+                self._roof_table.selectRow(self._vis_index)
+                self._roof_table.blockSignals(False)
 
     def _on_vis_prev(self):
         if self._vis_index > 0:

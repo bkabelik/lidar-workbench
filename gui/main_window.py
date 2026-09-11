@@ -1399,6 +1399,7 @@ class MainWindow(QMainWindow):
         dlg = GroundControlDialog(
             {}, parent=self, data_epsg=data_epsg,
             tile_ids=tile_ids,
+            current_tile_id=self._editor.tile_id,
             tile_manager=self._tm,
             database=self._db,
         )
@@ -1416,42 +1417,89 @@ class MainWindow(QMainWindow):
         )
         dlg.show()
 
-    def _apply_ground_control_shift(self, dx: float, dy: float, dz: float) -> None:
-        """Apply an XYZ shift to the current tile based on ground control results."""
-        if self._editor.tile_id is None:
+    def _apply_ground_control_shift(
+        self, dx: float, dy: float, dz: float, tile_ids: Optional[list] = None
+    ) -> None:
+        """Apply an XYZ shift to the specified tile(s) based on ground control results."""
+        if not tile_ids:
+            tile_ids = [self._editor.tile_id] if self._editor.tile_id else []
+
+        if not tile_ids:
+            QMessageBox.warning(self, "No Tiles", "No tiles specified to apply ground control shift.")
             return
 
-        data = self._tm.load_tile_points_full(self._editor.tile_id)
-        if data is None:
-            return
+        n_tiles = len(tile_ids)
+        progress = None
+        if n_tiles > 1:
+            from PySide6.QtWidgets import QProgressDialog, QWidget
+            parent = self if isinstance(self, QWidget) else None
+            progress = QProgressDialog(
+                f"Applying ground control shift to {n_tiles} tile(s)…",
+                "Cancel", 0, n_tiles, parent
+            )
+            progress.setWindowTitle("Applying Ground Control Shift")
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(300)
+            progress.show()
 
-        # Apply XYZ shift
-        data["x"] = data["x"] + dx
-        data["y"] = data["y"] + dy
-        data["z"] = data["z"] + dz
-
-        tile_id = self._editor.tile_id
-        if not self._write_tile_data_to_las(tile_id, data):
-            QMessageBox.critical(self, "Shift Failed", "Failed to write tile LAS file.")
-            return
+        applied_count = 0
+        failed_tiles = []
+        mag = float(np.sqrt(dx*dx + dy*dy + dz*dz))
 
         try:
-            self._editor.open_tile(tile_id)
-            self._multi_load_for_edit(data)
-            self._tile_list_widget.update_tile_status(tile_id, TileStatus.EDITED)
-            self._mark_project_dirty()
-            self._regenerate_dtm()
+            for idx, tid in enumerate(tile_ids):
+                if progress:
+                    progress.setValue(idx)
+                    progress.setLabelText(f"Shifting tile {idx + 1}/{n_tiles}: {tid}…")
+                    QApplication.processEvents()
+                    if progress.wasCanceled():
+                        break
+
+                data = self._tm.load_tile_points_full(tid)
+                if data is None:
+                    failed_tiles.append(tid)
+                    continue
+
+                # Apply XYZ shift
+                data["x"] = data["x"] + dx
+                data["y"] = data["y"] + dy
+                data["z"] = data["z"] + dz
+
+                if not self._write_tile_data_to_las(tid, data):
+                    failed_tiles.append(tid)
+                    continue
+
+                applied_count += 1
+                self._tile_list_widget.update_tile_status(tid, TileStatus.EDITED)
+
+                # If this is the currently open tile in editor, refresh active 3D view
+                if tid == self._editor.tile_id:
+                    self._editor.open_tile(tid)
+                    self._multi_load_for_edit(data)
+
+            if progress:
+                progress.setValue(n_tiles)
+
+            if applied_count > 0:
+                self._mark_project_dirty()
+                self._regenerate_dtm()
+
             if dx == 0.0 and dy == 0.0:
-                self.set_status(
-                    f"Ground control Z shift applied: {dz:+.3f} m",
-                    timeout=8000,
-                )
+                msg = f"Ground control Z shift ({dz:+.3f} m) applied to {applied_count} tile(s)."
             else:
-                mag = float(np.sqrt(dx*dx + dy*dy + dz*dz))
-                self.set_status(
-                    f"Ground control XYZ shift applied: "
-                    f"({dx:+.3f}, {dy:+.3f}, {dz:+.3f}) m, |Shift|={mag:.3f} m",
-                    timeout=8000,
+                msg = (
+                    f"Ground control XYZ shift applied to {applied_count} tile(s): "
+                    f"({dx:+.3f}, {dy:+.3f}, {dz:+.3f}) m, |Shift|={mag:.3f} m"
+                )
+
+            self.set_status(msg, timeout=8000)
+
+            if failed_tiles:
+                QMessageBox.warning(
+                    self, "Partial Shift",
+                    f"Ground control shift was applied to {applied_count} tile(s).\n\n"
+                    f"Failed to update {len(failed_tiles)} tile(s):\n"
+                    f"{', '.join(failed_tiles[:10])}"
                 )
         except Exception as exc:
             logger.exception("Failed to apply ground control shift")
