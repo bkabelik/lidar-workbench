@@ -222,7 +222,7 @@ class TestStripAdjustment(unittest.TestCase):
         """Test StripAdjustmentDialog initialization and table population."""
         dlg = StripAdjustmentDialog(tile_manager=None, database=None, project_dir=".")
         self.assertEqual(dlg._strip_table.columnCount(), 8)
-        self.assertEqual(dlg._results_table.columnCount(), 7)
+        self.assertEqual(dlg._results_table.columnCount(), 8)
         self.assertTrue(dlg._step1_chk.isChecked())
         self.assertTrue(dlg._step2_chk.isChecked())
         self.assertFalse(dlg._step3_chk.isChecked())

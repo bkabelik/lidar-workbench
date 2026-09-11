@@ -269,8 +269,19 @@ class _StripAdjustmentWorker(QThread):
                 ca = corrections[ts.strip_a]
                 cb = corrections[ts.strip_b]
 
-                pa_adj = ts.point_a + np.array([ca.dx, ca.dy, ca.dz])
-                cb_adj = ts.centroid_b + np.array([cb.dx, cb.dy, cb.dz])
+                pa_adj = ts.point_a.copy()
+                if ca.drift_nodes and len(ca.drift_nodes) > 0:
+                    kt_a = np.array([n[0] for n in ca.drift_nodes])
+                    kz_a = np.array([n[3] for n in ca.drift_nodes])
+                    pa_adj[2] += float(np.interp(ts.time_a, kt_a, kz_a))
+                pa_adj += np.array([ca.dx, ca.dy, ca.dz])
+
+                cb_adj = ts.centroid_b.copy()
+                if cb.drift_nodes and len(cb.drift_nodes) > 0:
+                    kt_b = np.array([n[0] for n in cb.drift_nodes])
+                    kz_b = np.array([n[3] for n in cb.drift_nodes])
+                    cb_adj[2] += float(np.interp(ts.time_b, kt_b, kz_b))
+                cb_adj += np.array([cb.dx, cb.dy, cb.dz])
 
                 res_adj = float(np.dot(pa_adj - cb_adj, ts.normal_b))
                 final_residuals.append(res_adj)
@@ -430,9 +441,10 @@ class StripAdjustmentDialog(QDialog):
         diag_layout.addWidget(self._diag_label)
 
         self._results_table = QTableWidget()
-        self._results_table.setColumnCount(7)
+        self._results_table.setColumnCount(8)
         self._results_table.setHorizontalHeaderLabels([
-            "Strip ID", "ΔX (m)", "ΔY (m)", "ΔZ (m)", "ΔRoll (°)", "ΔPitch (°)", "ΔYaw (°)"
+            "Strip ID", "ΔX (m) [Step 1]", "ΔY (m) [Step 1]", "ΔZ (m) [Step 1]",
+            "ΔRoll (°) [Step 2]", "ΔPitch (°) [Step 2]", "ΔYaw (°) [Step 2]", "Trajectory Drift [Step 3]"
         ])
         self._results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -553,34 +565,44 @@ class StripAdjustmentDialog(QDialog):
             except Exception as exc:
                 logger.warning("Could not query strip info from database: %s", exc)
 
-        # 2. GPS bounds sampling: inspect first matching tile per strip
-        for sid, meta in self._strip_meta.items():
-            if meta["t_min"] != float("inf"):
-                continue
-            for tid in sorted(list(meta["tiles"])):
-                tile_path = self._tm.tile_las_path(tid) if self._tm else None
-                if not tile_path or not os.path.exists(tile_path):
-                    direct = Path(self._project_dir) / "tiles" / f"{tid}.las"
-                    if direct.is_file():
-                        tile_path = direct
-                    else:
+        # 2. GPS bounds discovery: fast start/end sampling across all active tiles
+        for tid in target_tids:
+            tile_path = self._tm.tile_las_path(tid) if self._tm else None
+            if not tile_path or not os.path.exists(tile_path):
+                direct = Path(self._project_dir) / "tiles" / f"{tid}.las"
+                if direct.is_file():
+                    tile_path = direct
+                else:
+                    continue
+
+            try:
+                with laspy.open(tile_path) as r:
+                    n = r.header.point_count
+                    if n == 0:
                         continue
-                try:
-                    with laspy.open(tile_path) as r:
-                        if r.header.point_count == 0:
-                            continue
-                        for chunk in r.chunk_iterator(500000):
-                            mask = chunk.point_source_id == sid
-                            if np.any(mask):
-                                gt = chunk.gps_time[mask]
-                                if len(gt) and gt.max() > 0:
-                                    meta["t_min"] = min(meta["t_min"], float(gt.min()))
-                                    meta["t_max"] = max(meta["t_max"], float(gt.max()))
-                                    break
-                except Exception:
-                    pass
-                if meta["t_min"] != float("inf"):
-                    break
+                    k = min(30000, n)
+                    pts_1 = r.read_points(k)
+                    pts_2 = None
+                    if n > k:
+                        r.seek(n - k)
+                        pts_2 = r.read_points(k)
+
+                    for pts in ([pts_1, pts_2] if pts_2 is not None else [pts_1]):
+                        sids = np.asarray(pts.point_source_id)
+                        gt = np.asarray(pts.gps_time)
+                        for sid in np.unique(sids):
+                            sid_int = int(sid)
+                            if sid_int not in self._strip_meta:
+                                continue
+                            sub_gt = gt[sids == sid]
+                            valid = sub_gt[sub_gt > 0]
+                            if len(valid):
+                                cur_min = self._strip_meta[sid_int]["t_min"]
+                                cur_max = self._strip_meta[sid_int]["t_max"]
+                                self._strip_meta[sid_int]["t_min"] = min(cur_min, float(valid.min()))
+                                self._strip_meta[sid_int]["t_max"] = max(cur_max, float(valid.max()))
+            except Exception:
+                pass
 
         # 3. Fallback path (e.g. if DB is empty or missing flightline metadata)
         if not self._strip_meta:
@@ -654,9 +676,11 @@ class StripAdjustmentDialog(QDialog):
             traj = self._trajectories.get(sid)
 
             if t_max > 0 and t_min != float("inf"):
-                t_span_str = f"{t_min:.1f} – {t_max:.1f}"
+                dur = t_max - t_min
+                t_span_str = f"{t_min:.1f} – {t_max:.1f} ({dur:.1f}s)"
             elif traj is not None:
-                t_span_str = f"{traj.t_min:.1f} – {traj.t_max:.1f} (traj)"
+                dur = traj.t_max - traj.t_min
+                t_span_str = f"{traj.t_min:.1f} – {traj.t_max:.1f} ({dur:.1f}s traj)"
             else:
                 t_span_str = "N/A"
 
@@ -882,6 +906,17 @@ class StripAdjustmentDialog(QDialog):
             self._results_table.setItem(row, 4, QTableWidgetItem(f"{c.droll:+.4f}"))
             self._results_table.setItem(row, 5, QTableWidgetItem(f"{c.dpitch:+.4f}"))
             self._results_table.setItem(row, 6, QTableWidgetItem(f"{c.dyaw:+.4f}"))
+
+            if sid == ref_id:
+                drift_str = "0.0 mm (Fixed Datum)"
+            elif c.drift_nodes and len(c.drift_nodes) > 0:
+                dzs = [n[3] * 1000.0 for n in c.drift_nodes]
+                drift_str = f"{len(c.drift_nodes)} knots [{min(dzs):+.1f}, {max(dzs):+.1f}] mm"
+            elif self._step3_chk.isChecked():
+                drift_str = "0.0 mm (No drift detected)"
+            else:
+                drift_str = "Disabled"
+            self._results_table.setItem(row, 7, QTableWidgetItem(drift_str))
 
     # ── Apply to Project Tiles ────────────────────────────────────────
 
