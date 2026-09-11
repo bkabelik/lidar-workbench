@@ -480,6 +480,8 @@ class LayerGroup:
                     "label_font_size": c.label_font_size,
                     "label_color": c.label_color,
                 })
+            elif isinstance(c, OSMBasemapLayer):
+                items.append(c.to_dict())
         return {
             "type": "group",
             "name": self.name,
@@ -496,6 +498,8 @@ class LayerGroup:
             itype = item.get("type")
             if itype == "group":
                 group.add_layer(cls.from_dict(item))
+            elif itype == "basemap_osm":
+                group.add_layer(OSMBasemapLayer.from_dict(item))
             elif itype == "raster":
                 path = item.get("path", "")
                 if Path(path).exists():
@@ -519,6 +523,48 @@ class LayerGroup:
                     vl.label_color = tuple(item.get("label_color", (255, 255, 255)))
                     group.add_layer(vl)
         return group
+
+
+class OSMBasemapLayer:
+    """OpenStreetMap basemap layer streamed from OSM Slippy Map tiles."""
+
+    def __init__(
+        self,
+        name: str = "OpenStreetMap",
+        crs: str = "EPSG:25833",
+        visible: bool = False,
+        opacity: float = 0.75,
+    ):
+        self.name = name
+        self.crs = crs
+        self.visible = visible
+        self.opacity = opacity
+        self.bounds = None
+
+    @property
+    def file_path(self) -> Path:
+        return Path(f"osm://{self.name.lower()}")
+
+    def close(self) -> None:
+        pass
+
+    def to_dict(self) -> dict:
+        return {
+            "type": "basemap_osm",
+            "name": self.name,
+            "crs": self.crs,
+            "visible": self.visible,
+            "opacity": self.opacity,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> OSMBasemapLayer:
+        return cls(
+            name=data.get("name", "OpenStreetMap"),
+            crs=data.get("crs", "EPSG:25833"),
+            visible=data.get("visible", False),
+            opacity=data.get("opacity", 0.75),
+        )
 
 
 def save_layer_workspace(groups: List[LayerGroup], file_path: Path | str) -> None:

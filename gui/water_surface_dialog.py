@@ -18,7 +18,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from PySide6.QtCore import Qt, Signal, QPointF, QRectF
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QMouseEvent, QPainter, QPainterPath, QPen, QWheelEvent
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -34,13 +34,16 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSlider,
     QSpinBox,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
+import pyqtgraph as pg
 
+from .osm_basemap import OSMBasemapWorker
 from ..centerline_wsm import (
     RiverCenterline,
     clip_polyline_to_bbox,
@@ -556,6 +559,503 @@ class _StationRibbon(QWidget):
             self.station_clicked.emit(idx)
 
 
+class _WSM2DMapView(QWidget):
+    """
+    2D Plan View map showing:
+    - Decimated channel point cloud scatter for quick verification
+    - OpenStreetMap background tiles (optional toggle)
+    - River centerline polyline
+    - Cross-section cut lines (cyan = auto, green = locked anchor, orange = current section)
+    - Click on any cross-section to jump directly to it
+    - Click and drag a line across the channel to insert a new cross-section
+    """
+
+    section_clicked = Signal(int)
+    section_line_drawn = Signal(tuple, tuple)  # ((start_x, start_y), (end_x, end_y))
+
+    def __init__(
+        self,
+        data_epsg: Optional[int] = None,
+        parent: Optional[QWidget] = None,
+        centerline: Optional[RiverCenterline] = None,
+        crs_epsg: Optional[int] = None,
+    ):
+        super().__init__(parent)
+        self._data_epsg = data_epsg if data_epsg is not None else crs_epsg
+        self._centerline: Optional[RiverCenterline] = centerline
+        self._stations: np.ndarray = np.array([])
+        self._locked_mask: np.ndarray = np.array([])
+        self._corridor_width: float = 40.0
+        self._curr_idx: int = 0
+        self._section_endpoints: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+
+        self._raw_xs: Optional[np.ndarray] = None
+        self._raw_ys: Optional[np.ndarray] = None
+        self._raw_zs: Optional[np.ndarray] = None
+        self._raw_st: Optional[np.ndarray] = None
+        self._raw_cls: Optional[np.ndarray] = None
+        self._raw_intensities: Optional[np.ndarray] = None
+
+        self._is_drawing: bool = False
+        self._drag_start_world: Optional[Tuple[float, float]] = None
+        self._click_start_pos: Optional[QPointF] = None
+
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        # Toolbar row
+        tb_layout = QHBoxLayout()
+        self._mode_select_btn = QRadioButton("🎯 Select")
+        self._mode_select_btn.setChecked(True)
+        self._mode_select_btn.setToolTip("Click on any cross-section line on the map to jump directly to it")
+        tb_layout.addWidget(self._mode_select_btn)
+
+        self._mode_draw_btn = QRadioButton("✏ Draw Section")
+        self._mode_draw_btn.setToolTip("Click and drag a line across the river channel to insert a new cross-section at that location")
+        tb_layout.addWidget(self._mode_draw_btn)
+
+        self._raster_combo = QComboBox()
+        self._raster_combo.addItem("📷 Intensity (0.5m)", "intensity_0.5")
+        self._raster_combo.addItem("📷 Intensity (0.25m)", "intensity_0.25")
+        self._raster_combo.addItem("🏔 Elevation (0.5m)", "elevation_0.5")
+        self._raster_combo.addItem("✦ Points Only", "points")
+        self._raster_combo.addItem("🚫 None", "none")
+        self._raster_combo.setToolTip(
+            "Channel map display layer:\n"
+            "• Intensity (0.5m / 0.25m): high-contrast shoreline raster clearly showing channel extent\n"
+            "• Elevation: terrain color relief map\n"
+            "• Points: decimated raw point scatter"
+        )
+        self._raster_combo.currentIndexChanged.connect(self._on_raster_mode_changed)
+        tb_layout.addWidget(QLabel("Layer:"))
+        tb_layout.addWidget(self._raster_combo)
+
+        self._osm_cb = QCheckBox("🗺 OSM Map")
+        self._osm_cb.setChecked(self._data_epsg is not None)
+        self._osm_cb.setToolTip("Toggle OpenStreetMap tiles background in project CRS")
+        self._osm_cb.toggled.connect(self._on_osm_toggled)
+        tb_layout.addWidget(self._osm_cb)
+
+        self._fit_btn = QPushButton("↺ Fit")
+        self._fit_btn.setToolTip("Reset 2D map view to channel extents")
+        self._fit_btn.clicked.connect(self._fit_extent)
+        tb_layout.addWidget(self._fit_btn)
+
+        tb_layout.addStretch()
+        layout.addLayout(tb_layout)
+
+        # 2D Plot Widget
+        self._plot = pg.PlotWidget()
+        self._plot.setAspectLocked(True)
+        self._plot.setBackground("#14181f")
+        self._plot.showGrid(x=True, y=True, alpha=0.2)
+        self._plot.setLabel("bottom", "Easting (m)")
+        self._plot.setLabel("left", "Northing (m)")
+
+        # Graphics items hierarchy
+        self._osm_item = pg.ImageItem()
+        self._osm_item.setZValue(-10)
+        self._plot.addItem(self._osm_item)
+
+        self._raster_item = pg.ImageItem()
+        self._raster_item.setZValue(-5)
+        self._plot.addItem(self._raster_item)
+
+        self._scatter = pg.ScatterPlotItem(size=3, pen=None)
+        self._scatter.setZValue(0)
+        self._plot.addItem(self._scatter)
+
+        self._centerline_curve = pg.PlotCurveItem(pen=pg.mkPen('#388bfd', width=2.5))
+        self._centerline_curve.setZValue(10)
+        self._plot.addItem(self._centerline_curve)
+
+        self._sections_curve_normal = pg.PlotCurveItem(pen=pg.mkPen('#58a6ff', width=1.0), connect='pairs')
+        self._sections_curve_normal.setZValue(20)
+        self._plot.addItem(self._sections_curve_normal)
+
+        self._sections_curve_locked = pg.PlotCurveItem(pen=pg.mkPen('#3fb950', width=2.2), connect='pairs')
+        self._sections_curve_locked.setZValue(21)
+        self._plot.addItem(self._sections_curve_locked)
+
+        self._current_curve = pg.PlotCurveItem(pen=pg.mkPen('#f0883e', width=3.5))
+        self._current_curve.setZValue(30)
+        self._plot.addItem(self._current_curve)
+
+        self._drag_preview = pg.PlotCurveItem(pen=pg.mkPen('#f1e05a', width=2.0, style=Qt.DashLine))
+        self._drag_preview.setZValue(40)
+        self._plot.addItem(self._drag_preview)
+
+        layout.addWidget(self._plot)
+
+        # OSM Worker
+        self._osm_worker = OSMBasemapWorker(self)
+        self._osm_worker.mosaic_ready.connect(self._on_osm_mosaic_ready)
+        self._plot.plotItem.vb.sigRangeChanged.connect(self._on_view_range_changed)
+
+        self._plot.viewport().installEventFilter(self)
+
+    def set_data_epsg(self, epsg: int) -> None:
+        self._data_epsg = epsg
+        if self._osm_cb.isChecked():
+            self._on_view_range_changed()
+
+    def _on_raster_mode_changed(self) -> None:
+        self._rebuild_channel_raster()
+
+    def _rebuild_channel_raster(self) -> None:
+        """Compute high-contrast 2D raster (intensity or elevation) across the channel corridor."""
+        if self._raw_xs is None or len(self._raw_xs) == 0:
+            self._raster_item.hide()
+            return
+
+        mode = self._raster_combo.currentData()
+        if mode in ("none", "points"):
+            self._raster_item.hide()
+            if mode == "points":
+                self._scatter.show()
+                self._scatter.setSize(3)
+            else:
+                self._scatter.hide()
+            return
+
+        if mode == "intensity_0.25":
+            res = 0.25
+            attr = "intensity"
+        elif mode == "elevation_0.5":
+            res = 0.5
+            attr = "elevation"
+        else:  # intensity_0.5 (default)
+            res = 0.5
+            attr = "intensity"
+
+        xs = self._raw_xs
+        ys = self._raw_ys
+        min_x, max_x = float(np.min(xs)), float(np.max(xs))
+        min_y, max_y = float(np.min(ys)), float(np.max(ys))
+
+        if (max_x - min_x) < 1.0 or (max_y - min_y) < 1.0:
+            self._raster_item.hide()
+            return
+
+        cols = max(2, int(np.ceil((max_x - min_x) / res)) + 1)
+        rows = max(2, int(np.ceil((max_y - min_y) / res)) + 1)
+
+        # Clamp memory if bounds are abnormally large
+        if cols * rows > 36_000_000:
+            res = max(res, float(np.sqrt((max_x - min_x) * (max_y - min_y) / 18_000_000)))
+            cols = max(2, int(np.ceil((max_x - min_x) / res)) + 1)
+            rows = max(2, int(np.ceil((max_y - min_y) / res)) + 1)
+
+        has_intens = self._raw_intensities is not None and len(self._raw_intensities) > 0
+        if attr == "intensity" and has_intens:
+            vals = self._raw_intensities.astype(np.float32)
+        else:
+            vals = self._raw_zs.astype(np.float32)
+            attr = "elevation"
+
+        col_idx = np.clip(((xs - min_x) / res).astype(np.int32), 0, cols - 1)
+        row_idx = np.clip(((ys - min_y) / res).astype(np.int32), 0, rows - 1)
+        flat_idx = row_idx * cols + col_idx
+
+        counts = np.bincount(flat_idx, minlength=rows * cols)
+        sums = np.bincount(flat_idx, weights=vals, minlength=rows * cols)
+
+        valid = counts > 0
+        grid = np.zeros(rows * cols, dtype=np.float32)
+        grid[valid] = sums[valid] / counts[valid]
+        grid = grid.reshape((rows, cols))
+        valid_mask = valid.reshape((rows, cols))
+
+        if not np.any(valid_mask):
+            self._raster_item.hide()
+            return
+
+        valid_vals = grid[valid_mask]
+        p1, p99 = np.percentile(valid_vals, [1, 99])
+        if p99 <= p1:
+            p99 = p1 + 1.0
+
+        norm = np.clip((grid - p1) / (p99 - p1), 0.0, 1.0)
+        rgba = np.zeros((rows, cols, 4), dtype=np.uint8)
+
+        if attr == "intensity":
+            gray = (norm * 255).astype(np.uint8)
+            rgba[:, :, 0] = gray
+            rgba[:, :, 1] = gray
+            rgba[:, :, 2] = gray
+            rgba[valid_mask, 3] = 245
+        else:
+            t = norm
+            cr = np.clip((t - 0.5) * 4, 0, 1) + np.clip((t - 0.75) * 4, 0, 1)
+            cg = np.clip(t * 4, 0, 1) * (t <= 0.5) + np.clip((1 - t) * 4, 0, 1) * (t > 0.5)
+            cb = np.clip((0.5 - t) * 4, 0, 1)
+            rgba[:, :, 0] = (cr * 255).astype(np.uint8)
+            rgba[:, :, 1] = (cg * 255).astype(np.uint8)
+            rgba[:, :, 2] = (cb * 255).astype(np.uint8)
+            rgba[valid_mask, 3] = 240
+
+        self._raster_item.setImage(rgba.transpose(1, 0, 2), autoLevels=False)
+        self._raster_item.setRect(QRectF(min_x, min_y, cols * res, rows * res))
+        self._raster_item.show()
+
+        # Hide point scatter to avoid obscuring the sharp raster
+        self._scatter.hide()
+
+    def set_channel_points(
+        self,
+        xs: np.ndarray,
+        ys: Optional[np.ndarray] = None,
+        zs: Optional[np.ndarray] = None,
+        sensor_types: Optional[np.ndarray] = None,
+        classes: Optional[np.ndarray] = None,
+        intensities: Optional[np.ndarray] = None,
+    ) -> None:
+        if ys is None and isinstance(xs, np.ndarray) and xs.ndim == 2 and xs.shape[1] >= 3:
+            pts = xs
+            xs = pts[:, 0]
+            ys = pts[:, 1]
+            zs = pts[:, 2]
+
+        self._raw_xs = np.asarray(xs, dtype=np.float64) if xs is not None else None
+        self._raw_ys = np.asarray(ys, dtype=np.float64) if ys is not None else None
+        self._raw_zs = np.asarray(zs, dtype=np.float64) if zs is not None else None
+        self._raw_st = sensor_types
+        self._raw_cls = classes
+        self._raw_intensities = intensities
+
+        n = len(xs) if xs is not None else 0
+        if n == 0:
+            self._scatter.setData([], [])
+            self._raster_item.hide()
+            return
+
+        # Prepare subsampled scatter points for "Points Only" mode
+        stride = max(1, n // 25000)
+        x_sub = xs[::stride]
+        y_sub = ys[::stride]
+        z_sub = zs[::stride]
+        st_sub = sensor_types[::stride] if sensor_types is not None else None
+        cls_sub = classes[::stride] if classes is not None else None
+
+        n_sub = len(x_sub)
+        z_min, z_max = float(np.min(z_sub)), float(np.max(z_sub))
+        z_range = max(0.1, z_max - z_min)
+
+        brushes = []
+        has_bathy = st_sub is not None and np.any(st_sub == 2)
+        if has_bathy:
+            for i in range(n_sub):
+                st = st_sub[i] if st_sub is not None else 0
+                c = cls_sub[i] if cls_sub is not None else 0
+                if st == 2:
+                    brushes.append(pg.mkBrush(0, 220, 255, 200))
+                elif c == 9:
+                    brushes.append(pg.mkBrush(30, 144, 255, 200))
+                elif st == 1:
+                    brushes.append(pg.mkBrush(110, 180, 100, 140))
+                else:
+                    norm = (z_sub[i] - z_min) / z_range
+                    brushes.append(pg.mkBrush(int(80 + 120 * norm), int(120 + 80 * norm), 180, 150))
+        else:
+            for i in range(n_sub):
+                norm = np.clip((z_sub[i] - z_min) / z_range, 0.0, 1.0)
+                r = int(255 * (0.2 + 0.8 * norm))
+                g = int(255 * (0.3 + 0.6 * (1.0 - abs(norm - 0.5) * 2)))
+                b = int(255 * (0.8 - 0.6 * norm))
+                brushes.append(pg.mkBrush(r, g, b, 160))
+
+        self._scatter.setData(x=x_sub, y=y_sub, brush=brushes, size=3)
+
+        # Build high-contrast 2D channel raster
+        self._rebuild_channel_raster()
+        self._fit_extent()
+
+    def set_centerline(self, centerline: Optional[RiverCenterline]) -> None:
+        self._centerline = centerline
+        if centerline is not None and len(centerline.vertices) >= 2:
+            total_len = centerline.total_length
+            num_pts = max(50, int(total_len / 5.0))
+            s_samples = np.linspace(0.0, total_len, num_pts)
+            pts = [centerline.evaluate(s)[0] for s in s_samples]
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            self._centerline_curve.setData(xs, ys)
+            self._fit_extent()
+        else:
+            self._centerline_curve.setData([], [])
+
+    def set_sections(
+        self,
+        centerline: Optional[RiverCenterline],
+        stations: np.ndarray,
+        locked_mask: np.ndarray,
+        corridor_width: float,
+    ) -> None:
+        self._centerline = centerline
+        self._stations = stations
+        self._locked_mask = locked_mask
+        self._corridor_width = corridor_width
+        self._section_endpoints = []
+
+        if centerline is None or len(stations) == 0:
+            self._sections_curve_normal.setData([], [])
+            self._sections_curve_locked.setData([], [])
+            self._current_curve.setData([], [])
+            return
+
+        half_w = corridor_width * 0.5
+        x_norm, y_norm = [], []
+        x_lock, y_lock = [], []
+
+        for idx, s in enumerate(stations):
+            pos, tangent, normal = centerline.evaluate(float(s))
+            p_left = (pos[0] - normal[0] * half_w, pos[1] - normal[1] * half_w)
+            p_right = (pos[0] + normal[0] * half_w, pos[1] + normal[1] * half_w)
+            self._section_endpoints.append((p_left, p_right))
+
+            if idx < len(locked_mask) and locked_mask[idx]:
+                x_lock.extend([p_left[0], p_right[0]])
+                y_lock.extend([p_left[1], p_right[1]])
+            else:
+                x_norm.extend([p_left[0], p_right[0]])
+                y_norm.extend([p_left[1], p_right[1]])
+
+        self._sections_curve_normal.setData(np.array(x_norm), np.array(y_norm))
+        self._sections_curve_locked.setData(np.array(x_lock), np.array(y_lock))
+        self.set_current_section(self._curr_idx)
+
+    def set_current_section(self, curr_idx: int) -> None:
+        self._curr_idx = curr_idx
+        if 0 <= curr_idx < len(self._section_endpoints):
+            p1, p2 = self._section_endpoints[curr_idx]
+            self._current_curve.setData([p1[0], p2[0]], [p1[1], p2[1]])
+        else:
+            self._current_curve.setData([], [])
+
+    def _fit_extent(self) -> None:
+        if self._centerline is not None and len(self._centerline.vertices) >= 2:
+            vx = [v[0] for v in self._centerline.vertices]
+            vy = [v[1] for v in self._centerline.vertices]
+            minx, maxx = min(vx), max(vx)
+            miny, maxy = min(vy), max(vy)
+            pad = max(25.0, self._corridor_width)
+            self._plot.setRange(QRectF(minx - pad, miny - pad, (maxx - minx) + 2 * pad, (maxy - miny) + 2 * pad), padding=0.05)
+        elif self._scatter.data is not None and len(self._scatter.data) > 0:
+            x_data = self._scatter.data['x']
+            y_data = self._scatter.data['y']
+            if len(x_data) > 0:
+                minx, maxx = float(np.min(x_data)), float(np.max(x_data))
+                miny, maxy = float(np.min(y_data)), float(np.max(y_data))
+                self._plot.setRange(QRectF(minx, miny, maxx - minx, maxy - miny), padding=0.05)
+
+    def _on_view_range_changed(self) -> None:
+        if not self._osm_cb.isChecked() or not self._data_epsg:
+            return
+        rect = self._plot.plotItem.vb.viewRect()
+        vx0, vx1 = min(rect.left(), rect.right()), max(rect.left(), rect.right())
+        vy0, vy1 = min(rect.top(), rect.bottom()), max(rect.top(), rect.bottom())
+        if abs(vx1 - vx0) < 1.0 or abs(vy1 - vy0) < 1.0:
+            return
+        w = max(256, int(self._plot.width()))
+        h = max(256, int(self._plot.height()))
+        self._osm_worker.request_mosaic((vx0, vy0, vx1, vy1), self._data_epsg, target_size=(w, h))
+
+    def _on_osm_mosaic_ready(self, rgba: np.ndarray, bounds: Tuple[float, float, float, float]) -> None:
+        if not self._osm_cb.isChecked():
+            self._osm_item.hide()
+            return
+        minx, miny, maxx, maxy = bounds
+        rgba = rgba.copy()
+        rgba[..., 3] = (rgba[..., 3].astype(float) * 0.75).astype(np.uint8)
+        rgba_flipped = np.flipud(rgba)
+        self._osm_item.setImage(rgba_flipped.transpose(1, 0, 2), autoLevels=False)
+        self._osm_item.setRect(QRectF(minx, miny, maxx - minx, maxy - miny))
+        self._osm_item.show()
+
+    def _on_osm_toggled(self, checked: bool) -> None:
+        if not checked:
+            self._osm_item.hide()
+        else:
+            self._on_view_range_changed()
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if watched is self._plot.viewport():
+            if event.type() == QEvent.MouseButtonPress:
+                if event.button() == Qt.LeftButton:
+                    vb = self._plot.plotItem.vb
+                    scene_pos = vb.mapSceneToView(event.position())
+                    wx, wy = scene_pos.x(), scene_pos.y()
+                    if self._mode_draw_btn.isChecked():
+                        self._is_drawing = True
+                        self._drag_start_world = (wx, wy)
+                        self._drag_preview.setData([wx], [wy])
+                        self._drag_preview.show()
+                        return True
+                    else:
+                        self._click_start_pos = event.pos()
+
+            elif event.type() == QEvent.MouseMove:
+                if self._is_drawing and self._drag_start_world:
+                    vb = self._plot.plotItem.vb
+                    scene_pos = vb.mapSceneToView(event.position())
+                    wx, wy = scene_pos.x(), scene_pos.y()
+                    sx, sy = self._drag_start_world
+                    self._drag_preview.setData([sx, wx], [sy, wy])
+                    return True
+
+            elif event.type() == QEvent.MouseButtonRelease:
+                if event.button() == Qt.LeftButton:
+                    if self._is_drawing and self._drag_start_world:
+                        self._is_drawing = False
+                        self._drag_preview.setData([], [])
+                        vb = self._plot.plotItem.vb
+                        scene_pos = vb.mapSceneToView(event.position())
+                        wx, wy = scene_pos.x(), scene_pos.y()
+                        sx, sy = self._drag_start_world
+                        dist = np.hypot(wx - sx, wy - sy)
+                        if dist > 2.0:
+                            self.section_line_drawn.emit((sx, sy), (wx, wy))
+                        return True
+                    elif self._mode_select_btn.isChecked() and self._click_start_pos:
+                        delta = event.pos() - self._click_start_pos
+                        if delta.manhattanLength() < 6:
+                            vb = self._plot.plotItem.vb
+                            scene_pos = vb.mapSceneToView(event.position())
+                            self._handle_click_select(scene_pos.x(), scene_pos.y())
+                        self._click_start_pos = None
+
+        return super().eventFilter(watched, event)
+
+    def _handle_click_select(self, x: float, y: float) -> None:
+        if not self._section_endpoints:
+            return
+        min_d = float("inf")
+        best_idx = -1
+        p = np.array([x, y])
+        for idx, (p1, p2) in enumerate(self._section_endpoints):
+            a = np.array(p1)
+            b = np.array(p2)
+            ab = b - a
+            ab_sq = np.dot(ab, ab)
+            if ab_sq < 1e-6:
+                d = np.linalg.norm(p - a)
+            else:
+                t = np.clip(np.dot(p - a, ab) / ab_sq, 0.0, 1.0)
+                proj = a + t * ab
+                d = np.linalg.norm(p - proj)
+            if d < min_d:
+                min_d = d
+                best_idx = idx
+
+        tol = max(25.0, self._corridor_width * 0.6)
+        if min_d <= tol and best_idx >= 0:
+            self.section_clicked.emit(best_idx)
+
+
 class WaterSurfaceDialog(QDialog):
     """
     Interactive River Centerline Water Surface Model Generator.
@@ -687,8 +1187,8 @@ class WaterSurfaceDialog(QDialog):
         sf.addRow(params_row)
         layout.addWidget(setup_group)
 
-        # ── 2. Interactive Cross-Section Reviewer ──
-        review_group = QGroupBox("2. Cross-Section Review & Anchor Adjustment")
+        # ── 2. Interactive Cross-Section Reviewer & 2D Plan Map ──
+        review_group = QGroupBox("2. Cross-Section Review & 2D Channel Plan Map")
         rf = QVBoxLayout(review_group)
 
         # Ribbon showing all stations
@@ -700,7 +1200,6 @@ class WaterSurfaceDialog(QDialog):
         self._canvas = _CrossSectionCanvas()
         self._canvas.water_level_changed.connect(self._on_canvas_water_level_changed)
         self._canvas.water_section_changed.connect(self._on_canvas_water_section_changed)
-        rf.addWidget(self._canvas)
 
         # Controls under canvas
         ctrl_layout = QHBoxLayout()
@@ -738,8 +1237,6 @@ class WaterSurfaceDialog(QDialog):
         self._btn_next10.clicked.connect(lambda: self._step_station(10))
         ctrl_layout.addWidget(self._btn_next10)
 
-        rf.addLayout(ctrl_layout)
-
         # Elevation edit, tilt, & lock anchor row
         edit_layout = QHBoxLayout()
         edit_layout.addWidget(QLabel("Water Elevation:"))
@@ -773,8 +1270,6 @@ class WaterSurfaceDialog(QDialog):
         self._interp_btn.clicked.connect(self._on_interpolate_anchors)
         edit_layout.addWidget(self._interp_btn)
 
-        rf.addLayout(edit_layout)
-
         # Custom section insertion & removal row
         sec_mgmt_layout = QHBoxLayout()
         self._btn_add_station = QPushButton("➕ Add Section at Station…")
@@ -796,7 +1291,27 @@ class WaterSurfaceDialog(QDialog):
         self._btn_remove_sec.clicked.connect(self._on_remove_current_section)
         sec_mgmt_layout.addWidget(self._btn_remove_sec)
 
-        rf.addLayout(sec_mgmt_layout)
+        # Vertical splitter: Top = 2D Plan Map, Bottom = 1D Cross-Section Reviewer
+        splitter = QSplitter(Qt.Vertical)
+
+        self._map_2d = _WSM2DMapView(data_epsg=self._data_epsg)
+        self._map_2d.section_clicked.connect(self._go_to_station)
+        self._map_2d.section_line_drawn.connect(self._on_2d_map_section_drawn)
+        splitter.addWidget(self._map_2d)
+
+        bottom_panel = QWidget()
+        bottom_layout = QVBoxLayout(bottom_panel)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.addWidget(self._canvas)
+        bottom_layout.addLayout(ctrl_layout)
+        bottom_layout.addLayout(edit_layout)
+        bottom_layout.addLayout(sec_mgmt_layout)
+        splitter.addWidget(bottom_panel)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([380, 360])
+        rf.addWidget(splitter)
         layout.addWidget(review_group)
 
         # ── 3. Bottom Actions ──
@@ -804,13 +1319,13 @@ class WaterSurfaceDialog(QDialog):
         self._status_label = QLabel("Ready. Load or draw a centerline to begin.")
         bottom_layout.addWidget(self._status_label)
 
-        self._load_btn = QPushButton("📂 Load Profile…")
-        self._load_btn.setToolTip("Load saved water surface cross-sections and anchors from JSON")
+        self._load_btn = QPushButton("📂 Load All Profiles…")
+        self._load_btn.setToolTip("Load all saved water surface cross-sections, anchors, and centerline from JSON")
         self._load_btn.clicked.connect(self._on_load_sections)
         bottom_layout.addWidget(self._load_btn)
 
-        self._save_btn = QPushButton("💾 Save Profile…")
-        self._save_btn.setToolTip("Save current cross-sections, anchors, and tilt adjustments to JSON")
+        self._save_btn = QPushButton("💾 Save All Profiles…")
+        self._save_btn.setToolTip("Save all cross-sections, anchors, and tilt adjustments to JSON")
         self._save_btn.setEnabled(False)
         self._save_btn.clicked.connect(self._on_save_sections)
         bottom_layout.addWidget(self._save_btn)
@@ -827,6 +1342,11 @@ class WaterSurfaceDialog(QDialog):
 
         layout.addLayout(bottom_layout)
 
+    @property
+    def _wsm_map(self) -> _WSM2DMapView:
+        """Alias to 2D Plan View map."""
+        return self._map_2d
+
     def set_centerline_polyline(self, vertices: np.ndarray):
         """Set centerline directly from polyline vertices (e.g. drawn on DTM)."""
         try:
@@ -835,6 +1355,8 @@ class WaterSurfaceDialog(QDialog):
             self._centerline_path_edit.setText(f"[Drawn Polyline: {len(vertices)} vertices, {self._centerline.total_length:.1f} m]")
             self._status_label.setText(f"Centerline loaded: {self._centerline.total_length:.1f} m. Click 'Generate Cross-Sections'.")
             self._update_bathy_reach()
+            if hasattr(self, "_map_2d") and self._map_2d is not None:
+                self._map_2d.set_centerline(self._centerline)
         except Exception as e:
             QMessageBox.critical(self, "Centerline Error", str(e))
 
@@ -854,6 +1376,8 @@ class WaterSurfaceDialog(QDialog):
             self._centerline_path_edit.setText(fn)
             self._status_label.setText(f"Loaded {len(verts)} vertices ({self._centerline.total_length:.1f} m).")
             self._update_bathy_reach()
+            if hasattr(self, "_map_2d") and self._map_2d is not None:
+                self._map_2d.set_centerline(self._centerline)
         except Exception as e:
             QMessageBox.critical(self, "Load Error", f"Could not load centerline: {e}")
 
@@ -966,6 +1490,8 @@ class WaterSurfaceDialog(QDialog):
             f"Active centerline: {selected_way['name']} ({self._centerline.total_length:.1f} m in project). Click '▶ Generate Cross-Sections'."
         )
         self._update_bathy_reach()
+        if hasattr(self, "_map_2d") and self._map_2d is not None:
+            self._map_2d.set_centerline(self._centerline)
 
     def _update_bathy_reach(self):
         """Detect bathymetric points range along centerline and configure reach trimming."""
@@ -1064,6 +1590,7 @@ class WaterSurfaceDialog(QDialog):
         self._all_zs = data["z"]
         self._all_st = data.get("sensor_type")
         self._all_cls = data.get("classification")
+        self._all_intens = data.get("intensity")
 
         if len(self._all_xs) > 100:
             order = np.argsort(self._all_xs)
@@ -1074,12 +1601,19 @@ class WaterSurfaceDialog(QDialog):
                 self._all_st = self._all_st[order]
             if self._all_cls is not None:
                 self._all_cls = self._all_cls[order]
+            if self._all_intens is not None:
+                self._all_intens = self._all_intens[order]
             self._points_sorted_x = True
         else:
             self._points_sorted_x = False
 
         self._status_label.setText(f"Loaded {len(self._all_xs):,} points along corridor.")
         self._update_bathy_reach()
+        if hasattr(self, "_map_2d") and self._map_2d is not None:
+            self._map_2d.set_channel_points(
+                self._all_xs, self._all_ys, self._all_zs, self._all_st, self._all_cls,
+                intensities=self._all_intens
+            )
         return True
 
     def _on_generate_sections(self):
@@ -1181,6 +1715,9 @@ class WaterSurfaceDialog(QDialog):
             self._locked_mask[-1] = True
 
         self._curr_idx = 0
+        if hasattr(self, "_map_2d") and self._map_2d is not None:
+            self._map_2d.set_centerline(self._centerline)
+            self._map_2d.set_sections(self._centerline, self._stations, self._locked_mask, self._corridor_width)
         self._update_current_view()
         self._save_btn.setEnabled(True)
         self._export_btn.setEnabled(True)
@@ -1252,6 +1789,8 @@ class WaterSurfaceDialog(QDialog):
         )
 
         self._ribbon.set_data(len(self._stations), self._curr_idx, self._locked_mask)
+        if hasattr(self, "_map_2d") and self._map_2d is not None:
+            self._map_2d.set_current_section(self._curr_idx)
 
     def _go_to_station(self, idx: int):
         if 0 <= idx < len(self._stations):
@@ -1295,6 +1834,8 @@ class WaterSurfaceDialog(QDialog):
         )
         self._lock_btn.setChecked(True)
         self._ribbon.set_data(len(self._stations), self._curr_idx, self._locked_mask)
+        if hasattr(self, "_map_2d") and self._map_2d is not None:
+            self._map_2d.set_sections(self._centerline, self._stations, self._locked_mask, self._corridor_width)
         self._status_label.setText(f"Reset section at {self._stations[idx]:.1f} m to level horizontal ({w_z:.3f} m).")
 
     def _on_canvas_water_level_changed(self, new_z: float):
@@ -1311,6 +1852,8 @@ class WaterSurfaceDialog(QDialog):
         self._z_spin.blockSignals(False)
         self._lock_btn.setChecked(True)
         self._ribbon.set_data(len(self._stations), self._curr_idx, self._locked_mask)
+        if hasattr(self, "_map_2d") and self._map_2d is not None:
+            self._map_2d.set_sections(self._centerline, self._stations, self._locked_mask, self._corridor_width)
 
     def _on_canvas_water_section_changed(
         self, z_center: float, z_left: float, z_right: float, left_off: float, right_off: float
@@ -1336,6 +1879,8 @@ class WaterSurfaceDialog(QDialog):
         self._lock_btn.blockSignals(False)
 
         self._ribbon.set_data(len(self._stations), self._curr_idx, self._locked_mask)
+        if hasattr(self, "_map_2d") and self._map_2d is not None:
+            self._map_2d.set_sections(self._centerline, self._stations, self._locked_mask, self._corridor_width)
 
     def _on_spin_z_changed(self, val: float):
         if len(self._stations) == 0:
@@ -1356,6 +1901,8 @@ class WaterSurfaceDialog(QDialog):
         )
         self._lock_btn.setChecked(True)
         self._ribbon.set_data(len(self._stations), self._curr_idx, self._locked_mask)
+        if hasattr(self, "_map_2d") and self._map_2d is not None:
+            self._map_2d.set_sections(self._centerline, self._stations, self._locked_mask, self._corridor_width)
 
     def _on_toggle_lock(self, checked: bool):
         if len(self._stations) == 0:
@@ -1376,6 +1923,8 @@ class WaterSurfaceDialog(QDialog):
             if checked else ""
         )
         self._ribbon.set_data(len(self._stations), self._curr_idx, self._locked_mask)
+        if hasattr(self, "_map_2d") and self._map_2d is not None:
+            self._map_2d.set_sections(self._centerline, self._stations, self._locked_mask, self._corridor_width)
 
     def _apply_interpolation(self):
         if len(self._stations) < 2:
@@ -1443,6 +1992,8 @@ class WaterSurfaceDialog(QDialog):
             self._left_offsets = np.insert(self._left_offsets, new_idx, l_off)
             self._right_offsets = np.insert(self._right_offsets, new_idx, r_off)
 
+        if hasattr(self, "_map_2d") and self._map_2d is not None:
+            self._map_2d.set_sections(self._centerline, self._stations, self._locked_mask, self._corridor_width)
         return new_idx
 
     def _on_add_station_dialog(self):
@@ -1515,6 +2066,33 @@ class WaterSurfaceDialog(QDialog):
             f"Inserted custom section from drawn map line at station {s_val:.1f} m as a Locked Anchor."
         )
 
+    def _on_2d_map_section_drawn(self, start_xy: Tuple[float, float], end_xy: Tuple[float, float]):
+        """Callback when user draws a cross-section line directly on the 2D channel map."""
+        if self._centerline is None or len(self._stations) == 0:
+            QMessageBox.information(self, "No Centerline", "Please generate initial cross-sections first.")
+            return
+
+        mx = (start_xy[0] + end_xy[0]) * 0.5
+        my = (start_xy[1] + end_xy[1]) * 0.5
+        s_val = float(self._centerline.project_point_to_station(mx, my))
+
+        pos, tangent, normal = self._centerline.evaluate(s_val)
+        sec = slice_cross_section_points(
+            self._all_xs, self._all_ys, self._all_zs,
+            center_pos=pos, normal=normal, tangent=tangent,
+            corridor_width=self._corridor_width, slice_thickness=2.0,
+            sensor_types=self._all_st, classes=self._all_cls,
+        )
+        w_z, _, _ = detect_section_water_level(sec["offset"], sec["z"], sec["sensor_type"], sec["classification"])
+        if np.isnan(w_z):
+            w_z = float(self._water_levels[self._curr_idx])
+
+        new_idx = self._insert_station_state(s_val, w_z, sec)
+        self._go_to_station(new_idx)
+        self._status_label.setText(
+            f"Inserted custom section from 2D map at station {s_val:.1f} m as a Locked Anchor."
+        )
+
     def _on_remove_current_section(self):
         if len(self._stations) <= 1:
             QMessageBox.warning(self, "Cannot Remove", "Cannot remove the only remaining section.")
@@ -1544,10 +2122,17 @@ class WaterSurfaceDialog(QDialog):
         self._apply_interpolation()
 
         self._curr_idx = new_idx
+        if hasattr(self, "_map_2d") and self._map_2d is not None:
+            self._map_2d.set_sections(self._centerline, self._stations, self._locked_mask, self._corridor_width)
         self._update_current_view()
         self._status_label.setText(
             f"Removed section at station {s_val:.1f} m. {len(self._stations)} sections remaining."
         )
+
+    def closeEvent(self, event):
+        if hasattr(self, "_map_2d") and hasattr(self._map_2d, "_osm_worker"):
+            self._map_2d._osm_worker.stop()
+        super().closeEvent(event)
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -1620,7 +2205,7 @@ class WaterSurfaceDialog(QDialog):
         default_fn = str(self._project_dir / "water_surface_profile.json")
         fn, _ = QFileDialog.getSaveFileName(
             self,
-            "Save Water Surface Profile Sections",
+            "Save All Water Surface Profile Sections",
             default_fn,
             "JSON Profile Files (*.json *.wsp.json);;All Files (*)",
         )
@@ -1645,8 +2230,8 @@ class WaterSurfaceDialog(QDialog):
             )
             self._status_label.setText(f"Saved {len(self._stations)} sections to {Path(fn).name}.")
             QMessageBox.information(
-                self, "Profile Saved",
-                f"Water surface profile saved successfully:\n{fn}\n\n"
+                self, "All Profiles Saved",
+                f"All water surface profile cross-sections saved successfully:\n{fn}\n\n"
                 f"Contains {len(self._stations)} cross-sections with water levels, anchors, tilt, and embankment offsets."
             )
         except Exception as e:
@@ -1657,7 +2242,7 @@ class WaterSurfaceDialog(QDialog):
         default_fn = str(self._project_dir / "water_surface_profile.json")
         fn, _ = QFileDialog.getOpenFileName(
             self,
-            "Load Water Surface Profile Sections",
+            "Load All Water Surface Profile Sections",
             default_fn,
             "JSON Profile Files (*.json *.wsp.json);;All Files (*)",
         )
@@ -1703,10 +2288,14 @@ class WaterSurfaceDialog(QDialog):
             self._curr_idx = 0
             self._save_btn.setEnabled(True)
             self._export_btn.setEnabled(True)
+            if hasattr(self, "_map_2d") and self._map_2d is not None:
+                self._map_2d.set_data_epsg(self._data_epsg)
+                self._map_2d.set_centerline(self._centerline)
+                self._map_2d.set_sections(self._centerline, self._stations, self._locked_mask, self._corridor_width)
             self._update_current_view()
             self._status_label.setText(f"Loaded {len(self._stations)} sections from {Path(fn).name}.")
             QMessageBox.information(
-                self, "Profile Loaded",
+                self, "All Profiles Loaded",
                 f"Loaded {len(self._stations)} cross-sections from:\n{fn}\n\n"
                 f"Corridor width: {self._corridor_width:.1f} m, Bank margin: {data['bank_margin']:.1f} m\n"
                 f"Anchors locked: {int(np.sum(self._locked_mask))} of {len(self._stations)}."

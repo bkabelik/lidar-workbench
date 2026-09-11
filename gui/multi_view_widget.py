@@ -25,6 +25,7 @@ from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QHBoxLayout,
     QLabel,
     QMenu,
@@ -100,6 +101,59 @@ class MultiViewWidget(QWidget):
         toolbar.addWidget(QLabel("Select:"))
         toolbar.addWidget(self._sel_mode_combo)
 
+        # Tool size adjustment controls
+        self._brush_size_label = QLabel("Radius:")
+        self._brush_size_spin = QDoubleSpinBox()
+        self._brush_size_spin.setRange(0.05, 25.0)
+        self._brush_size_spin.setSingleStep(0.1)
+        self._brush_size_spin.setDecimals(2)
+        self._brush_size_spin.setValue(0.6)
+        self._brush_size_spin.setSuffix(" m")
+        self._brush_size_spin.setToolTip("Brush selection radius (m). Shortcuts: '[' / ']' or Shift+Scroll")
+        self._brush_size_spin.valueChanged.connect(self._on_brush_spin_changed)
+
+        self._rect_w_label = QLabel("W:")
+        self._rect_w_spin = QDoubleSpinBox()
+        self._rect_w_spin.setRange(0.1, 50.0)
+        self._rect_w_spin.setSingleStep(0.2)
+        self._rect_w_spin.setDecimals(1)
+        self._rect_w_spin.setValue(1.0)
+        self._rect_w_spin.setSuffix(" m")
+        self._rect_w_spin.setToolTip("Rectangle brush width (m)")
+        self._rect_w_spin.valueChanged.connect(self._on_rect_spin_changed)
+
+        self._rect_h_label = QLabel("H:")
+        self._rect_h_spin = QDoubleSpinBox()
+        self._rect_h_spin.setRange(0.05, 25.0)
+        self._rect_h_spin.setSingleStep(0.1)
+        self._rect_h_spin.setDecimals(2)
+        self._rect_h_spin.setValue(0.4)
+        self._rect_h_spin.setSuffix(" m")
+        self._rect_h_spin.setToolTip("Rectangle brush height (m)")
+        self._rect_h_spin.valueChanged.connect(self._on_rect_spin_changed)
+
+        toolbar.addWidget(self._brush_size_label)
+        toolbar.addWidget(self._brush_size_spin)
+        toolbar.addWidget(self._rect_w_label)
+        toolbar.addWidget(self._rect_w_spin)
+        toolbar.addWidget(self._rect_h_label)
+        toolbar.addWidget(self._rect_h_spin)
+
+        toolbar.addSpacing(12)
+
+        # Profile corridor width control
+        self._corridor_label = QLabel("Corridor:")
+        self._corridor_spin = QDoubleSpinBox()
+        self._corridor_spin.setRange(0.2, 50.0)
+        self._corridor_spin.setSingleStep(0.5)
+        self._corridor_spin.setDecimals(1)
+        self._corridor_spin.setValue(2.0)
+        self._corridor_spin.setSuffix(" m")
+        self._corridor_spin.setToolTip("Profile corridor slice width (m). Shortcut: Ctrl+Scroll in Profile View")
+        self._corridor_spin.valueChanged.connect(self._on_corridor_spin_changed)
+        toolbar.addWidget(self._corridor_label)
+        toolbar.addWidget(self._corridor_spin)
+
         toolbar.addSpacing(12)
 
         self._colour_combo = QComboBox()
@@ -139,6 +193,10 @@ class MultiViewWidget(QWidget):
         self._view_dtm.profile_line_defined.connect(self.profile_line_defined)
 
         self._view_profile = ViewProfile()
+        self._view_profile.brush_size_changed.connect(self._on_profile_brush_size_changed)
+        self._view_profile.rect_size_changed.connect(self._on_profile_rect_size_changed)
+        self._view_profile.profile_width_changed.connect(self._on_profile_width_changed)
+        self._update_tool_size_widgets_visibility("brush")
 
         # ── nested splitters for resizable layout ──────────────────
         # Top row: 3D (left, stretch 2) | DTM (right, stretch 1)
@@ -331,13 +389,55 @@ class MultiViewWidget(QWidget):
                 self._view_3d.toggle_flightline(fl, False)
 
     # ── slots ──────────────────────────────────────────────────────
+    def _update_tool_size_widgets_visibility(self, mode: str) -> None:
+        is_brush = (mode == "brush")
+        is_rect = (mode == "rect_brush")
+        self._brush_size_label.setVisible(is_brush)
+        self._brush_size_spin.setVisible(is_brush)
+        self._rect_w_label.setVisible(is_rect)
+        self._rect_w_spin.setVisible(is_rect)
+        self._rect_h_label.setVisible(is_rect)
+        self._rect_h_spin.setVisible(is_rect)
+
+    def _on_brush_spin_changed(self, val: float) -> None:
+        self._view_profile.set_brush_radius(val, emit=False)
+
+    def _on_rect_spin_changed(self, _val: float) -> None:
+        w = self._rect_w_spin.value() * 0.5  # half-width
+        h = self._rect_h_spin.value() * 0.5  # half-height
+        self._view_profile.set_rect_size(w, h, emit=False)
+
+    def _on_profile_brush_size_changed(self, radius: float) -> None:
+        self._brush_size_spin.blockSignals(True)
+        self._brush_size_spin.setValue(radius)
+        self._brush_size_spin.blockSignals(False)
+
+    def _on_profile_rect_size_changed(self, half_w: float, half_h: float) -> None:
+        self._rect_w_spin.blockSignals(True)
+        self._rect_w_spin.setValue(half_w * 2.0)
+        self._rect_w_spin.blockSignals(False)
+        self._rect_h_spin.blockSignals(True)
+        self._rect_h_spin.setValue(half_h * 2.0)
+        self._rect_h_spin.blockSignals(False)
+
+    def _on_corridor_spin_changed(self, val: float) -> None:
+        self._view_profile.set_profile_width(val)
+        self._view_profile.profile_width_changed.emit(val)
+
+    def _on_profile_width_changed(self, val: float) -> None:
+        self._corridor_spin.blockSignals(True)
+        self._corridor_spin.setValue(val)
+        self._corridor_spin.blockSignals(False)
 
     def _on_sel_mode_changed(self, index: int) -> None:
         """Propagate selection mode to the profile view."""
         mode = self._sel_mode_combo.currentData()
+        self._update_tool_size_widgets_visibility(mode)
         self._view_profile.set_selection_mode(mode)
 
     def _on_colour_mode_changed(self, index: int) -> None:
-        """Propagate colour mode to the 3D overview view."""
+        """Propagate colour mode to 3D, Profile, and DTM views."""
         mode = self._colour_combo.currentData()
         self._view_3d.set_colour_mode(mode)
+        self._view_profile.set_colour_mode(mode)
+        self._view_dtm.set_colour_mode(mode)

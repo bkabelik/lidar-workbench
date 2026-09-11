@@ -181,6 +181,8 @@ class ProfileData:
     classifications: np.ndarray
     intensities: np.ndarray
     indices: np.ndarray
+    return_numbers: Optional[np.ndarray] = None
+    point_source_ids: Optional[np.ndarray] = None
 
 
 def extract_profile(
@@ -192,6 +194,8 @@ def extract_profile(
     start_xy: Tuple[float, float],
     end_xy: Tuple[float, float],
     width: float = DEFAULT_PROFILE_WIDTH_M,
+    return_numbers: Optional[np.ndarray] = None,
+    point_source_ids: Optional[np.ndarray] = None,
 ) -> ProfileData:
     """
     Extract points that lie within *width* meters of a profile line.
@@ -206,6 +210,8 @@ def extract_profile(
         intensities:          Intensity values.
         start_xy, end_xy:     Profile endpoints in CRS units ``(x, y)``.
         width:                Half-width of the extraction corridor (meters).
+        return_numbers:       Optional return number array.
+        point_source_ids:     Optional flightline/point source ID array.
 
     Returns:
         :class:`ProfileData` with the extracted points.
@@ -220,6 +226,8 @@ def extract_profile(
             classifications=np.array([], dtype=np.uint8),
             intensities=np.array([], dtype=np.uint16),
             indices=np.array([], dtype=np.int64),
+            return_numbers=np.array([], dtype=np.uint8) if return_numbers is not None else None,
+            point_source_ids=np.array([], dtype=np.uint16) if point_source_ids is not None else None,
         )
 
     sx, sy = start_xy
@@ -271,6 +279,8 @@ def extract_profile(
         classifications=classifications[mask],
         intensities=intensities[mask],
         indices=indices,
+        return_numbers=return_numbers[mask] if return_numbers is not None else None,
+        point_source_ids=point_source_ids[mask] if point_source_ids is not None else None,
     )
 
 
@@ -469,6 +479,8 @@ class ManualEditor:
             logger.warning("No tile loaded — cannot extract profile")
             return None
 
+        ret_nums = self._point_data.get("return_number")
+        ps_ids = self._point_data.get("point_source_id")
         self._profile = extract_profile(
             self._point_data["x"],
             self._point_data["y"],
@@ -478,6 +490,8 @@ class ManualEditor:
             start_xy,
             end_xy,
             width,
+            return_numbers=ret_nums,
+            point_source_ids=ps_ids,
         )
         self._selected_indices = None
         return self._profile

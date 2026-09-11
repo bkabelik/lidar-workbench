@@ -17,10 +17,12 @@ from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QImage,
     QMouseEvent,
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QWheelEvent,
 )
 from PySide6.QtWidgets import QVBoxLayout, QWidget
@@ -36,6 +38,12 @@ SELECT_LINE_BELOW = "line_below"
 SELECT_RECTANGLE = "rectangle"
 SELECT_BRUSH = "brush"
 SELECT_RECT_BRUSH = "rect_brush"
+
+_FL_PALETTE = np.array([
+    [0.90, 0.10, 0.10], [0.10, 0.50, 0.90], [0.10, 0.80, 0.10], [0.90, 0.60, 0.10],
+    [0.70, 0.10, 0.90], [0.10, 0.80, 0.80], [0.90, 0.10, 0.70], [0.60, 0.60, 0.10],
+    [0.90, 0.50, 0.50], [0.20, 0.60, 0.20], [0.50, 0.50, 0.90], [0.80, 0.80, 0.20],
+])
 
 
 class ViewProfile(QWidget):
@@ -56,6 +64,8 @@ class ViewProfile(QWidget):
     selection_changed = Signal(np.ndarray)
     selection_mode_changed = Signal(str)
     profile_width_changed = Signal(float)
+    brush_size_changed = Signal(float)
+    rect_size_changed = Signal(float, float)
     point_hovered = Signal(int, float, float, float, int, int)  # idx, x, y, z, class, intensity
     point_picked = Signal(int, float, float, float, int, int)   # idx, x, y, z, class, intensity (click)
 
@@ -63,20 +73,21 @@ class ViewProfile(QWidget):
         super().__init__(parent)
         self.setMinimumSize(200, 200)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
 
         # Data
         self._distances: Optional[np.ndarray] = None
         self._elevations: Optional[np.ndarray] = None
         self._classifications: Optional[np.ndarray] = None
         self._intensities: Optional[np.ndarray] = None
+        self._return_numbers: Optional[np.ndarray] = None
+        self._point_source_ids: Optional[np.ndarray] = None
         self._profile_indices: Optional[np.ndarray] = None  # indices into the parent tile
         self._xs: Optional[np.ndarray] = None  # original X coords
         self._ys: Optional[np.ndarray] = None  # original Y coords
         self._zs: Optional[np.ndarray] = None  # original Z coords
         self._dtm_distances: Optional[np.ndarray] = None
         self._dtm_elevations: Optional[np.ndarray] = None
-
-        # Class visibility: None = all visible (persists across profile loads)
         self._class_visibility: Optional[np.ndarray] = None
 
         # View transform
@@ -85,19 +96,27 @@ class ViewProfile(QWidget):
         self._scale_x: float = 1.0     # pixels per meter
         self._scale_y: float = 1.0
 
-        # Selection state
+        # Colour mode: class, height, intensity, return_number, flightline
+        self._colour_mode: str = "class"
+
+        # Selection state: fine default sizes (0.6m radius, 1.0m x 0.4m rect)
         self._select_mode: str = SELECT_BRUSH
         self._selecting: bool = False
         self._sel_start: Optional[Tuple[float, float]] = None
         self._sel_end: Optional[Tuple[float, float]] = None
-        self._brush_radius: float = 2.0
-        self._rect_width: float = 4.0    # half-width in meters for rect_brush
-        self._rect_height: float = 2.0   # half-height in meters for rect_brush
+        self._brush_radius: float = 0.6
+        self._rect_width: float = 0.5    # half-width in meters for rect_brush (1.0m total)
+        self._rect_height: float = 0.2   # half-height in meters for rect_brush (0.4m total)
         self._current_mask: Optional[np.ndarray] = None
         self._cursor_world: Optional[Tuple[float, float]] = None  # mouse pos in world coords
 
-        # Width-adjust mode: after profile is loaded, scroll adjusts width
-        # until the user clicks to confirm and enter selection mode.
+        # Base rendering cache for buttery smooth mouse movement
+        self._base_pixmap: Optional[QPixmap] = None
+        self._base_dirty: bool = True
+        self._panning: bool = False
+        self._pan_start: Optional[QPointF] = None
+
+        # Width-adjust mode (optional, Ctrl+Scroll to adjust corridor width)
         self._width_adjusting: bool = False
         self._total_width: float = 5.0   # current corridor width (m)
 
@@ -105,6 +124,10 @@ class ViewProfile(QWidget):
         self._point_info_active: bool = False
         self._picked_point: Optional[Tuple[float, float, float, int, int, int, float]] = None
         # (x, y, z, class, intensity, index, distance_on_profile)
+
+    def _invalidate_base(self) -> None:
+        self._base_dirty = True
+        self.update()
 
     @property
     def point_info_active(self) -> bool:
@@ -131,32 +154,33 @@ class ViewProfile(QWidget):
         xs: Optional[np.ndarray] = None,
         ys: Optional[np.ndarray] = None,
         zs: Optional[np.ndarray] = None,
+        return_numbers: Optional[np.ndarray] = None,
+        point_source_ids: Optional[np.ndarray] = None,
     ) -> None:
         """
         Load profile point data.  After loading, the view enters
         "width-adjust" mode: scroll adjusts corridor width, and the
         first left-click confirms the width and enters selection mode.
-
-        Args:
-            distances:       Distance along profile (meters).
-            elevations:      Point elevations.
-            classifications: ASPRS class codes.
-            intensities:     LiDAR intensity values.
-            indices:         Point indices into the parent tile array.
-            xs, ys, zs:      Original 3D coordinates.
         """
         self._distances = distances
         self._elevations = elevations
         self._classifications = classifications
         self._intensities = intensities
+        self._return_numbers = return_numbers
+        self._point_source_ids = point_source_ids
         self._profile_indices = indices
         self._xs = xs
         self._ys = ys
         self._zs = zs
         self._current_mask = None
-        self._width_adjusting = True  # enter width-adjust mode
+        self._width_adjusting = False  # default to normal zoom mode
         self._fit_view()
-        self.update()
+        self._invalidate_base()
+
+    def set_colour_mode(self, mode: str) -> None:
+        """Set point cloud colouring mode (class, height, intensity, return_number, flightline)."""
+        self._colour_mode = mode
+        self._invalidate_base()
 
     def set_dtm_reference(
         self,
@@ -172,44 +196,48 @@ class ViewProfile(QWidget):
         """
         self._dtm_distances = dtm_distances
         self._dtm_elevations = dtm_elevations
-        self.update()
+        self._invalidate_base()
 
     def set_profile_width(self, width: float) -> None:
         """Set the initial corridor width (called before profile data is loaded)."""
         self._total_width = max(0.5, width)
 
     def set_selection_mode(self, mode: str) -> None:
-        """Set the active selection tool. Exits width-adjust mode if active."""
+        """Set the active selection tool."""
         if mode not in (SELECT_NONE, SELECT_LINE_ABOVE, SELECT_LINE_BELOW,
                          SELECT_RECTANGLE, SELECT_BRUSH, SELECT_RECT_BRUSH):
             logger.warning("Unknown selection mode: %s", mode)
             return
-        self._width_adjusting = False  # confirm width when user picks a tool
+        self._width_adjusting = False
         self._select_mode = mode
         self._cursor_world = None  # reset cursor on mode change
         self.selection_mode_changed.emit(mode)
         logger.debug("Profile selection mode: %s", mode)
 
-    def set_brush_radius(self, radius: float) -> None:
+    def set_brush_radius(self, radius: float, emit: bool = True) -> None:
         """Set the brush selection radius in meters."""
-        self._brush_radius = max(0.1, radius)
+        self._brush_radius = max(0.05, float(radius))
+        if emit:
+            self.brush_size_changed.emit(self._brush_radius)
         self.update()
 
-    def set_rect_size(self, width: float, height: float) -> None:
+    def set_rect_size(self, width: float, height: float, emit: bool = True) -> None:
         """Set the rect_brush half-size in meters."""
-        self._rect_width = max(0.1, width)
-        self._rect_height = max(0.1, height)
+        self._rect_width = max(0.05, float(width))
+        self._rect_height = max(0.05, float(height))
+        if emit:
+            self.rect_size_changed.emit(self._rect_width, self._rect_height)
         self.update()
 
     def set_selection_mask(self, mask: np.ndarray) -> None:
         """Apply an externally-computed selection mask."""
         self._current_mask = mask
-        self.update()
+        self._invalidate_base()
 
     def set_class_visibility(self, visibility: np.ndarray) -> None:
         """Set which ASPRS classes are visible (bool array indexed by class code)."""
         self._class_visibility = visibility
-        self.update()
+        self._invalidate_base()
 
     def clear(self) -> None:
         """Clear all data."""
@@ -219,6 +247,8 @@ class ViewProfile(QWidget):
         self._dtm_distances = None
         self._dtm_elevations = None
         self._current_mask = None
+        self._base_pixmap = None
+        self._base_dirty = True
         self.update()
 
     # ── coordinate transforms ──────────────────────────────────────
@@ -265,58 +295,161 @@ class ViewProfile(QWidget):
 
     # ── painting ───────────────────────────────────────────────────
 
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
+    def _render_base_pixmap(self) -> None:
+        """Render axes, DTM reference curve, and point cloud into cached QPixmap."""
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+
+        # Prepare numpy RGBA array (H, W, 4) initialized to dark background #1a1a2e
+        img = np.empty((h, w, 4), dtype=np.uint8)
+        img[:, :, 0] = 0x1A
+        img[:, :, 1] = 0x1A
+        img[:, :, 2] = 0x2E
+        img[:, :, 3] = 0xFF
+
+        # Draw point cloud points
+        if self._distances is not None and len(self._distances) > 0:
+            px = np.round((self._distances - self._offset_x) * self._scale_x + w / 2).astype(np.int32)
+            py = np.round(-(self._elevations - self._offset_y) * self._scale_y + h / 2).astype(np.int32)
+
+            vis = (px >= 0) & (px < w) & (py >= 0) & (py < h)
+            if self._class_visibility is not None and self._classifications is not None:
+                vis = vis & self._class_visibility[self._classifications]
+
+            if np.any(vis):
+                vis_idx = np.where(vis)[0]
+                vis_px = px[vis_idx]
+                vis_py = py[vis_idx]
+
+                mode = self._colour_mode
+                n_vis = len(vis_idx)
+
+                # Compute RGB arrays
+                if mode == "height":
+                    z_vals = self._elevations[vis_idx]
+                    z_min, z_max = float(self._elevations.min()), float(self._elevations.max())
+                    z_span = max(1e-6, z_max - z_min)
+                    t = np.clip((z_vals - z_min) / z_span, 0.0, 1.0)
+                    cr = ((np.clip((t - 0.5) * 4, 0, 1) + np.clip((t - 0.75) * 4, 0, 1)) * 255).astype(np.uint8)
+                    cg = ((np.clip(t * 4, 0, 1) * (t <= 0.5) + np.clip((1 - t) * 4, 0, 1) * (t > 0.5)) * 255).astype(np.uint8)
+                    cb = ((np.clip((0.5 - t) * 4, 0, 1)) * 255).astype(np.uint8)
+                elif mode == "intensity" and self._intensities is not None and len(self._intensities) > 0:
+                    i_vals = self._intensities[vis_idx]
+                    i_min, i_max = float(self._intensities.min()), float(self._intensities.max())
+                    i_span = max(1e-6, i_max - i_min)
+                    t = (np.clip((i_vals - i_min) / i_span, 0.0, 1.0) * 255).astype(np.uint8)
+                    cr = cg = cb = t
+                elif mode == "return_number" and self._return_numbers is not None and len(self._return_numbers) > 0:
+                    rn_vals = self._return_numbers[vis_idx]
+                    rn_palette = {1: (51, 178, 51), 2: (178, 178, 51), 3: (178, 102, 51), 4: (178, 51, 51)}
+                    cr = np.full(n_vis, 102, dtype=np.uint8)
+                    cg = np.full(n_vis, 51, dtype=np.uint8)
+                    cb = np.full(n_vis, 178, dtype=np.uint8)
+                    for r_code, rgb in rn_palette.items():
+                        m = rn_vals == r_code
+                        if np.any(m):
+                            cr[m], cg[m], cb[m] = rgb
+                elif mode == "flightline" and self._point_source_ids is not None and len(self._point_source_ids) > 0:
+                    fl_vals = self._point_source_ids[vis_idx]
+                    fl_unique = np.unique(self._point_source_ids)
+                    fl_map = {fl_val: k for k, fl_val in enumerate(fl_unique)}
+                    cr = np.zeros(n_vis, dtype=np.uint8)
+                    cg = np.zeros(n_vis, dtype=np.uint8)
+                    cb = np.zeros(n_vis, dtype=np.uint8)
+                    for fl_val, k in fl_map.items():
+                        m = fl_vals == fl_val
+                        if np.any(m):
+                            fl_col = _FL_PALETTE[k % len(_FL_PALETTE)]
+                            cr[m] = int(fl_col[0] * 255)
+                            cg[m] = int(fl_col[1] * 255)
+                            cb[m] = int(fl_col[2] * 255)
+                else:  # mode == "class"
+                    cls_vals = self._classifications[vis_idx] if self._classifications is not None else np.zeros(n_vis, dtype=np.int32)
+                    cr = np.zeros(n_vis, dtype=np.uint8)
+                    cg = np.zeros(n_vis, dtype=np.uint8)
+                    cb = np.zeros(n_vis, dtype=np.uint8)
+                    for code in np.unique(cls_vals):
+                        m = cls_vals == code
+                        r, g, b = get_class_color(int(code))
+                        cr[m] = int(r * 255)
+                        cg[m] = int(g * 255)
+                        cb[m] = int(b * 255)
+
+                # Identify selected points mask
+                is_sel = self._current_mask[vis_idx] if self._current_mask is not None else None
+
+                # Stamp unselected points (2x2 square)
+                if is_sel is not None and np.any(is_sel):
+                    unsel = ~is_sel
+                    u_px, u_py = vis_px[unsel], vis_py[unsel]
+                    u_r, u_g, u_b = cr[unsel], cg[unsel], cb[unsel]
+                else:
+                    u_px, u_py = vis_px, vis_py
+                    u_r, u_g, u_b = cr, cg, cb
+
+                for dx, dy in [(0, 0), (1, 0), (0, 1), (1, 1)]:
+                    cx = np.clip(u_px + dx, 0, w - 1)
+                    cy = np.clip(u_py + dy, 0, h - 1)
+                    img[cy, cx, 0] = u_r
+                    img[cy, cx, 1] = u_g
+                    img[cy, cx, 2] = u_b
+                    img[cy, cx, 3] = 255
+
+                # Stamp selected points in bright red (#ff3232, 4x4)
+                if is_sel is not None and np.any(is_sel):
+                    s_px, s_py = vis_px[is_sel], vis_py[is_sel]
+                    for dx in range(-1, 3):
+                        for dy in range(-1, 3):
+                            cx = np.clip(s_px + dx, 0, w - 1)
+                            cy = np.clip(s_py + dy, 0, h - 1)
+                            img[cy, cx, 0] = 255
+                            img[cy, cx, 1] = 50
+                            img[cy, cx, 2] = 50
+                            img[cy, cx, 3] = 255
+
+        # Convert img array to QPixmap
+        qimg = QImage(img.data, w, h, w * 4, QImage.Format_RGBA8888)
+        pixmap = QPixmap.fromImage(qimg)
+
+        # Draw axes and DTM curve on top using QPainter
+        painter = QPainter(pixmap)
         try:
             painter.setRenderHint(QPainter.Antialiasing)
-            painter.fillRect(self.rect(), QColor("#1a1a2e"))
 
-            # Axes
-            painter.setPen(QPen(QColor("#555"), 1))
+            # Coordinate Axes
+            painter.setPen(QPen(QColor("#444444"), 1))
             origin = self._world_to_widget(0, 0)
-            painter.drawLine(0, int(origin.y()), self.width(), int(origin.y()))
-            painter.drawLine(int(origin.x()), 0, int(origin.x()), self.height())
+            painter.drawLine(0, int(origin.y()), w, int(origin.y()))
+            painter.drawLine(int(origin.x()), 0, int(origin.x()), h)
 
             # DTM reference line
-            if self._dtm_distances is not None and self._dtm_elevations is not None:
-                pen = QPen(QColor("#8B4513"), 2)
+            if self._dtm_distances is not None and self._dtm_elevations is not None and len(self._dtm_distances) > 1:
+                pen = QPen(QColor("#D2691E"), 2)
                 painter.setPen(pen)
                 path = QPainterPath()
-                pt = self._world_to_widget(self._dtm_distances[0], self._dtm_elevations[0])
-                path.moveTo(pt)
+                pt0 = self._world_to_widget(self._dtm_distances[0], self._dtm_elevations[0])
+                path.moveTo(pt0)
                 for i in range(1, len(self._dtm_distances)):
                     pt = self._world_to_widget(self._dtm_distances[i], self._dtm_elevations[i])
                     path.lineTo(pt)
                 painter.drawPath(path)
+        finally:
+            painter.end()
 
-            # Point cloud
-            if self._distances is not None and len(self._distances) > 0:
-                n = len(self._distances)
-                step = max(1, n // 30_000)
+        self._base_pixmap = pixmap
+        self._base_dirty = False
 
-                for i in range(0, n, step):
-                    pt = self._world_to_widget(self._distances[i], self._elevations[i])
-                    cls = int(self._classifications[i]) if self._classifications is not None else 0
+    def paintEvent(self, event) -> None:
+        if self._base_dirty or self._base_pixmap is None or self._base_pixmap.size() != self.size():
+            self._render_base_pixmap()
 
-                    # Skip hidden classes
-                    if self._class_visibility is not None and not self._class_visibility[cls]:
-                        continue
+        painter = QPainter(self)
+        try:
+            if self._base_pixmap is not None:
+                painter.drawPixmap(0, 0, self._base_pixmap)
 
-                    r, g, b = get_class_color(cls)
-
-                    if self._current_mask is not None and self._current_mask[i]:
-                        # Highlight selected points
-                        color = QColor(255, 50, 50, 220)
-                        radius = 3.5
-                    else:
-                        color = QColor(int(r * 255), int(g * 255), int(b * 255), 200)
-                        radius = 2.0
-
-                    painter.setPen(Qt.NoPen)
-                    painter.setBrush(QBrush(color))
-                    painter.drawEllipse(pt, radius, radius)
-
-            # Selection preview (while drawing)
+            # Selection preview (while dragging line or rect)
             if self._selecting and self._sel_start is not None and self._sel_end is not None:
                 painter.setPen(QPen(QColor("#ff4444"), 1, Qt.DashLine))
 
@@ -342,7 +475,7 @@ class ViewProfile(QWidget):
                     painter.drawRect(rect)
 
             # Persistent cursor indicator for click-to-place tools (brush / rect_brush)
-            if (not self._selecting and not self._width_adjusting
+            if (not self._selecting
                     and self._cursor_world is not None
                     and self._select_mode in (SELECT_BRUSH, SELECT_RECT_BRUSH)):
                 painter.setPen(QPen(QColor("#ffaa00"), 1, Qt.DashLine))
@@ -358,30 +491,18 @@ class ViewProfile(QWidget):
                     rect = QRectF(p1, p2).normalized()
                     painter.drawRect(rect)
 
-            # Width-adjust mode overlay
-            if self._width_adjusting:
-                painter.setPen(QColor("#ffcc00"))
-                painter.drawText(
-                    10, 25,
-                    f"Width: {self._total_width:.1f} m — scroll to adjust, click to confirm"
-                )
-
             # Point Info picked-point marker
             if self._picked_point is not None and self._point_info_active:
                 px, py, pz, cls, intens, idx, d_val = self._picked_point
-                # Draw a bright crosshair at the picked point
                 z_val = pz
                 pt = self._world_to_widget(d_val, z_val)
                 cx, cy = pt.x(), pt.y()
                 r = 8
-                # Outer ring
                 painter.setPen(QPen(QColor(0, 255, 128, 220), 2.5))
                 painter.setBrush(Qt.NoBrush)
                 painter.drawEllipse(QPointF(cx, cy), r, r)
-                # Crosshair
                 painter.drawLine(QPointF(cx - r - 4, cy), QPointF(cx + r + 4, cy))
                 painter.drawLine(QPointF(cx, cy - r - 4), QPointF(cx, cy + r + 4))
-                # Inner dot
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(QColor(0, 255, 128, 255)))
                 painter.drawEllipse(QPointF(cx, cy), 3, 3)
@@ -392,22 +513,18 @@ class ViewProfile(QWidget):
     # ── mouse events ───────────────────────────────────────────────
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
-        # ── Point Info tool: click always picks a point ────────────
+        # Point Info tool: click always picks a point
         if self._point_info_active and event.button() in (Qt.LeftButton, Qt.RightButton):
-            if self._width_adjusting:
-                self._width_adjusting = False
-                self.profile_width_changed.emit(self._total_width)
-                self.update()
             wx, wy = self._widget_to_world(event.position().x(), event.position().y())
             self._pick_nearest_point(wx, wy)
             return
 
-        # ── Width-adjust mode: first click confirms width ──────────
-        if self._width_adjusting:
-            self._width_adjusting = False
-            self.profile_width_changed.emit(self._total_width)
-            self.update()
-            return  # don't start selection on the confirming click
+        # Middle button: start panning
+        if event.button() == Qt.MiddleButton:
+            self._panning = True
+            self._pan_start = event.position()
+            event.accept()
+            return
 
         if event.button() == Qt.LeftButton:
             wx, wy = self._widget_to_world(event.position().x(), event.position().y())
@@ -428,11 +545,21 @@ class ViewProfile(QWidget):
             # Cancel selection
             self._selecting = False
             self._current_mask = None
-            self.update()
+            self._invalidate_base()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        # Panning with middle mouse button
+        if self._panning and self._pan_start is not None:
+            dx = event.position().x() - self._pan_start.x()
+            dy = event.position().y() - self._pan_start.y()
+            self._pan_start = event.position()
+            self._offset_x -= dx / self._scale_x
+            self._offset_y += dy / self._scale_y
+            self._invalidate_base()
+            return
+
         wx, wy = self._widget_to_world(event.position().x(), event.position().y())
-        self._cursor_world = (wx, wy)  # track for persistent cursor indicator
+        self._cursor_world = (wx, wy)
 
         if self._selecting:
             self._sel_end = (wx, wy)
@@ -448,7 +575,7 @@ class ViewProfile(QWidget):
             if not self._point_info_active:
                 self._emit_hover(wx, wy)
 
-        # Repaint for cursor indicator in brush/rect_brush modes
+        # Repaint for cursor indicator in brush/rect_brush modes (fast cached blit!)
         if self._select_mode in (SELECT_BRUSH, SELECT_RECT_BRUSH):
             self.update()
 
@@ -459,11 +586,10 @@ class ViewProfile(QWidget):
 
         d_dist = self._distances - d
         e_dist = self._elevations - z
-        dists = np.sqrt(d_dist * d_dist + e_dist * e_dist)
+        dists = d_dist * d_dist + e_dist * e_dist
         nearest = int(np.argmin(dists))
 
-        # Only pick if within reasonable distance in world coords
-        if dists[nearest] > self._brush_radius * 3:
+        if dists[nearest] > (self._brush_radius * 3) ** 2:
             return
 
         idx = int(self._profile_indices[nearest]) if self._profile_indices is not None else int(nearest)
@@ -473,13 +599,17 @@ class ViewProfile(QWidget):
         cls = int(self._classifications[nearest]) if self._classifications is not None else 0
         intens = int(self._intensities[nearest]) if self._intensities is not None else 0
 
-        # Store for marker rendering
         self._picked_point = (px, py, pz, cls, intens, idx, d)
         self.update()
 
         self.point_picked.emit(idx, px, py, pz, cls, intens)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MiddleButton:
+            self._panning = False
+            event.accept()
+            return
+
         if not self._selecting:
             return
 
@@ -494,26 +624,55 @@ class ViewProfile(QWidget):
         elif self._select_mode == SELECT_RECTANGLE:
             self._compute_rect_selection()
 
-        # Don't emit on brush/rect_brush — they're continuous
         if self._select_mode not in (SELECT_BRUSH, SELECT_RECT_BRUSH) and self._current_mask is not None:
             self.selection_changed.emit(self._current_mask.copy())
 
-        self.update()
+        self._invalidate_base()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
-        if self._width_adjusting:
-            # In width-adjust mode: scroll changes corridor width
+        if event.modifiers() & Qt.ShiftModifier:
+            # Shift+Scroll: dynamically resize active brush or rect tool
+            factor = 1.15 if event.angleDelta().y() > 0 else 0.85
+            if self._select_mode == SELECT_BRUSH:
+                self.set_brush_radius(self._brush_radius * factor)
+            elif self._select_mode == SELECT_RECT_BRUSH:
+                self.set_rect_size(self._rect_width * factor, self._rect_height * factor)
+            event.accept()
+            return
+
+        if event.modifiers() & Qt.ControlModifier:
+            # Ctrl+Scroll: dynamically adjust corridor width
             direction = 1.0 if event.angleDelta().y() > 0 else -1.0
-            self._total_width = max(0.5, self._total_width + direction * 1.0)
+            self._total_width = max(0.5, self._total_width + direction * 0.5)
             self.profile_width_changed.emit(self._total_width)
-        else:
-            # Normal mode: scroll zooms
-            factor = 1.1 if event.angleDelta().y() > 0 else 0.9
-            self._scale_x *= factor
-            self._scale_y *= factor
-            self._scale_x = max(0.001, min(self._scale_x, 10000.0))
-            self._scale_y = max(0.001, min(self._scale_y, 10000.0))
-            self.update()
+            event.accept()
+            return
+
+        # Normal mode: scroll zooms smoothly
+        factor = 1.15 if event.angleDelta().y() > 0 else 0.87
+        self._scale_x *= factor
+        self._scale_y *= factor
+        self._scale_x = max(0.001, min(self._scale_x, 10000.0))
+        self._scale_y = max(0.001, min(self._scale_y, 10000.0))
+        self._invalidate_base()
+
+    def keyPressEvent(self, event) -> None:
+        key = event.key()
+        if key == Qt.Key_BracketLeft:
+            if self._select_mode == SELECT_BRUSH:
+                self.set_brush_radius(self._brush_radius * 0.85)
+            elif self._select_mode == SELECT_RECT_BRUSH:
+                self.set_rect_size(self._rect_width * 0.85, self._rect_height * 0.85)
+            event.accept()
+            return
+        elif key == Qt.Key_BracketRight:
+            if self._select_mode == SELECT_BRUSH:
+                self.set_brush_radius(self._brush_radius * 1.15)
+            elif self._select_mode == SELECT_RECT_BRUSH:
+                self.set_rect_size(self._rect_width * 1.15, self._rect_height * 1.15)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     # ── selection computation ──────────────────────────────────────
 
@@ -524,7 +683,6 @@ class ViewProfile(QWidget):
         d1, z1 = self._sel_start
         d2, z2 = self._sel_end
 
-        # Constrain to points whose distance falls within the drawn segment
         d_min, d_max = sorted([d1, d2])
         in_range = (self._distances >= d_min) & (self._distances <= d_max)
 
@@ -567,7 +725,7 @@ class ViewProfile(QWidget):
 
         d_dist = self._distances - d
         e_dist = self._elevations - z
-        new_mask = np.sqrt(d_dist * d_dist + e_dist * e_dist) <= self._brush_radius
+        new_mask = (d_dist * d_dist + e_dist * e_dist) <= (self._brush_radius * self._brush_radius)
 
         if additive and self._current_mask is not None:
             self._current_mask = self._current_mask | new_mask
@@ -575,7 +733,7 @@ class ViewProfile(QWidget):
             self._current_mask = new_mask
 
         self.selection_changed.emit(self._current_mask.copy())
-        self.update()
+        self._invalidate_base()
 
     def _compute_rect_brush_selection(
         self, d: float, z: float, additive: bool = False
@@ -596,7 +754,7 @@ class ViewProfile(QWidget):
             self._current_mask = new_mask
 
         self.selection_changed.emit(self._current_mask.copy())
-        self.update()
+        self._invalidate_base()
 
     def _emit_hover(self, d: float, z: float) -> None:
         """Find the nearest profile point and emit point_hovered signal."""
@@ -605,11 +763,11 @@ class ViewProfile(QWidget):
 
         d_dist = self._distances - d
         e_dist = self._elevations - z
-        dists = np.sqrt(d_dist * d_dist + e_dist * e_dist)
+        dists = d_dist * d_dist + e_dist * e_dist
         nearest = int(np.argmin(dists))
 
         # Only emit if within reasonable distance in world coords
-        if dists[nearest] > self._brush_radius * 3:
+        if dists[nearest] > (self._brush_radius * 3) ** 2:
             return
 
         idx = int(self._profile_indices[nearest]) if self._profile_indices is not None else int(nearest)
@@ -623,7 +781,7 @@ class ViewProfile(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        # Keep view centered; don't re-fit (preserve user zoom)
+        self._base_dirty = True
 
     def leaveEvent(self, event) -> None:
         """Clear cursor indicator when mouse leaves the widget."""

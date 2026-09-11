@@ -39,6 +39,12 @@ logger = logging.getLogger("lidar_workbench.gui.view_dtm")
 # Maximum long-side pixel dimension of the cached scatter image.
 _SCATTER_MAX_DIM = 2048
 
+_FL_PALETTE = np.array([
+    [0.90, 0.10, 0.10], [0.10, 0.50, 0.90], [0.10, 0.80, 0.10], [0.90, 0.60, 0.10],
+    [0.70, 0.10, 0.90], [0.10, 0.80, 0.80], [0.90, 0.10, 0.70], [0.60, 0.60, 0.10],
+    [0.90, 0.50, 0.50], [0.20, 0.60, 0.20], [0.50, 0.50, 0.90], [0.80, 0.80, 0.20],
+])
+
 
 class ViewDTM(QWidget):
     """
@@ -78,12 +84,18 @@ class ViewDTM(QWidget):
         self._points_y: Optional[np.ndarray] = None
         self._points_z: Optional[np.ndarray] = None
         self._points_class: Optional[np.ndarray] = None
+        self._points_intensity: Optional[np.ndarray] = None
+        self._points_return_number: Optional[np.ndarray] = None
+        self._points_source_id: Optional[np.ndarray] = None
 
         # Original (unsampled) arrays for DTM generation
         self._points_x_orig: Optional[np.ndarray] = None
         self._points_y_orig: Optional[np.ndarray] = None
         self._points_z_orig: Optional[np.ndarray] = None
         self._points_class_orig: Optional[np.ndarray] = None
+
+        # Colour mode: class, height, intensity, return_number, flightline
+        self._colour_mode: str = "class"
 
         # Class visibility: None = all classes visible
         self._class_visibility: Optional[np.ndarray] = None
@@ -140,6 +152,10 @@ class ViewDTM(QWidget):
         self._points_z_orig = zs
         self._points_class_orig = cls
 
+        intens = data.get("intensity")
+        rn = data.get("return_number")
+        psid = data.get("point_source_id")
+
         # Subsample for fast 2D scatter rendering
         n = len(xs)
         if n > 200_000:
@@ -148,11 +164,17 @@ class ViewDTM(QWidget):
             self._points_y = ys[::step]
             self._points_z = zs[::step]
             self._points_class = cls[::step]
+            self._points_intensity = intens[::step] if intens is not None else None
+            self._points_return_number = rn[::step] if rn is not None else None
+            self._points_source_id = psid[::step] if psid is not None else None
         else:
             self._points_x = xs
             self._points_y = ys
             self._points_z = zs
             self._points_class = cls
+            self._points_intensity = intens
+            self._points_return_number = rn
+            self._points_source_id = psid
 
         # Clear any cached DTM (regenerated explicitly via generate_dtm)
         self._dtm_grid_x = None
@@ -162,6 +184,12 @@ class ViewDTM(QWidget):
 
         self._render_scatter()
         self._fit_view()
+        self.update()
+
+    def set_colour_mode(self, mode: str) -> None:
+        """Set point cloud 2D scatter colouring mode."""
+        self._colour_mode = mode
+        self._render_scatter()
         self.update()
 
     def generate_dtm(self, ground_class: int = 2) -> None:
@@ -311,12 +339,25 @@ class ViewDTM(QWidget):
         ys = self._points_y
         cls = self._points_class
 
+        zs = self._points_z
+        intens = self._points_intensity
+        rn = self._points_return_number
+        psid = self._points_source_id
+
         # Apply class visibility filter
         if cls is not None and self._class_visibility is not None:
             vis = self._class_visibility[np.asarray(cls, dtype=np.int64)]
             xs = xs[vis]
             ys = ys[vis]
             cls = cls[vis]
+            if zs is not None:
+                zs = zs[vis]
+            if intens is not None:
+                intens = intens[vis]
+            if rn is not None:
+                rn = rn[vis]
+            if psid is not None:
+                psid = psid[vis]
 
         if len(xs) == 0:
             self._scatter_pixmap = None
@@ -356,7 +397,55 @@ class ViewDTM(QWidget):
             img[rows, cols, 2] = rgb[2]
             img[rows, cols, 3] = 255
 
-        if cls is not None:
+        mode = self._colour_mode
+
+        if mode == "height" and zs is not None and len(zs) > 0:
+            z_min, z_max = float(zs.min()), float(zs.max())
+            z_span = max(1e-6, z_max - z_min)
+            t = np.clip((zs - z_min) / z_span, 0.0, 1.0)
+            cr = ((np.clip((t - 0.5) * 4, 0, 1) + np.clip((t - 0.75) * 4, 0, 1)) * 255).astype(np.uint8)
+            cg = ((np.clip(t * 4, 0, 1) * (t <= 0.5) + np.clip((1 - t) * 4, 0, 1) * (t > 0.5)) * 255).astype(np.uint8)
+            cb = ((np.clip((0.5 - t) * 4, 0, 1)) * 255).astype(np.uint8)
+            for k in range(len(zs)):
+                rgb = (int(cr[k]), int(cg[k]), int(cb[k]))
+                _stamp(row[k], col[k], rgb)
+                _stamp(row[k], col[k] + 1, rgb)
+                _stamp(row[k] + 1, col[k], rgb)
+                _stamp(row[k] + 1, col[k] + 1, rgb)
+        elif mode == "intensity" and intens is not None and len(intens) > 0:
+            i_min, i_max = float(intens.min()), float(intens.max())
+            i_span = max(1e-6, i_max - i_min)
+            vals = (np.clip((intens - i_min) / i_span, 0.0, 1.0) * 255).astype(np.uint8)
+            for k in range(len(intens)):
+                v = int(vals[k])
+                rgb = (v, v, v)
+                _stamp(row[k], col[k], rgb)
+                _stamp(row[k], col[k] + 1, rgb)
+                _stamp(row[k] + 1, col[k], rgb)
+                _stamp(row[k] + 1, col[k] + 1, rgb)
+        elif mode == "return_number" and rn is not None and len(rn) > 0:
+            rn_palette = {1: (51, 178, 51), 2: (178, 178, 51), 3: (178, 102, 51), 4: (178, 51, 51)}
+            for r_val in np.unique(rn):
+                m = rn == r_val
+                rgb = rn_palette.get(int(r_val), (102, 51, 178))
+                rr = row[m]
+                cc = col[m]
+                _stamp(rr, cc, rgb)
+                _stamp(rr, cc + 1, rgb)
+                _stamp(rr + 1, cc, rgb)
+                _stamp(rr + 1, cc + 1, rgb)
+        elif mode == "flightline" and psid is not None and len(psid) > 0:
+            for idx, fl_val in enumerate(np.unique(psid)):
+                m = psid == fl_val
+                fl_col = _FL_PALETTE[idx % len(_FL_PALETTE)]
+                rgb = (int(fl_col[0] * 255), int(fl_col[1] * 255), int(fl_col[2] * 255))
+                rr = row[m]
+                cc = col[m]
+                _stamp(rr, cc, rgb)
+                _stamp(rr, cc + 1, rgb)
+                _stamp(rr + 1, cc, rgb)
+                _stamp(rr + 1, cc + 1, rgb)
+        elif cls is not None:
             for code in np.unique(cls):
                 m = cls == code
                 r, g, b = get_class_color(int(code))

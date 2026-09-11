@@ -70,12 +70,14 @@ from ..point_qc import (
 )
 from .point_qc_layers import (
     LayerGroup,
+    OSMBasemapLayer,
     RasterLayer,
     VectorFeature,
     VectorLayer,
     load_layer_workspace,
     save_layer_workspace,
 )
+from .osm_basemap import OSMBasemapWorker
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +266,12 @@ class PointQCWindow(QMainWindow):
         self._tile_grid_layer: Optional[VectorLayer] = None
         self._active_raster_layer: Optional[RasterLayer] = None
 
+        # OpenStreetMap basemap worker & layer
+        self._osm_worker = OSMBasemapWorker(self)
+        self._osm_worker.mosaic_ready.connect(self._on_osm_mosaic_ready)
+        self._osm_layer = OSMBasemapLayer("OpenStreetMap", crs=self._detect_project_crs(), visible=False)
+        self.groups[2].add_layer(self._osm_layer)
+
         # Graphics item caches
         self._raster_items: Dict[str, pg.ImageItem] = {}
         self._vector_path_items: Dict[str, QGraphicsPathItem] = {}
@@ -335,6 +343,14 @@ class PointQCWindow(QMainWindow):
         grid_action.triggered.connect(self._on_generate_tile_grid)
         tb.addAction(grid_action)
 
+        tb.addSeparator()
+
+        self._osm_action = QAction("🗺 OSM Basemap", self)
+        self._osm_action.setCheckable(True)
+        self._osm_action.setToolTip("Toggle OpenStreetMap basemap tiles behind project layers")
+        self._osm_action.triggered.connect(self._on_toggle_osm_action)
+        tb.addAction(self._osm_action)
+
     def _setup_central_canvas(self) -> None:
         self._view_box = QCViewBox()
         self._view_box.setAspectLocked(True)
@@ -344,6 +360,11 @@ class PointQCWindow(QMainWindow):
         self._plot_widget.showGrid(x=True, y=True, alpha=0.25)
         self._plot_widget.setLabel("bottom", "Easting (m)")
         self._plot_widget.setLabel("left", "Northing (m)")
+
+        # Background OSM Basemap image item
+        self._osm_item = pg.ImageItem()
+        self._osm_item.setZValue(-50)
+        self._view_box.addItem(self._osm_item)
 
         self._view_box.tile_clicked.connect(self._on_canvas_tile_clicked)
         self._view_box.box_selected.connect(self._on_canvas_box_selected)
@@ -728,6 +749,11 @@ class PointQCWindow(QMainWindow):
                     c_item.setCheckState(0, Qt.Checked if child.visible else Qt.Unchecked)
                     c_item.setData(0, Qt.UserRole, child)
                     grp_item.addChild(c_item)
+                elif isinstance(child, OSMBasemapLayer):
+                    c_item = QTreeWidgetItem([child.name, "Basemap (OSM)"])
+                    c_item.setCheckState(0, Qt.Checked if child.visible else Qt.Unchecked)
+                    c_item.setData(0, Qt.UserRole, child)
+                    grp_item.addChild(c_item)
 
             self._tree.addTopLevelItem(grp_item)
             grp_item.setExpanded(True)
@@ -742,6 +768,10 @@ class PointQCWindow(QMainWindow):
         if isinstance(data, (RasterLayer, VectorLayer)):
             data.visible = is_checked
             self._render_all_layers()
+        elif isinstance(data, OSMBasemapLayer):
+            data.visible = is_checked
+            self._osm_action.setChecked(is_checked)
+            self._render_osm_basemap()
         elif isinstance(data, LayerGroup):
             data.visible = is_checked
             for i in range(item.childCount()):
@@ -786,6 +816,13 @@ class PointQCWindow(QMainWindow):
             self._preset_combo.setEnabled(False)
             self._auto_range_btn.setEnabled(False)
             self._val_range_lbl.setText(f"Features: {len(obj.features)}")
+        elif isinstance(obj, OSMBasemapLayer):
+            self._opacity_slider.setValue(int(obj.opacity * 100))
+            self._vmin_spin.setEnabled(False)
+            self._vmax_spin.setEnabled(False)
+            self._preset_combo.setEnabled(False)
+            self._auto_range_btn.setEnabled(False)
+            self._val_range_lbl.setText(f"Basemap CRS: {obj.crs}")
         else:
             self._vmin_spin.setEnabled(False)
             self._vmax_spin.setEnabled(False)
@@ -801,6 +838,9 @@ class PointQCWindow(QMainWindow):
         if isinstance(obj, (RasterLayer, VectorLayer)):
             obj.opacity = val / 100.0
             self._render_all_layers()
+        elif isinstance(obj, OSMBasemapLayer):
+            obj.opacity = val / 100.0
+            self._render_osm_basemap()
 
     def _on_colormap_changed(self, cmap_name: str) -> None:
         items = self._tree.selectedItems()
@@ -915,11 +955,88 @@ class PointQCWindow(QMainWindow):
             maxy = max(b[3] for b in all_bounds)
             self._view_box.setRange(QRectF(minx, miny, maxx - minx, maxy - miny), padding=0.05)
 
+    def _on_toggle_osm_action(self, checked: bool) -> None:
+        self._osm_layer.visible = checked
+        self._tree.blockSignals(True)
+        for i in range(self._tree.topLevelItemCount()):
+            grp_item = self._tree.topLevelItem(i)
+            for j in range(grp_item.childCount()):
+                c_item = grp_item.child(j)
+                if c_item.data(0, Qt.UserRole) is self._osm_layer:
+                    c_item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+        self._tree.blockSignals(False)
+        self._render_osm_basemap()
+
+    def _detect_project_crs(self) -> str:
+        if self.database:
+            try:
+                crs_info = self.database.get_project_crs()
+                if crs_info and crs_info.get("epsg"):
+                    return f"EPSG:{crs_info['epsg']}"
+            except Exception:
+                pass
+        for grp in self.groups:
+            for l in grp.get_all_layers():
+                if isinstance(l, RasterLayer) and l.crs:
+                    return l.crs
+        return "EPSG:25833"
+
+    def _render_osm_basemap(self) -> None:
+        if not hasattr(self, "_plot_widget") or self._plot_widget is None:
+            return
+        basemap_grp = self.groups[2] if len(self.groups) > 2 else None
+        if not self._osm_layer.visible or (basemap_grp and not basemap_grp.visible):
+            if hasattr(self, "_osm_item") and self._osm_item is not None:
+                self._osm_item.hide()
+            return
+
+        view_rect = self._view_box.viewRect()
+        vx0 = min(view_rect.left(), view_rect.right())
+        vx1 = max(view_rect.left(), view_rect.right())
+        vy0 = min(view_rect.top(), view_rect.bottom())
+        vy1 = max(view_rect.top(), view_rect.bottom())
+
+        if abs(vx1 - vx0) < 1.0 or abs(vy1 - vy0) < 1.0:
+            return
+
+        target_size = (
+            max(256, int(self._plot_widget.width())),
+            max(256, int(self._plot_widget.height())),
+        )
+        crs = self._osm_layer.crs or self._detect_project_crs()
+        self._osm_layer.crs = crs
+        self._osm_worker.request_mosaic((vx0, vy0, vx1, vy1), crs, target_size=target_size)
+
+    def _on_osm_mosaic_ready(self, rgba: np.ndarray, bounds: Tuple[float, float, float, float]) -> None:
+        if not hasattr(self, "_osm_item") or self._osm_item is None:
+            return
+        basemap_grp = self.groups[2] if len(self.groups) > 2 else None
+        if not self._osm_layer.visible or (basemap_grp and not basemap_grp.visible):
+            self._osm_item.hide()
+            return
+
+        minx, miny, maxx, maxy = bounds
+        if self._osm_layer.opacity < 1.0:
+            rgba = rgba.copy()
+            rgba[..., 3] = (rgba[..., 3].astype(float) * max(0.0, min(1.0, self._osm_layer.opacity))).astype(np.uint8)
+
+        rgba_flipped = np.flipud(rgba)
+        self._osm_item.setImage(rgba_flipped.transpose(1, 0, 2), autoLevels=False)
+        self._osm_item.setRect(QRectF(minx, miny, maxx - minx, maxy - miny))
+        self._osm_item.show()
+
+    def closeEvent(self, event) -> None:
+        if hasattr(self, "_osm_worker") and self._osm_worker is not None:
+            self._osm_worker.stop()
+        super().closeEvent(event)
+
     def _on_view_range_changed(self) -> None:
         """Called dynamically on pan/zoom to fetch decimated raster viewports."""
+        self._render_osm_basemap()
         self._render_raster_layers()
 
     def _render_all_layers(self) -> None:
+        self._render_osm_basemap()
         self._render_raster_layers()
         self._render_vector_layers()
 

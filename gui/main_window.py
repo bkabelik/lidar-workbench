@@ -2548,6 +2548,8 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
             xs=profile.xs,
             ys=profile.ys,
             zs=profile.elevations,  # elevations ARE the Z values
+            return_numbers=profile.return_numbers,
+            point_source_ids=profile.point_source_ids,
         )
 
         # Extract DTM profile for reference line
@@ -2568,7 +2570,7 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
         if len(profile.distances) > 0:
             self.set_status(
                 f"Profile: {len(profile.distances)} pts / {profile.distances[-1]:.1f} m "
-                f"(width={self._profile_width:.1f} m, scroll to adjust, click to confirm)",
+                f"(width={self._profile_width:.1f} m, Ctrl+Scroll to adjust)",
                 timeout=8000,
             )
         else:
@@ -2624,6 +2626,8 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
             xs=profile.xs,
             ys=profile.ys,
             zs=profile.elevations,
+            return_numbers=profile.return_numbers,
+            point_source_ids=profile.point_source_ids,
         )
         # Restore DTM reference line
         if self._dtm_ref_distances is not None:
@@ -2632,7 +2636,7 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
             )
         self.set_status(
             f"Profile width: {self._profile_width:.1f} m — "
-            f"{len(profile.distances)} pts (scroll to adjust, click to confirm)",
+            f"{len(profile.distances)} pts (Ctrl+Scroll to adjust)",
             timeout=3000,
         )
 
@@ -2793,6 +2797,8 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
                     xs=profile.xs,
                     ys=profile.ys,
                     zs=profile.elevations,
+                    return_numbers=profile.return_numbers,
+                    point_source_ids=profile.point_source_ids,
                 )
                 self._multi_view._apply_class_visibility("profile")
                 if self._dtm_ref_distances is not None:
