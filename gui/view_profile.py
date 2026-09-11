@@ -1,9 +1,28 @@
 """
 LiDAR Workbench — Profile View (2D Side View).
 
-Displays a 2D scatter plot of points along a profile line, coloured
-by ASPRS class, with a DTM reference line and interactive selection
-tools (line-above/below, rectangle, brush).
+Displays an interactive 2D cross-section scatter plot along an arbitrary or polyline
+corridor, showing distance-on-profile (X axis) vs. elevation (Z axis).
+
+Key capabilities:
+- Vectorized Offscreen Rendering:
+  Points are pre-rendered into an offscreen QPixmap buffer using NumPy RGBA blitting,
+  allowing 120+ FPS hover feedback, brush manipulation, and interactive line drawing
+  without per-frame point redraw bottlenecks.
+- Upper-Left HUD Overlay:
+  Real-time semi-transparent card showing current corridor width (m) and direct keybinds:
+  - Mouse Scroll: Smooth zoom centered at cursor position
+  - Middle-Click Drag: Pan view
+  - Ctrl + Mouse Scroll: Dynamically adjust corridor width (m)
+  - Shift + Mouse Scroll or [ / ]: Dynamically adjust brush radius or rect brush dimensions
+- Interactive Selection & Manual QC Editing Tools:
+  - Brush (B): Circular paint selection
+  - Rect Brush (Shift+R): Rectangular paint selection
+  - Rectangle (R): Box selection
+  - Above Line (A) / Below Line (L): Angle/slope guided reclassification
+- Multi-Attribute Color Coding:
+  Supports Class (ASPRS), Height (Z elevation), Intensity (raw reflectance),
+  Return Number, and Flightline (Point Source ID).
 """
 
 from __future__ import annotations
@@ -17,6 +36,7 @@ from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QFont,
     QImage,
     QMouseEvent,
     QPainter,
@@ -51,14 +71,20 @@ class ViewProfile(QWidget):
     2D profile side-view widget.
 
     Shows distance-on-profile (X axis) vs. elevation (Y axis).
-    Supports four selection modes and reports selection masks.
+    Supports brush, rectangular brush, line above/below, and bounding rectangle
+    selection modes, rendering live HUD feedback and emitting selection masks.
 
     Signals:
         selection_changed(mask: np.ndarray):
             Emitted when the user completes a selection operation.
-            The mask is a boolean array over the profile points.
         selection_mode_changed(mode: str):
             Emitted when the active selection tool changes.
+        profile_width_changed(width: float):
+            Emitted when the corridor width is adjusted (e.g. via Ctrl+Scroll).
+        brush_size_changed(radius: float):
+            Emitted when brush radius is adjusted (e.g. via Shift+Scroll or [ / ]).
+        rect_size_changed(half_w: float, half_h: float):
+            Emitted when rect brush dimensions are adjusted.
     """
 
     selection_changed = Signal(np.ndarray)
@@ -506,6 +532,29 @@ class ViewProfile(QWidget):
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(QColor(0, 255, 128, 255)))
                 painter.drawEllipse(QPointF(cx, cy), 3, 3)
+
+            # ── Upper-left shortcut & corridor explanation overlay ─────────
+            painter.setPen(QPen(QColor(60, 70, 85, 180), 1))
+            painter.setBrush(QBrush(QColor(18, 22, 30, 215)))
+            hud_rect = QRectF(10, 10, 310, 52)
+            painter.drawRoundedRect(hud_rect, 6, 6)
+
+            font_bold = QFont()
+            font_bold.setPointSize(9)
+            font_bold.setBold(True)
+            painter.setFont(font_bold)
+            painter.setPen(QColor("#58a6ff"))
+            painter.drawText(QRectF(18, 13, 290, 16), Qt.AlignLeft | Qt.AlignVCenter,
+                             f"Corridor Width: {self._total_width:.1f} m")
+
+            font_small = QFont()
+            font_small.setPointSize(8)
+            painter.setFont(font_small)
+            painter.setPen(QColor("#c9d1d9"))
+            painter.drawText(QRectF(18, 29, 290, 15), Qt.AlignLeft | Qt.AlignVCenter,
+                             "Ctrl + Scroll : Change corridor width")
+            painter.drawText(QRectF(18, 44, 290, 15), Qt.AlignLeft | Qt.AlignVCenter,
+                             "Shift + Scroll or [ / ] : Adjust brush / rect size")
         finally:
             if painter.isActive():
                 painter.end()

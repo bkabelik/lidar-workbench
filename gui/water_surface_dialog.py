@@ -562,12 +562,14 @@ class _StationRibbon(QWidget):
 class _WSM2DMapView(QWidget):
     """
     2D Plan View map showing:
-    - Decimated channel point cloud scatter for quick verification
-    - OpenStreetMap background tiles (optional toggle)
+    - High-contrast channel intensity raster (0.5m / 0.25m) using NumPy bincount and percentile stretch,
+      clearly revealing water surface voids, water edges, and riverbanks for complete channel coverage
+    - Elevation raster option (0.5m) and decimated point cloud scatter fallback
+    - Streamed OpenStreetMap (OSM) background tiles (optional toggle with reprojection)
     - River centerline polyline
     - Cross-section cut lines (cyan = auto, green = locked anchor, orange = current section)
-    - Click on any cross-section to jump directly to it
-    - Click and drag a line across the channel to insert a new cross-section
+    - Interactive cross-section selection: click on any cut line to jump directly to it
+    - Interactive manual profile creation: click and drag a line across the channel to insert a new cross-section
     """
 
     section_clicked = Signal(int)
@@ -697,6 +699,16 @@ class _WSM2DMapView(QWidget):
         self._plot.plotItem.vb.sigRangeChanged.connect(self._on_view_range_changed)
 
         self._plot.viewport().installEventFilter(self)
+
+    def closeEvent(self, event):
+        if hasattr(self, "_osm_worker") and self._osm_worker is not None:
+            self._osm_worker.stop()
+        super().closeEvent(event)
+
+    def close(self):
+        if hasattr(self, "_osm_worker") and self._osm_worker is not None:
+            self._osm_worker.stop()
+        return super().close()
 
     def set_data_epsg(self, epsg: int) -> None:
         self._data_epsg = epsg
@@ -2128,6 +2140,11 @@ class WaterSurfaceDialog(QDialog):
         self._status_label.setText(
             f"Removed section at station {s_val:.1f} m. {len(self._stations)} sections remaining."
         )
+
+    def close(self):
+        if hasattr(self, "_map_2d") and hasattr(self._map_2d, "_osm_worker"):
+            self._map_2d._osm_worker.stop()
+        return super().close()
 
     def closeEvent(self, event):
         if hasattr(self, "_map_2d") and hasattr(self._map_2d, "_osm_worker"):

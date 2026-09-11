@@ -11,19 +11,32 @@ Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.c
 
 ## Features
 
-### Point Cloud Processing
+### Point Cloud Processing & AI
 - **LAS/LAZ Preview** — standalone file inspector with bounding box, subsampled, and full-resolution LODs before import
 - **Drag-and-drop import** of `.las`/`.laz` flight strips with automatic spatial tiling
 - **Interactive noise filtering** — SOR, ROR, DBSCAN, isolated-point, low-point, and surface-proximity filters with real-time 3D preview
 - **Pointcept integration** — deep-learning classification via Point Transformer V3
-- **Manual editing** — profile-based inspection with brush, rect brush, line-above/below, and rectangle selection tools; class reassignment
-- **Full undo/redo** stack for all classification edits
+- **Manual editing & QC** — ultra-responsive profile-based inspection with brush, rect brush, line-above/below, and rectangle selection tools; class reassignment with full undo/redo stack
 
-### Multi-View Workspace
-- **3D point cloud** — class-coloured rendering with orbit/pan/zoom controls
-- **DTM top-down** — hillshade DTM with interactive profile-line drawing
-- **2D profile side** — corridor cross-section with selection tools and DTM reference overlay
-- **3D profile slice** — perspective view of the profile corridor
+### Multi-View Workspace & Synchronized Inspection
+- **3D point cloud** — class/height/intensity/return/flightline coloured rendering with orbit/pan/zoom controls
+- **DTM top-down** — hillshade DTM with interactive profile-line drawing and class/flightline point scatter
+- **2D profile side view** — high-performance offscreen-rendered cross-section corridor (120+ FPS) with live HUD overlay, mouse-wheel shortcuts, and DTM reference overlay
+- **Multi-Attribute LiDAR Colouring** — synchronized across 3D, DTM, and Profile views (By Class, By Height, By Intensity, By Return Number, By Flightline)
+- **Dynamic corridor width & tool sizing** — adjust slice width and tool dimensions directly from the toolbar spinboxes or via hotkeys
+
+### Water Surface Modeler (WSM)
+- **Ergonomic vertical layout** — 2D Plan View map placed directly above the 1D cross-section elevation editor
+- **2D Channel Intensity Raster** — binned 0.25 m / 0.5 m intensity maps highlighting NIR water absorption voids and bank boundaries to guarantee full channel coverage
+- **Interactive cross-section editing** — color-coded normal profiles (cyan), locked anchors (green), and active profile (orange) with drag handles and click-to-jump navigation
+- **Complete channel persistence** — "Save All Profiles" and "Load All Profiles" in JSON/GeoJSON format for seamless multi-session editing
+- **Downstream monotonicity enforcement** — ensures physically realistic descending water surface elevations along the river reach
+- **GeoTIFF Export** — exports high-resolution 3D raster water surface models
+
+### Point QC & Flight Strip Alignment
+- **2D Difference Map** — pairwise and max strip difference rasters highlighting vertical misalignments across overlapping flightlines
+- **Dynamic Color Stretch** — custom min/max elevation difference clipping (e.g. 0.0 m to 0.3 m) with quick presets for sub-decimeter QA
+- **OpenStreetMap Basemap** — asynchronous multithreaded tile downloading, disk caching, and on-the-fly reprojection to project CRS (e.g. UTM EPSG:25833)
 
 ### DTM / DSM Export
 - **DTM** — Delaunay-triangulation (TIN) interpolation of ground points (class 2) to a regular grid
@@ -97,17 +110,35 @@ python -m lidar_workbench.main /path/to/project
 3. **Import LAS/LAZ data** — *File → Import LAS/LAZ* (Ctrl+I) or drag-and-drop a folder onto the window
 4. **Apply noise filter** — Select tiles in the tile list → *Tools → Noise Filter* → choose filter type → *Apply*
 5. **Classify with Pointcept** (optional) — Select filtered tiles → *Tools → Classify (Pointcept)* → configure → *Start*
-6. **Manual editing** — Double-click a classified tile to open the multi-view:
-   - Draw a profile line in the DTM view (right-click + drag)
-   - Select misclassified points in the profile view using any selection tool:
+6. **Manual editing & QC** — Double-click a classified tile to open the multi-view:
+   - Draw a cross-section line in the DTM view (right-click + drag)
+   - Inspect cross-section points in the 2D Profile View with instant 120+ FPS cached rendering
+   - Check the **Upper-Left HUD Overlay** for the active corridor width and shortcut hints
+   - Dynamically adjust profile parameters on the fly:
+     - `Ctrl + Mouse Scroll`: Expand or shrink corridor slice width (e.g. 0.5 m to 20 m)
+     - `Shift + Mouse Scroll` or `[` / `]`: Scale circular brush radius or rectangular brush dimensions
+     - Mouse Scroll: Zoom smoothly centered at cursor
+     - Middle-click Drag: Pan view
+   - Direct toolbar spinbox controls: adjust **Radius**, **W**, **H**, and **Corridor** with live bidirectional sync
+   - Switch colour modes on the toolbar: **By Class**, **By Height**, **By Intensity**, **By Return Number**, or **By Flightline**
+   - Select misclassified points using any selection tool:
      - **Brush** (B) — click/drag to paint a circular region
      - **Rect Brush** (Shift+R) — click/drag to paint a rectangular region
      - **Above Line** (A) / **Below Line** (L) — draw a line to classify points above/below it
      - **Rectangle** (R) — drag to select points in a rectangular area
-   - Tool sizes (brush radius, rect brush dimensions) are configurable in *Tools → Settings*
-   - Click a class button in the properties panel to reclassify
+   - Click a class button in the properties panel to reclassify selected points
    - *Undo*/*Redo* as needed (Ctrl+Z / Ctrl+Y)
-7. **Export raster** — *Tools → Export Raster (DTM / DSM)*:
+7. **Water Surface Modeling (WSM)** (optional) — *Tools → Water Surface Model (WSM)*:
+   - Ergonomic vertical view: 2D Plan Map positioned above the 1D cross-section viewer
+   - Select **Intensity 0.5 m** or **0.25 m** raster to clearly reveal water voids, shorelines, and banks
+   - Step through sections (`A` / `D`), adjust water levels (`W` / `S`), and lock anchor sections (`Space`)
+   - Click **Save All Profiles…** to persist all cross-section parameters across project sessions
+   - Enforce downstream monotonicity and rasterize a seamless 3D water surface GeoTIFF
+8. **Point QC & Strip Alignment** (optional) — *Tools → Point QC 2D Map*:
+   - Stream OpenStreetMap (OSM) satellite/cartographic basemap tiles reprojected to your project CRS
+   - Review pairwise and Max Strip Difference rasters to identify vertical calibration offsets
+   - Adjust Min/Max color stretch (e.g. 0.0 m to 0.3 m) with quick presets for sub-decimeter elevation QC
+9. **Export raster** — *Tools → Export Raster (DTM / DSM)*:
    - Choose **DTM** (ground-only TIN interpolation) or **DSM** (max-Z from selected classes)
    - Set resolution (e.g. 0.5 m) and output directory
    - Toggle hillshade, merged vs tiled output
@@ -131,6 +162,51 @@ process with GDAL.
 
 ---
 
+## Manual QC Profile View Controls & HUD
+
+The 2D Profile View incorporates an ultra-fast offscreen bitmap caching engine (rendering at 120+ FPS) and an upper-left HUD card displaying live feedback:
+
+| Shortcut / Control | Function | Description |
+|---|---|---|
+| **Ctrl + Mouse Scroll** | Adjust Corridor Width | Dynamically widens or narrows the profile cross-section slice (0.5 m increments). Live width is displayed in the HUD and synchronised with the toolbar spinbox. |
+| **Shift + Mouse Scroll** | Adjust Brush / Rect Size | Dynamically scales the circular brush radius or rectangular brush dimensions. Synchronised with the toolbar spinboxes. |
+| **`[` / `]` Keys** | Step Tool Size | Alternate keybind to decrease / increase active brush or rect brush size by 15%. |
+| **Mouse Scroll** | Zoom View | Smooth zoom centered at the current mouse cursor position without affecting corridor width. |
+| **Middle-Click Drag** | Pan View | Pan the 2D cross-section elevation and distance axes. |
+| **Left-Click / Drag** | Apply Tool | Paint or draw using the active selection tool (Brush, Rect Brush, Above Line, Below Line, Rectangle). |
+| **Upper-Left HUD Card** | Live Status Card | Semi-transparent rounded overlay displaying: `Corridor Width: X.X m`, `Ctrl + Scroll : Change corridor width`, and `Shift + Scroll or [ / ] : Adjust brush / rect size`. |
+
+---
+
+## Water Surface Modeler (WSM)
+
+The Water Surface Modeler generates physically consistent water surface elevation models (3D GeoTIFF) along river corridors:
+
+- **Vertical Split Layout**: The 2D Plan View map is positioned directly above the 1D cross-section editor, providing intuitive geographic alignment while refining individual profiles.
+- **2D Channel Intensity Raster**: High-contrast 0.25 m / 0.5 m binned intensity raster (`np.bincount` with percentile stretch) reveals NIR shoreline voids and riverbanks even when water point returns are sparse, ensuring the operator has complete channel coverage.
+- **Overlaid Cross-Sections**: 2D cut lines display status at a glance:
+  - Cyan lines: Auto-generated cross-sections.
+  - Lime green lines: Locked anchor sections confirmed by the user.
+  - Glowing orange line: Active cross-section currently loaded in the 1D editor.
+- **Batch Profile Management**:
+  - **Save All Profiles…**: Exports the entire sequence of cross-sections, locked anchors, embankment offsets, and elevations into a single JSON/GeoJSON project file.
+  - **Load All Profiles…**: Restores full channel state in one click for uninterrupted multi-session editing.
+- **Monotonicity & Geometry**: Enforces strictly descending downstream water surface profiles and interpolates smoothly between user-locked anchors.
+
+---
+
+## Point QC & Strip Alignment 2D Map
+
+- **OpenStreetMap Basemap**: Streamed slippy map tiles cached locally on disk (`~/.cache/lidar_workbench/osm_tiles`) and reprojected asynchronously via `rasterio.warp` to the project's native CRS.
+- **Difference Rasters**:
+  - Pairwise strip difference rasters: Compute vertical deviations between specific overlapping flight strips.
+  - Max Strip Difference raster: Computes the maximum elevation discrepancy across all flightlines per raster cell.
+- **Dynamic Color Stretch**:
+  - Interactive Min and Max value spinboxes (e.g. 0.0 m to 0.3 m) allow isolating sub-decimeter vertical calibration offsets.
+  - Instant preset buttons for standard elevation error ranges.
+
+---
+
 ## Architecture
 
 ```
@@ -147,14 +223,18 @@ lidar_workbench/
 ├── dtm_generator.py             # In-memory DTM interpolation
 ├── export_manager.py            # DTM/DSM/Hillshade export engine
 ├── manual_edit.py               # Profile extraction, selections, undo/redo
+├── centerline_wsm.py            # River centerline extraction, interpolation & GeoTIFF export
 ├── gui/
 │   ├── main_window.py           # QMainWindow (menus, toolbar, 3-panel splitter)
 │   ├── tile_list_widget.py      # Tile browser with status groups
-│   ├── multi_view_widget.py     # 2×2 / 1×3 view layout manager
+│   ├── multi_view_widget.py     # Synchronized 3D, DTM, and Profile view layout
 │   ├── view_3d.py               # Open3D 3D point cloud widget
 │   ├── view_dtm.py              # 2D DTM view with profile drawing
-│   ├── view_profile.py          # 2D profile side view with selection tools
+│   ├── view_profile.py          # 2D profile side view with 120+ FPS cache & HUD
 │   ├── view_profile_3d.py       # 3D profile corridor view
+│   ├── water_surface_dialog.py  # WSM generator (vertical 2D intensity map + 1D editor)
+│   ├── point_qc_layers.py       # Strip difference raster layers & min/max stretch
+│   ├── osm_basemap.py           # OSM tile downloader, disk cache & reprojection worker
 │   ├── filter_dialog.py         # Noise filter parameter dialog
 │   ├── classification_dialog.py # Pointcept configuration dialog
 │   ├── export_dialog.py         # DTM/DSM export configuration dialog

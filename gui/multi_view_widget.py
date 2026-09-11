@@ -10,7 +10,19 @@ resizable layout:
     │    ViewProfile       │  ← full-width bottom
     └──────────────────────┘
 
-Colour modes are synchronised across the 3D overview.
+Toolbar controls:
+- Unified Colour Mode Selector:
+  Synchronised across View3D, ViewDTM, and ViewProfile (Class, Height, Intensity,
+  Return Number, Flightline).
+- Manual QC Tool Sizing:
+  - Radius spinbox: Brush radius in metres (bidirectional sync with Profile View).
+  - W & H spinboxes: Rectangular brush dimensions in metres.
+  - Corridor spinbox: Profile slice corridor width in metres (bidirectional sync with
+    Profile View HUD and Ctrl+Scroll adjustments).
+- Per-Viewer ASPRS Class Filters:
+  Toggle class visibility independently for 3D, DTM, or Profile.
+- Flightline / Strip Toggles:
+  Inspect individual flightlines or check inter-strip overlap.
 """
 
 from __future__ import annotations
@@ -50,12 +62,12 @@ class MultiViewWidget(QWidget):
 
     Layout:
         ``QVBoxLayout``
-        ├── toolbar (colour combo)
+        ├── toolbar (selection mode, tool dimensions, corridor width, colour mode, class filters)
         └── vertical ``QSplitter``
             ├── top horizontal ``QSplitter``
             │   ├── :class:`View3D`      (3D point cloud)
-            │   └── :class:`ViewDTM`     (2D top-down DTM)
-            └── :class:`ViewProfile`      (2D profile side view, full width)
+            │   └── :class:`ViewDTM`     (2D top-down DTM with profile cut line drawing)
+            └── :class:`ViewProfile`      (2D profile side view, full width, with offscreen caching & HUD)
 
     Signals:
         profile_line_defined(start_xy, end_xy):

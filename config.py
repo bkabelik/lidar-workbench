@@ -14,7 +14,7 @@ from typing import Dict, Final, Tuple
 
 # ── Application metadata ──────────────────────────────────────────────
 APP_NAME: Final[str] = "LiDAR Workbench"
-APP_VERSION: Final[str] = "0.1.0"
+APP_VERSION: Final[str] = "1.0"
 APP_ORG: Final[str] = "Kabelik GmbH"
 APP_WEBSITE: Final[str] = "https://kabelik.at"
 APP_DESCRIPTION: Final[str] = (

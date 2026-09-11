@@ -31,7 +31,7 @@ if __name__ == "__main__" and __package__ is None:
         sys.path.insert(0, _parent_dir)
     __package__ = "lidar_workbench"
 
-from .config import APP_NAME, APP_ORG, setup_logging
+from .config import APP_NAME, APP_ORG, APP_VERSION, setup_logging
 from .database import Database
 from .project_manager import ProjectManager
 from .tile_manager import TileManager
@@ -66,7 +66,7 @@ def main() -> int:
 
     # Logging
     logger = setup_logging(args.log_file, level=logging.DEBUG)
-    logger.info("LiDAR Workbench %s starting", "0.1.0")
+    logger.info("LiDAR Workbench %s starting", APP_VERSION)
 
     # Qt application (high-DPI is automatic in Qt 6)
     app = QApplication(sys.argv)

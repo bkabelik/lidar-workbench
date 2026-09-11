@@ -256,5 +256,8 @@ class OSMBasemapWorker(QThread):
 
     def stop(self) -> None:
         self._is_running = False
-        self.wait(1000)
+        self._pending_request = None
+        if self.isRunning():
+            self.quit()
+            self.wait(1000)
 

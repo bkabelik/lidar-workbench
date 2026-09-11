@@ -19,6 +19,7 @@ if str(root) not in sys.path:
     sys.path.insert(0, str(root))
 
 from PySide6.QtCore import QPointF, Qt
+from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication, QSplitter
 
 from lidar_workbench.gui.osm_basemap import (
@@ -46,19 +47,18 @@ class TestOSMAndGuiFeatures(unittest.TestCase):
 
     def test_osm_basemap_layer_serialization(self):
         """Test OSMBasemapLayer serialization and deserialization."""
-        osm_layer = OSMBasemapLayer(name="OpenStreetMap", visible=True, opacity=0.85, crs_epsg=25833)
-        self.assertEqual(osm_layer.type_name, "osm_basemap")
+        osm_layer = OSMBasemapLayer(name="OpenStreetMap", visible=True, opacity=0.85, crs="EPSG:25833")
         self.assertEqual(osm_layer.opacity, 0.85)
 
         data = osm_layer.to_dict()
-        self.assertEqual(data["type"], "osm_basemap")
+        self.assertEqual(data["type"], "basemap_osm")
         self.assertEqual(data["opacity"], 0.85)
-        self.assertEqual(data["crs_epsg"], 25833)
+        self.assertEqual(data["crs"], "EPSG:25833")
 
         restored = OSMBasemapLayer.from_dict(data)
         self.assertEqual(restored.name, "OpenStreetMap")
         self.assertEqual(restored.opacity, 0.85)
-        self.assertEqual(restored.crs_epsg, 25833)
+        self.assertEqual(restored.crs, "EPSG:25833")
         self.assertTrue(restored.visible)
 
     def test_osm_tile_cache(self):
@@ -90,8 +90,8 @@ class TestOSMAndGuiFeatures(unittest.TestCase):
         return_num = np.random.choice([1, 2, 3], n)
         flightline = np.random.choice([1, 2], n)
 
-        prof.set_data(
-            x=x, y=z, classifications=cls,
+        prof.set_profile_data(
+            distances=x, elevations=z, classifications=cls,
             intensities=intensity,
             return_numbers=return_num,
             point_source_ids=flightline,
@@ -106,26 +106,31 @@ class TestOSMAndGuiFeatures(unittest.TestCase):
         self.assertFalse(prof._base_dirty)
         self.assertIsNotNone(prof._base_pixmap)
 
+        # Render profile view to test paintEvent including HUD overlay
+        pixmap = QPixmap(800, 400)
+        prof.render(pixmap)
+        self.assertFalse(pixmap.isNull())
+
         modes = ["class", "height", "intensity", "return_number", "flightline"]
         for m in modes:
             prof.set_colour_mode(m)
             self.assertEqual(prof._colour_mode, m)
 
         # Test brush and rect sizes on ViewProfile
-        prof.set_brush_size(1.5)
+        prof.set_brush_radius(1.5)
         self.assertAlmostEqual(prof._brush_radius, 1.5)
         prof.set_rect_size(2.0, 1.0)
-        self.assertAlmostEqual(prof._rect_w, 2.0)
-        self.assertAlmostEqual(prof._rect_h, 1.0)
+        self.assertAlmostEqual(prof._rect_width, 2.0)
+        self.assertAlmostEqual(prof._rect_height, 1.0)
 
         # DTM View tests
-        dtm.set_scatter_points(
-            x=x, y=y, z=z,
-            classifications=cls,
-            intensities=intensity,
-            return_numbers=return_num,
-            point_source_ids=flightline,
-        )
+        dtm.load_points({
+            "x": x, "y": y, "z": z,
+            "classification": cls,
+            "intensity": intensity,
+            "return_number": return_num,
+            "point_source_id": flightline,
+        })
         for m in modes:
             dtm.set_colour_mode(m)
             self.assertEqual(dtm._colour_mode, m)
@@ -135,31 +140,32 @@ class TestOSMAndGuiFeatures(unittest.TestCase):
 
     def test_multi_view_widget_controls(self):
         """Test that MultiViewWidget exposes radius, w, h, corridor spinboxes and syncs them."""
-        mv = MultiViewWidget()
-        self.assertTrue(hasattr(mv, "_brush_r_spin"))
-        self.assertTrue(hasattr(mv, "_rect_w_spin"))
-        self.assertTrue(hasattr(mv, "_rect_h_spin"))
-        self.assertTrue(hasattr(mv, "_corridor_spin"))
+        with patch("lidar_workbench.gui.view_3d.View3D._init_renderer"):
+            mv = MultiViewWidget()
+            self.assertTrue(hasattr(mv, "_brush_size_spin"))
+            self.assertTrue(hasattr(mv, "_rect_w_spin"))
+            self.assertTrue(hasattr(mv, "_rect_h_spin"))
+            self.assertTrue(hasattr(mv, "_corridor_spin"))
 
-        # Changing spinboxes updates profile view
-        mv._brush_r_spin.setValue(0.75)
-        self.assertAlmostEqual(mv.profile_view._brush_radius, 0.75)
+            # Changing spinboxes updates profile view
+            mv._brush_size_spin.setValue(0.75)
+            self.assertAlmostEqual(mv._view_profile._brush_radius, 0.75)
 
-        mv._rect_w_spin.setValue(0.8)
-        mv._rect_h_spin.setValue(0.4)
-        self.assertAlmostEqual(mv.profile_view._rect_w, 0.8)
-        self.assertAlmostEqual(mv.profile_view._rect_h, 0.4)
+            mv._rect_w_spin.setValue(0.8)
+            mv._rect_h_spin.setValue(0.4)
+            self.assertAlmostEqual(mv._view_profile._rect_width, 0.4)
+            self.assertAlmostEqual(mv._view_profile._rect_height, 0.2)
 
-        # Changing corridor width spinbox
-        mv._corridor_spin.setValue(3.5)
-        self.assertAlmostEqual(mv.profile_view._total_width, 3.5)
+            # Changing corridor width spinbox
+            mv._corridor_spin.setValue(3.5)
+            self.assertAlmostEqual(mv._view_profile._total_width, 3.5)
 
-        # Test colour mode selector
-        mv._colour_combo.setCurrentText("Flightline")
-        self.assertEqual(mv.profile_view._colour_mode, "flightline")
-        self.assertEqual(mv.dtm_view._colour_mode, "flightline")
+            # Test colour mode selector
+            mv._colour_combo.setCurrentIndex(mv._colour_combo.findData("flightline"))
+            self.assertEqual(mv._view_profile._colour_mode, "flightline")
+            self.assertEqual(mv._view_dtm._colour_mode, "flightline")
 
-        mv.close()
+            mv.close()
 
     def test_wsm_2d_map_and_buttons(self):
         """Test WSM 2D Map View, Intensity raster, and vertical layout above profile view."""
@@ -194,16 +200,19 @@ class TestOSMAndGuiFeatures(unittest.TestCase):
         # Update cross-sections
         stations = np.array([0.0, 30.0, 60.0])
         locked = np.array([True, False, True])
-        left_off = np.array([-10.0, -10.0, -10.0])
-        right_off = np.array([10.0, 10.0, 10.0])
-        map_view.update_cross_sections(stations, locked, left_off, right_off, active_idx=1)
+        map_view.set_sections(centerline, stations, locked, corridor_width=20.0)
         self.assertIsNotNone(map_view._sections_curve_normal.xData)
 
         # Create dialog (without parent or full run) to verify button labels & vertical splitter
-        dlg = WaterSurfaceDialog(centerline=centerline, crs_epsg=25833)
+        dlg = WaterSurfaceDialog(
+            project_dir=tempfile.gettempdir(),
+            load_points_func=lambda: None,
+            data_epsg=25833,
+        )
+        dlg._full_centerline = centerline
         self.assertEqual(dlg._save_btn.text(), "💾 Save All Profiles…")
         self.assertEqual(dlg._load_btn.text(), "📂 Load All Profiles…")
-        self.assertTrue(dlg._wsm_map is not None)
+        self.assertTrue(dlg._map_2d is not None)
 
         # Find the splitter holding _map_2d and verify vertical orientation (2D map above profile view)
         splitters = dlg.findChildren(QSplitter)
