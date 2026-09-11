@@ -218,13 +218,17 @@ class View3D(QWidget):
         # Cleanup is done explicitly via MultiViewWidget.cleanup().
 
     def _cleanup_renderer(self):
-        """Release OpenGL resources. Called explicitly, not on destroyed."""
+        """Release OpenGL and Filament resources safely."""
         if self._renderer is not None:
-            # Null Python references first so the C++ destructor
-            # doesn't try to access already-freed Filament resources.
+            if self._scene is not None:
+                try:
+                    self._scene.clear_geometry()
+                except Exception:
+                    pass
             self._scene = None
             self._picked_geom = None
             self._highlight_geom = None
+            self._marker_geom = None
             try:
                 del self._renderer
             except Exception:

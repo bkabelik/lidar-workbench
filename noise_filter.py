@@ -204,6 +204,90 @@ def apply_filter_to_tile(
     )
 
 
+def _estimate_surface_grid(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    grid_size: float = 2.0,
+    classifications: Optional[np.ndarray] = None,
+    reference_class: Optional[int] = None,
+) -> np.ndarray:
+    """
+    Fast raster estimation of ground/lowest surface elevation for every input point.
+
+    Uses O(N) cell minimum binning via numpy.minimum.at, instant Euclidean distance
+    transform for NaN hole filling, and 3x3 median filtering to reject isolated pit noise.
+    Returns array of estimated surface Z values interpolated at each (xs, ys).
+    """
+    n = len(xs)
+    if n == 0:
+        return np.zeros(0, dtype=np.float64)
+    if n < 10 or grid_size <= 0:
+        return np.full(n, float(np.median(zs)), dtype=np.float64)
+
+    min_x, max_x = float(xs.min()), float(xs.max())
+    min_y, max_y = float(ys.min()), float(ys.max())
+
+    nx = max(int(np.ceil((max_x - min_x) / grid_size)) + 1, 1)
+    ny = max(int(np.ceil((max_y - min_y) / grid_size)) + 1, 1)
+
+    # If reference_class is set, only use those points to build the surface
+    if reference_class is not None and classifications is not None:
+        ref_mask = (classifications == reference_class)
+        if ref_mask.sum() >= 10:
+            grid_xs, grid_ys, grid_zs = xs[ref_mask], ys[ref_mask], zs[ref_mask]
+        else:
+            grid_xs, grid_ys, grid_zs = xs, ys, zs
+    else:
+        grid_xs, grid_ys, grid_zs = xs, ys, zs
+
+    gx = np.clip(((grid_xs - min_x) / grid_size).astype(np.int32), 0, nx - 1)
+    gy = np.clip(((grid_ys - min_y) / grid_size).astype(np.int32), 0, ny - 1)
+    flat_idx = gx * ny + gy
+
+    grid_flat = np.full(nx * ny, np.inf, dtype=np.float32)
+    np.minimum.at(grid_flat, flat_idx, grid_zs.astype(np.float32))
+    grid = grid_flat.reshape((nx, ny))
+    grid[np.isinf(grid)] = np.nan
+
+    # Fill NaNs using distance_transform_edt (morphological nearest-neighbor fill)
+    nan_mask = np.isnan(grid)
+    if np.any(nan_mask):
+        if not np.all(nan_mask):
+            try:
+                import scipy.ndimage as ndimage
+                indices = ndimage.distance_transform_edt(nan_mask, return_distances=False, return_indices=True)
+                grid = grid[tuple(indices)]
+            except Exception:
+                grid[nan_mask] = float(np.median(zs))
+        else:
+            grid.fill(float(np.median(zs)))
+
+    # 3x3 median filter to eliminate single-cell pit outliers
+    try:
+        import scipy.ndimage as ndimage
+        grid = ndimage.median_filter(grid, size=3)
+    except Exception:
+        pass
+
+    # Bilinear interpolation back to all points (xs, ys)
+    fx = np.clip((xs - min_x) / grid_size, 0, nx - 1)
+    fy = np.clip((ys - min_y) / grid_size, 0, ny - 1)
+    x0 = np.clip(np.floor(fx).astype(np.int32), 0, nx - 1)
+    y0 = np.clip(np.floor(fy).astype(np.int32), 0, ny - 1)
+    x1 = np.clip(x0 + 1, 0, nx - 1)
+    y1 = np.clip(y0 + 1, 0, ny - 1)
+    wx = fx - x0
+    wy = fy - y0
+
+    z_surf = (grid[x0, y0] * (1 - wx) * (1 - wy) +
+              grid[x1, y0] * wx * (1 - wy) +
+              grid[x0, y1] * (1 - wx) * wy +
+              grid[x1, y1] * wx * wy)
+
+    return z_surf
+
+
 def dbscan_outlier_removal(
     xs: np.ndarray,
     ys: np.ndarray,
@@ -212,29 +296,35 @@ def dbscan_outlier_removal(
     min_samples: int = 10,
     min_cluster_size: int = 50,
     mode: str = "above",
+    height_above_surface: float = 2.0,
+    depth_below_surface: float = 2.0,
+    classifications: Optional[np.ndarray] = None,
     progress: ProgressCB = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    DBSCAN-based outlier removal.
+    Surface-constrained DBSCAN outlier removal.
 
-    Clusters points in 3-D space using scikit-learn's DBSCAN, then flags
-    points belonging to clusters smaller than *min_cluster_size* as outliers.
+    Restricts DBSCAN to candidate noise zones (elevated aerial fliers or sub-surface
+    pits relative to the local terrain/surface). Points inside the valid surface band
+    are kept untouched without running DBSCAN on them, providing massive speedups
+    and preserving real vegetation, buildings, and ground features.
 
-    The *mode* parameter restricts which small clusters are flagged:
-
-    - ``"above"`` — only flag small clusters whose mean Z is **above**
-      the global median Z (aerial noise: birds, dust, sensor artifacts).
-    - ``"below"`` — only flag small clusters whose mean Z is **below**
-      the global median Z (sub-surface noise: multipath errors).
-    - ``"both"`` — flag all small clusters regardless of elevation.
+    Candidate points are clustered using Open3D's C++ DBSCAN (with fallback to
+    scikit-learn). Unclustered noise (label -1) and points in clusters smaller than
+    *min_cluster_size* are flagged as outliers.
 
     Args:
-        xs, ys, zs:      Point coordinates.
-        eps:             DBSCAN neighbourhood radius (CRS units).
-        min_samples:     Minimum points to form a core point in DBSCAN.
-        min_cluster_size: Clusters smaller than this are noise candidates.
-        mode:            ``"above"``, ``"below"``, or ``"both"``.
-        progress:        Optional callback.
+        xs, ys, zs:            Point coordinates.
+        eps:                   DBSCAN neighbourhood radius (CRS units/metres).
+        min_samples:           Minimum points to form a core point.
+        min_cluster_size:      Clusters smaller than this are noise candidates.
+        mode:                  "above" (aerial noise), "below" (sub-surface), or "both".
+        height_above_surface:  Only run DBSCAN on points sitting more than this
+                               many metres above the estimated surface.
+        depth_below_surface:   Only run DBSCAN on points sitting more than this
+                               many metres below the estimated surface.
+        classifications:       Optional point classifications for ground surface reference.
+        progress:              Optional callback.
 
     Returns:
         ``(keep_mask, outlier_mask)``.
@@ -245,61 +335,71 @@ def dbscan_outlier_removal(
         return empty, empty
 
     if progress:
-        progress("DBSCAN clustering…", 5.0)
+        progress("DBSCAN: estimating local surface…", 10.0)
 
-    from sklearn.cluster import DBSCAN
+    # 1. Estimate local surface elevation across the tile
+    z_surf = _estimate_surface_grid(
+        xs, ys, zs, grid_size=2.0, classifications=classifications
+    )
 
-    points = np.column_stack((xs, ys, zs))
+    # 2. Select candidate noise points based on mode and surface offsets
+    if mode == "above":
+        cand_mask = zs > (z_surf + height_above_surface)
+    elif mode == "below":
+        cand_mask = zs < (z_surf - depth_below_surface)
+    else:  # "both" or "all"
+        cand_mask = (zs > (z_surf + height_above_surface)) | (zs < (z_surf - depth_below_surface))
 
-    # DBSCAN clustering
-    db = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1)
-    labels = db.fit_predict(points)
+    n_cand = int(cand_mask.sum())
+    if n_cand == 0:
+        if progress:
+            progress("DBSCAN: 0 outliers / {n} points", 100.0)
+        logger.info("DBSCAN (%s): 0 candidate noise points found.", mode)
+        return np.ones(n, dtype=bool), np.zeros(n, dtype=bool)
 
     if progress:
-        progress("Computing cluster sizes…", 60.0)
+        progress(f"DBSCAN: clustering {n_cand:,} candidate noise points…", 30.0)
 
-    n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-    logger.info("DBSCAN: %d clusters found (eps=%.2f, min_samples=%d)", n_clusters, eps, min_samples)
+    cand_pts = np.column_stack((xs[cand_mask], ys[cand_mask], zs[cand_mask]))
 
-    # Points with label == -1 are already noise (DBSCAN's own classification)
-    # PLUS points in clusters smaller than min_cluster_size
-    global_median_z = float(np.median(zs))
+    # 3. Cluster candidate points with Open3D C++ DBSCAN (fallback: sklearn)
+    labels = None
+    try:
+        import open3d as o3d
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(cand_pts)
+        labels = np.array(pcd.cluster_dbscan(eps=eps, min_points=min_samples, print_progress=False))
+    except Exception:
+        try:
+            from sklearn.cluster import DBSCAN
+            db = DBSCAN(eps=eps, min_samples=min_samples, n_jobs=-1)
+            labels = db.fit_predict(cand_pts)
+        except Exception as exc:
+            logger.warning("DBSCAN clustering failed: %s", exc)
+            return np.ones(n, dtype=bool), np.zeros(n, dtype=bool)
+
+    # 4. Outliers: noise points (label == -1) + small clusters (< min_cluster_size)
+    cand_outliers = (labels == -1)
+    valid_labels = labels[labels >= 0]
+    if len(valid_labels) > 0 and min_cluster_size > 1:
+        u_labels, counts = np.unique(valid_labels, return_counts=True)
+        small_cluster_ids = set(u_labels[counts < min_cluster_size])
+        if small_cluster_ids:
+            cand_outliers |= np.isin(labels, list(small_cluster_ids))
 
     outlier_mask = np.zeros(n, dtype=bool)
-
-    for label_val in set(labels):
-        cluster_mask = labels == label_val
-        cluster_size = cluster_mask.sum()
-
-        if label_val == -1:
-            # DBSCAN noise points — always out if mode allows
-            if mode == "both":
-                outlier_mask[cluster_mask] = True
-            elif mode == "above":
-                # Noise points above median
-                outlier_mask[cluster_mask] = zs[cluster_mask] > global_median_z
-            else:  # "below"
-                outlier_mask[cluster_mask] = zs[cluster_mask] < global_median_z
-        elif cluster_size < min_cluster_size:
-            cluster_mean_z = float(zs[cluster_mask].mean())
-            if mode == "both":
-                outlier_mask[cluster_mask] = True
-            elif mode == "above" and cluster_mean_z > global_median_z:
-                outlier_mask[cluster_mask] = True
-            elif mode == "below" and cluster_mean_z < global_median_z:
-                outlier_mask[cluster_mask] = True
-
+    outlier_mask[cand_mask] = cand_outliers
     keep_mask = ~outlier_mask
 
     if progress:
-        progress(
-            f"DBSCAN: {outlier_mask.sum()} outliers / {n} points", 100.0,
-        )
+        progress(f"DBSCAN: {outlier_mask.sum()} outliers / {n} points", 100.0)
 
     logger.info(
-        "DBSCAN (%s, eps=%.2f, min_samples=%d, min_cluster=%d): "
-        "%d outliers removed out of %d",
-        mode, eps, min_samples, min_cluster_size, outlier_mask.sum(), n,
+        "DBSCAN (%s, eps=%.2f, min_samples=%d, min_cluster=%d, h_above=%.1f, d_below=%.1f): "
+        "%d outliers removed out of %d (from %d candidates)",
+        mode, eps, min_samples, min_cluster_size,
+        height_above_surface, depth_below_surface,
+        outlier_mask.sum(), n, n_cand,
     )
     return keep_mask, outlier_mask
 
@@ -481,23 +581,25 @@ def low_point_removal(
     search_radius: float = 2.0,
     below_threshold: float = 1.0,
     above_threshold: float = 10.0,
+    k_neighbors: int = 12,
     progress: ProgressCB = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Low-point filter.
+    Low-point (pit / underground multipath) filter.
 
-    For each point the lowest and highest Z among neighbours within
-    *search_radius* is found.  If the point is more than
-    *below_threshold* below the lowest neighbour, or more than
-    *above_threshold* above the highest neighbour, it is flagged.
+    For each point, evaluates the lowest neighbour within *search_radius*
+    (strictly excluding the point itself). If the point is more than
+    *below_threshold* below its lowest neighbour, or more than
+    *above_threshold* above its highest neighbour, it is flagged as an outlier.
 
-    Classic multipath (underground) and extreme aerial outlier removal.
+    Uses vectorised 2D cKDTree neighbour querying for high speed.
 
     Args:
         xs, ys, zs:        Point coordinates.
         search_radius:     Neighbourhood radius (metres).
-        below_threshold:   Max Z below the local minimum allowed.
-        above_threshold:   Max Z above the local maximum allowed.
+        below_threshold:   Max Z below the lowest neighbour allowed (metres).
+        above_threshold:   Max Z above the highest neighbour allowed (metres).
+        k_neighbors:       Number of nearest neighbours to check.
         progress:          Optional callback.
 
     Returns:
@@ -511,29 +613,51 @@ def low_point_removal(
     if progress:
         progress("Low-point filter: building KDTree…", 10.0)
 
-    points = np.column_stack((xs, ys, zs))
     try:
-        from scipy.spatial import KDTree
-        tree = KDTree(points)
-        indices_list = tree.query_ball_point(points, r=search_radius)
+        from scipy.spatial import cKDTree
+        xy = np.column_stack((xs, ys))
+        tree = cKDTree(xy)
+        k_query = min(k_neighbors + 1, n)
+        dists, idxs = tree.query(xy, k=k_query, distance_upper_bound=search_radius)
+
+        if dists.ndim == 1:
+            dists = dists[:, None]
+            idxs = idxs[:, None]
+
+        # Valid neighbours must be within radius and NOT the point itself (dist > 1e-6)
+        valid = (idxs < n) & (dists > 1e-6)
+        has_nbrs = np.any(valid, axis=1)
+
+        # Min and max Z of valid neighbours
+        nbr_z_min_arr = np.where(valid, zs[np.clip(idxs, 0, n - 1)], np.inf)
+        min_nbr_z = np.min(nbr_z_min_arr, axis=1)
+
+        is_low = has_nbrs & (zs < min_nbr_z - below_threshold)
+
+        if above_threshold is not None and above_threshold > 0:
+            nbr_z_max_arr = np.where(valid, zs[np.clip(idxs, 0, n - 1)], -np.inf)
+            max_nbr_z = np.max(nbr_z_max_arr, axis=1)
+            is_high = has_nbrs & (zs > max_nbr_z + above_threshold)
+            outlier_mask = is_low | is_high
+        else:
+            outlier_mask = is_low
+
     except ImportError:
-        logger.debug("scipy not available — using brute-force for low-point filter")
+        logger.debug("scipy not available — using fallback for low-point filter")
+        points = np.column_stack((xs, ys, zs))
         indices_list = _brute_force_radius_indices(points, search_radius)
+        outlier_mask = np.zeros(n, dtype=bool)
+        for i in range(n):
+            nbrs = [idx for idx in indices_list[i] if idx != i]
+            if not nbrs:
+                continue
+            nbr_z = zs[nbrs]
+            if zs[i] < nbr_z.min() - below_threshold:
+                outlier_mask[i] = True
+            elif above_threshold is not None and zs[i] > nbr_z.max() + above_threshold:
+                outlier_mask[i] = True
 
-    if progress:
-        progress("Low-point filter: computing mask…", 60.0)
-
-    keep_mask = np.ones(n, dtype=bool)
-    for i in range(n):
-        neighbours = indices_list[i]
-        if len(neighbours) < 2:
-            continue
-        nbr_z = zs[neighbours]
-        if zs[i] < nbr_z.min() - below_threshold or \
-           zs[i] > nbr_z.max() + above_threshold:
-            keep_mask[i] = False
-
-    outlier_mask = ~keep_mask
+    keep_mask = ~outlier_mask
 
     if progress:
         progress(f"Low-point: {outlier_mask.sum()} outliers / {n} points", 100.0)
@@ -553,115 +677,51 @@ def surface_noise_removal(
     tolerance: float = 0.15,
     classifications: Optional[np.ndarray] = None,
     reference_class: Optional[int] = None,
+    mode: str = "near_surface",
     progress: ProgressCB = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Surface-proximity noise filter.
 
     Builds a smooth surface grid from the lowest points (or from
-    *reference_class* points if given), then flags points of any
-    class that sit within *tolerance* of that surface (above or
-    below) — near-ground noise that is too close to be real features.
-
-    When used post-classification with ``reference_class=2`` (ground),
-    this catches stray non-ground points hugging the terrain — grass
-    stubble, sensor artifacts, low vegetation touching the ground.
+    *reference_class* points if given), then flags points that sit
+    within *tolerance* of that surface — near-ground noise that is
+    too close to be real features.
 
     Args:
-        xs, ys, zs:       Point coordinates.
+        xs, ys, zs:        Point coordinates.
         grid_size:         Cell size for the surface raster (metres).
         tolerance:         Band around the surface to flag as noise (metres).
-        classifications:   Point classification codes (needed if
-                           *reference_class* is set).
-        reference_class:   If set, build the surface from only this class
-                           (e.g. 2 = ground).  If None, use min-Z of all
-                           points (original behaviour).
+        classifications:   Point classification codes (needed if *reference_class* is set).
+        reference_class:   If set, build surface only from this class (e.g. 2 = ground).
+        mode:              "near_surface" (tolerance band), "below_surface", or "above_surface".
         progress:          Optional callback.
 
     Returns:
         ``(keep_mask, outlier_mask)``.
     """
     n = len(xs)
-    if n < 100:
+    if n < 10:
         return np.ones(n, dtype=bool), np.zeros(n, dtype=bool)
 
     if progress:
-        progress("Surface-noise filter: gridding…", 10.0)
+        progress("Surface-noise filter: estimating surface…", 20.0)
 
-    points = np.column_stack((xs, ys, zs))
-    import scipy.ndimage as ndimage
-
-    min_x, max_x = xs.min(), xs.max()
-    min_y, max_y = ys.min(), ys.max()
-
-    nx = int(np.ceil((max_x - min_x) / grid_size)) + 1
-    ny = int(np.ceil((max_y - min_y) / grid_size)) + 1
-
-    # --- minimum Z per cell ---
-    # If reference_class is set, only use those points to build the surface
-    if reference_class is not None and classifications is not None:
-        ref_mask = classifications == reference_class
-        if ref_mask.sum() < 10:
-            logger.warning("Surface-noise: too few reference-class points (%d)", ref_mask.sum())
-            return np.ones(n, dtype=bool), np.zeros(n, dtype=bool)
-        grid_xs, grid_ys, grid_zs = xs[ref_mask], ys[ref_mask], zs[ref_mask]
-    else:
-        grid_xs, grid_ys, grid_zs = xs, ys, zs
-
-    grid = np.full((nx, ny), np.inf, dtype=np.float32)
-    gx = np.clip(((grid_xs - min_x) / grid_size).astype(np.int32), 0, nx - 1)
-    gy = np.clip(((grid_ys - min_y) / grid_size).astype(np.int32), 0, ny - 1)
-
-    flat_idx = gx * ny + gy
-    sort_idx = np.argsort(flat_idx)
-    sorted_flat = flat_idx[sort_idx]
-    sorted_z = grid_zs[sort_idx]
-    unique_bins, first_idx = np.unique(sorted_flat, return_index=True)
-    last_idx = np.append(first_idx[1:], len(sort_idx))
-    for j, bin_id in enumerate(unique_bins):
-        bin_z = sorted_z[first_idx[j]:last_idx[j]]
-        xi, yi = divmod(bin_id, ny)
-        grid[xi, yi] = bin_z.min()
-    grid[grid == np.inf] = np.nan
-
-    # --- hole-fill ---
-    grid = _simple_grid_fill(grid)
-
-    # --- smooth ---
-    grid = ndimage.median_filter(grid, size=3)
-
-    if progress:
-        progress("Surface-noise filter: interpolating…", 60.0)
-
-    # --- bilinear surface height for every point ---
-    fx = (xs - min_x) / grid_size
-    fy = (ys - min_y) / grid_size
-    x0 = np.clip(np.floor(fx).astype(np.int32), 0, nx - 1)
-    y0 = np.clip(np.floor(fy).astype(np.int32), 0, ny - 1)
-    x1 = np.clip(x0 + 1, 0, nx - 1)
-    y1 = np.clip(y0 + 1, 0, ny - 1)
-
-    wx = fx - x0
-    wy = fy - y0
-
-    fill_val = float(np.nanmedian(grid))
-    if np.isnan(fill_val):
-        fill_val = float(np.median(zs))
-
-    def _safe(arr):
-        out = arr.copy()
-        out[np.isnan(out)] = fill_val
-        return out
-
-    z_surface = (_safe(grid[x0, y0]) * (1 - wx) * (1 - wy) +
-                 _safe(grid[x1, y0]) * wx * (1 - wy) +
-                 _safe(grid[x0, y1]) * (1 - wx) * wy +
-                 _safe(grid[x1, y1]) * wx * wy)
+    z_surface = _estimate_surface_grid(
+        xs, ys, zs,
+        grid_size=grid_size,
+        classifications=classifications,
+        reference_class=reference_class,
+    )
 
     h_above = zs - z_surface
-    # Flag points within tolerance of the surface (either side),
-    # excluding a 1 cm gap for points exactly on the surface.
-    is_noise = (np.abs(h_above) <= tolerance) & (np.abs(h_above) > 0.01)
+
+    if mode == "below_surface":
+        is_noise = h_above < -tolerance
+    elif mode == "above_surface":
+        is_noise = h_above > tolerance
+    else:  # "near_surface"
+        is_noise = (np.abs(h_above) <= tolerance) & (np.abs(h_above) > 0.01)
 
     keep_mask = ~is_noise
     outlier_mask = is_noise
@@ -670,9 +730,8 @@ def surface_noise_removal(
         progress(f"Surface-noise: {outlier_mask.sum()} outliers / {n} points", 100.0)
 
     logger.info(
-        "Surface-noise (grid=%.2f, tol=%.2f): "
-        "%d outliers removed out of %d",
-        grid_size, tolerance, outlier_mask.sum(), n,
+        "Surface-noise (grid=%.2f, tol=%.2f, mode=%s): %d outliers removed out of %d",
+        grid_size, tolerance, mode, outlier_mask.sum(), n,
     )
     return keep_mask, outlier_mask
 
@@ -900,39 +959,60 @@ def multipath_reflection_removal(
 
     keep_mask = np.ones(n, dtype=bool)
 
-    # Work in tiles for large datasets
-    tile_n = 50000
-    for start in range(0, n, tile_n):
-        end = min(start + tile_n, n)
-        tile_pts = points[start:end]
-        if len(tile_pts) < 100:
+    # Spatial patch partitioning (e.g. 20m x 20m cells) ensures planar assumption
+    # holds locally across slopes, riverbeds, and valleys
+    patch_size = 20.0
+    min_x, max_x = xs.min(), xs.max()
+    min_y, max_y = ys.min(), ys.max()
+    nx = max(int(np.ceil((max_x - min_x) / patch_size)), 1)
+    ny = max(int(np.ceil((max_y - min_y) / patch_size)), 1)
+    gx = np.clip(((xs - min_x) / patch_size).astype(np.int32), 0, nx - 1)
+    gy = np.clip(((ys - min_y) / patch_size).astype(np.int32), 0, ny - 1)
+    cell_keys = gx * ny + gy
+
+    order = np.argsort(cell_keys)
+    sorted_keys = cell_keys[order]
+    unique_cells, start_indices = np.unique(sorted_keys, return_index=True)
+    end_indices = np.append(start_indices[1:], n)
+
+    for s, e in zip(start_indices, end_indices):
+        count = e - s
+        if count < 30:
             continue
+        patch_idx = order[s:e]
+        tile_pts = points[patch_idx]
 
         # Fit a dominant plane via RANSAC
         try:
             ransac = RANSACRegressor(residual_threshold=depth_threshold * 2)
             ransac.fit(tile_pts[:, :2], tile_pts[:, 2])
             a, b = ransac.estimator_.coef_
-            c = ransac.estimator_.intercept_
-        except ValueError:
+            normal = np.array([a, b, -1.0])
+            norm = np.linalg.norm(normal)
+            if norm > 1e-6:
+                normal /= norm
+            else:
+                normal = np.array([0.0, 0.0, 1.0])
+        except Exception:
             continue
 
-        normal = np.array([a, b, -1.0])
-        normal /= np.linalg.norm(normal)
         center = tile_pts.mean(axis=0)
         proj = np.dot(tile_pts - center, normal)
 
         # Histogram of projections → keep the densest cluster
-        hist, bins = np.histogram(proj, bins=min(50, len(tile_pts) // 20))
+        hist, bins = np.histogram(proj, bins=min(50, max(5, count // 10)))
         if len(hist) == 0:
             continue
         main_bin = np.argmax(hist)
         main_center = (bins[main_bin] + bins[main_bin + 1]) / 2.0
 
-        tile_keep = np.abs(proj - main_center) < depth_threshold
-        keep_mask[start:end] = tile_keep
+        tile_keep = np.abs(proj - main_center) <= depth_threshold
+        keep_mask[patch_idx] = tile_keep
 
     outlier_mask = ~keep_mask
+    if progress:
+        progress(f"Multipath: {outlier_mask.sum()} outliers / {n} points", 100.0)
+
     logger.info(
         "Multipath (depth_thresh=%.2f): %d outliers removed out of %d",
         depth_threshold, outlier_mask.sum(), n,
@@ -954,6 +1034,7 @@ def bilateral_filter(
 
     Smooths points while preserving sharp edges by weighting neighbours
     by both spatial distance and depth (Z) similarity.
+    Uses chunked vectorised array operations with scipy cKDTree for high speed.
 
     Args:
         xs, ys, zs:      Point coordinates.
@@ -970,7 +1051,7 @@ def bilateral_filter(
         return xs.copy(), ys.copy(), zs.copy()
 
     try:
-        from scipy.spatial import KDTree
+        from scipy.spatial import cKDTree
     except ImportError:
         logger.warning("scipy not available — skipping bilateral filter")
         return xs.copy(), ys.copy(), zs.copy()
@@ -979,33 +1060,117 @@ def bilateral_filter(
         progress("Bilateral: building KDTree…", 10.0)
 
     points = np.column_stack((xs, ys, zs))
-    tree = KDTree(points)
+    tree = cKDTree(points)
     _, all_indices = tree.query(points, k=min(knn + 1, n))
+    nbr_indices = all_indices[:, 1:]  # skip self
 
-    out_x, out_y, out_z = xs.copy(), ys.copy(), zs.copy()
+    out_points = points.copy()
+    chunk_size = 5000
+    two_s_sigma_sq = 2.0 * spatial_sigma * spatial_sigma
+    two_r_sigma_sq = 2.0 * range_sigma * range_sigma
 
-    for i in range(n):
-        nbr_idx = all_indices[i]
-        if all_indices.ndim > 1 and all_indices.shape[1] > 1:
-            nbr_idx = nbr_idx[1:]  # skip self
-        if len(nbr_idx) < 3:
-            continue
+    if progress:
+        progress("Bilateral: smoothing…", 30.0)
 
-        nbrs = points[nbr_idx]
-        dist = np.linalg.norm(nbrs - points[i], axis=1)
+    for c_start in range(0, n, chunk_size):
+        c_end = min(c_start + chunk_size, n)
+        c_pts = points[c_start:c_end]
+        c_nbr_idx = nbr_indices[c_start:c_end]
+        nbrs = points[c_nbr_idx]
 
-        spatial_w = np.exp(-dist**2 / (2 * spatial_sigma**2))
-        z_diff = np.abs(nbrs[:, 2] - points[i, 2])
-        range_w = np.exp(-z_diff**2 / (2 * range_sigma**2))
-        weights = spatial_w * range_w
-        w_sum = weights.sum()
-        if w_sum > 0:
-            weights /= w_sum
-            out_x[i] = np.average(nbrs[:, 0], weights=weights)
-            out_y[i] = np.average(nbrs[:, 1], weights=weights)
-            out_z[i] = np.average(nbrs[:, 2], weights=weights)
+        diff = nbrs - c_pts[:, None, :]
+        dists_sq = np.sum(diff**2, axis=-1)
+        z_diff_sq = diff[:, :, 2]**2
 
-    return out_x, out_y, out_z
+        weights = np.exp(-dists_sq / two_s_sigma_sq) * np.exp(-z_diff_sq / two_r_sigma_sq)
+        w_sum = weights.sum(axis=1, keepdims=True)
+        w_sum[w_sum == 0] = 1.0
+        weights /= w_sum
+
+        out_points[c_start:c_end] = np.sum(nbrs * weights[:, :, None], axis=1)
+
+    if progress:
+        progress("Bilateral: complete", 100.0)
+
+    return out_points[:, 0], out_points[:, 1], out_points[:, 2]
+
+
+def elevation_window_filter(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    min_z: Optional[float] = None,
+    max_z: Optional[float] = None,
+    min_height_above_ground: Optional[float] = None,
+    max_height_above_ground: Optional[float] = None,
+    grid_size: float = 2.0,
+    classifications: Optional[np.ndarray] = None,
+    reference_class: Optional[int] = None,
+    progress: ProgressCB = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Elevation and Height-above-ground window filter (industry standard).
+
+    Flags points falling outside absolute elevation bounds [min_z, max_z]
+    and/or relative height bounds [min_height_above_ground, max_height_above_ground]
+    measured from the local estimated ground/terrain surface.
+
+    Ideal for stripping aerial fliers (clouds, birds, planes) and sub-surface pits
+    without disturbing valid terrain or structures.
+
+    Args:
+        xs, ys, zs:                   Point coordinates.
+        min_z:                        Absolute minimum Z allowed (or None).
+        max_z:                        Absolute maximum Z allowed (or None).
+        min_height_above_ground:      Minimum relative height above ground (e.g. -1.0m).
+        max_height_above_ground:      Maximum relative height above ground (e.g. 50.0m).
+        grid_size:                    Grid cell size for ground surface estimation.
+        classifications:              Optional classification codes.
+        reference_class:              Optional class code to build ground from (e.g. 2).
+        progress:                     Optional callback.
+
+    Returns:
+        ``(keep_mask, outlier_mask)``.
+    """
+    n = len(xs)
+    if n == 0:
+        empty = np.array([], dtype=bool)
+        return empty, empty
+
+    outlier_mask = np.zeros(n, dtype=bool)
+
+    # 1. Absolute elevation window
+    if min_z is not None:
+        outlier_mask |= (zs < min_z)
+    if max_z is not None:
+        outlier_mask |= (zs > max_z)
+
+    # 2. Relative height above ground window
+    if min_height_above_ground is not None or max_height_above_ground is not None:
+        if progress:
+            progress("Elevation window: estimating terrain surface…", 25.0)
+        z_surf = _estimate_surface_grid(
+            xs, ys, zs,
+            grid_size=grid_size,
+            classifications=classifications,
+            reference_class=reference_class,
+        )
+        h = zs - z_surf
+        if min_height_above_ground is not None:
+            outlier_mask |= (h < min_height_above_ground)
+        if max_height_above_ground is not None:
+            outlier_mask |= (h > max_height_above_ground)
+
+    keep_mask = ~outlier_mask
+
+    if progress:
+        progress(f"Elevation window: {outlier_mask.sum()} outliers / {n} points", 100.0)
+
+    logger.info(
+        "Elevation window (min_z=%s, max_z=%s, min_h=%s, max_h=%s): %d outliers removed out of %d",
+        min_z, max_z, min_height_above_ground, max_height_above_ground, outlier_mask.sum(), n,
+    )
+    return keep_mask, outlier_mask
 
 
 def topo_discriminator(
@@ -1842,12 +2007,28 @@ def _apply_pipeline(data: dict, pipeline: list) -> np.ndarray:
                     if data.get("num_returns") is not None else None
                 ),
             )
+        elif step["type"] == "elevation_window":
+            cls = data.get("classification")
+            k, _ = elevation_window_filter(
+                data["x"][keep], data["y"][keep], data["z"][keep],
+                min_z=step.get("min_z"),
+                max_z=step.get("max_z"),
+                min_height_above_ground=step.get("min_height_above_ground"),
+                max_height_above_ground=step.get("max_height_above_ground"),
+                grid_size=step.get("grid_size", 2.0),
+                classifications=cls[keep] if cls is not None else None,
+                reference_class=step.get("reference_class", 2),
+            )
         else:
             mode = "above" if step["type"] == "dbscan_above" else "below"
+            cls = data.get("classification")
             k, _ = dbscan_outlier_removal(
                 data["x"][keep], data["y"][keep], data["z"][keep],
                 eps=step["eps"], min_samples=step["min_samples"],
                 min_cluster_size=step["min_cluster_size"], mode=mode,
+                height_above_surface=step.get("height_above_surface", 2.0),
+                depth_below_surface=step.get("depth_below_surface", 2.0),
+                classifications=cls[keep] if cls is not None else None,
             )
         keep_indices = np.where(keep)[0]
         keep[keep_indices[~k]] = False

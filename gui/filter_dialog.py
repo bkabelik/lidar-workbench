@@ -60,6 +60,7 @@ from ..noise_filter import (
     multipath_reflection_removal,
     bilateral_filter,
     thin_points_average,
+    elevation_window_filter,
 )
 from ..tile_manager import TileManager, subset_point_data
 from .view_3d import View3D
@@ -71,6 +72,7 @@ FILTER_TYPES = [
     ("ROR (Radius Outlier Removal)", "ror"),
     ("DBSCAN — Above (aerial noise)", "dbscan_above"),
     ("DBSCAN — Below (sub-surface noise)", "dbscan_below"),
+    ("Elevation / Height Window", "elevation_window"),
     ("Isolated Points (fliers)", "isolated"),
     ("Low Points — Multipath", "low_points"),
     ("Surface Proximity Noise", "surface_noise"),
@@ -176,8 +178,78 @@ class FilterDialog(QDialog):
         self._dbscan_min_cluster_spin.setRange(1, 10000)
         self._dbscan_min_cluster_spin.setValue(50)
         df.addRow("Min Cluster Size:", self._dbscan_min_cluster_spin)
+
+        self._dbscan_height_spin = QDoubleSpinBox()
+        self._dbscan_height_spin.setRange(0.1, 500.0)
+        self._dbscan_height_spin.setDecimals(2)
+        self._dbscan_height_spin.setValue(2.0)
+        self._dbscan_height_spin.setSuffix(" m")
+        self._dbscan_height_label = QLabel("Height Above Surface:")
+        df.addRow(self._dbscan_height_label, self._dbscan_height_spin)
+
+        self._dbscan_depth_spin = QDoubleSpinBox()
+        self._dbscan_depth_spin.setRange(0.1, 500.0)
+        self._dbscan_depth_spin.setDecimals(2)
+        self._dbscan_depth_spin.setValue(2.0)
+        self._dbscan_depth_spin.setSuffix(" m")
+        self._dbscan_depth_label = QLabel("Depth Below Surface:")
+        df.addRow(self._dbscan_depth_label, self._dbscan_depth_spin)
+
         self._dbscan_group.setVisible(False)
         left.addWidget(self._dbscan_group)
+
+        # --- Elevation Window params ---
+        self._elev_group = QGroupBox("Elevation / Height Window Parameters")
+        ef = QFormLayout(self._elev_group)
+
+        self._elev_min_z_check = QCheckBox("Min Elevation (Z):")
+        self._elev_min_z_spin = QDoubleSpinBox()
+        self._elev_min_z_spin.setRange(-1000.0, 9000.0)
+        self._elev_min_z_spin.setDecimals(2)
+        self._elev_min_z_spin.setValue(0.0)
+        self._elev_min_z_spin.setSuffix(" m")
+        self._elev_min_z_spin.setEnabled(False)
+        self._elev_min_z_check.toggled.connect(self._elev_min_z_spin.setEnabled)
+        self._elev_min_z_check.toggled.connect(self._schedule_preview_update)
+        ef.addRow(self._elev_min_z_check, self._elev_min_z_spin)
+
+        self._elev_max_z_check = QCheckBox("Max Elevation (Z):")
+        self._elev_max_z_spin = QDoubleSpinBox()
+        self._elev_max_z_spin.setRange(-1000.0, 9000.0)
+        self._elev_max_z_spin.setDecimals(2)
+        self._elev_max_z_spin.setValue(1000.0)
+        self._elev_max_z_spin.setSuffix(" m")
+        self._elev_max_z_spin.setEnabled(False)
+        self._elev_max_z_check.toggled.connect(self._elev_max_z_spin.setEnabled)
+        self._elev_max_z_check.toggled.connect(self._schedule_preview_update)
+        ef.addRow(self._elev_max_z_check, self._elev_max_z_spin)
+
+        self._elev_min_h_check = QCheckBox("Min Height Above Ground:")
+        self._elev_min_h_spin = QDoubleSpinBox()
+        self._elev_min_h_spin.setRange(-200.0, 200.0)
+        self._elev_min_h_spin.setDecimals(2)
+        self._elev_min_h_spin.setValue(-1.0)
+        self._elev_min_h_spin.setSuffix(" m")
+        self._elev_min_h_spin.setEnabled(True)
+        self._elev_min_h_check.setChecked(True)
+        self._elev_min_h_check.toggled.connect(self._elev_min_h_spin.setEnabled)
+        self._elev_min_h_check.toggled.connect(self._schedule_preview_update)
+        ef.addRow(self._elev_min_h_check, self._elev_min_h_spin)
+
+        self._elev_max_h_check = QCheckBox("Max Height Above Ground:")
+        self._elev_max_h_spin = QDoubleSpinBox()
+        self._elev_max_h_spin.setRange(0.1, 2000.0)
+        self._elev_max_h_spin.setDecimals(2)
+        self._elev_max_h_spin.setValue(50.0)
+        self._elev_max_h_spin.setSuffix(" m")
+        self._elev_max_h_spin.setEnabled(True)
+        self._elev_max_h_check.setChecked(True)
+        self._elev_max_h_check.toggled.connect(self._elev_max_h_spin.setEnabled)
+        self._elev_max_h_check.toggled.connect(self._schedule_preview_update)
+        ef.addRow(self._elev_max_h_check, self._elev_max_h_spin)
+
+        self._elev_group.setVisible(False)
+        left.addWidget(self._elev_group)
 
         # --- Isolated Points params ---
         self._isolated_group = QGroupBox("Isolated Points Parameters")
@@ -388,6 +460,9 @@ class FilterDialog(QDialog):
             self._sor_nb_spin, self._sor_std_spin,
             self._ror_radius_spin, self._ror_min_spin,
             self._dbscan_eps_spin, self._dbscan_min_samples_spin, self._dbscan_min_cluster_spin,
+            self._dbscan_height_spin, self._dbscan_depth_spin,
+            self._elev_min_z_spin, self._elev_max_z_spin,
+            self._elev_min_h_spin, self._elev_max_h_spin,
             self._isolated_radius_spin, self._isolated_min_nbr_spin,
             self._lowpts_radius_spin, self._lowpts_below_spin, self._lowpts_above_spin,
             self._surf_grid_spin, self._surf_tol_spin,
@@ -404,7 +479,19 @@ class FilterDialog(QDialog):
         ft = self._filter_type_combo.currentData()
         self._sor_group.setVisible(ft == "sor")
         self._ror_group.setVisible(ft == "ror")
-        self._dbscan_group.setVisible(ft in ("dbscan_above", "dbscan_below"))
+        is_dbscan = ft in ("dbscan_above", "dbscan_below")
+        self._dbscan_group.setVisible(is_dbscan)
+        if ft == "dbscan_above":
+            self._dbscan_height_label.setVisible(True)
+            self._dbscan_height_spin.setVisible(True)
+            self._dbscan_depth_label.setVisible(False)
+            self._dbscan_depth_spin.setVisible(False)
+        elif ft == "dbscan_below":
+            self._dbscan_height_label.setVisible(False)
+            self._dbscan_height_spin.setVisible(False)
+            self._dbscan_depth_label.setVisible(True)
+            self._dbscan_depth_spin.setVisible(True)
+        self._elev_group.setVisible(ft == "elevation_window")
         self._isolated_group.setVisible(ft == "isolated")
         self._lowpts_group.setVisible(ft == "low_points")
         self._surf_group.setVisible(ft == "surface_noise")
@@ -458,8 +545,19 @@ class FilterDialog(QDialog):
                 label += f"  (σs={step['spatial_sigma']}, σr={step['range_sigma']}, k={step['knn']})"
             elif step["type"] == "thin_average":
                 label += f"  (grid={step['grid_size']}m)"
+            elif step["type"] == "elevation_window":
+                parts = []
+                if step.get("min_z") is not None: parts.append(f"minZ={step['min_z']}m")
+                if step.get("max_z") is not None: parts.append(f"maxZ={step['max_z']}m")
+                if step.get("min_height_above_ground") is not None: parts.append(f"minH={step['min_height_above_ground']}m")
+                if step.get("max_height_above_ground") is not None: parts.append(f"maxH={step['max_height_above_ground']}m")
+                label += f"  ({', '.join(parts) if parts else 'unconstrained'})"
+            elif step["type"] == "dbscan_above":
+                label += f"  (ε={step['eps']}, min_s={step['min_samples']}, min_c={step['min_cluster_size']}, h>{step.get('height_above_surface', 2.0)}m)"
+            elif step["type"] == "dbscan_below":
+                label += f"  (ε={step['eps']}, min_s={step['min_samples']}, min_c={step['min_cluster_size']}, d<{step.get('depth_below_surface', 2.0)}m)"
             else:
-                label += f"  (ε={step['eps']}, min_s={step['min_samples']}, min_c={step['min_cluster_size']})"
+                label += f"  (ε={step.get('eps', 2.0)}, min_s={step.get('min_samples', 10)})"
             self._pipeline_list.addItem(QListWidgetItem(label))
 
     def _get_current_params(self):
@@ -496,6 +594,31 @@ class FilterDialog(QDialog):
         elif ft == "thin_average":
             return {"type": "thin_average",
                     "grid_size": self._thin_grid_spin.value()}
+        elif ft == "elevation_window":
+            return {
+                "type": "elevation_window",
+                "min_z": self._elev_min_z_spin.value() if self._elev_min_z_check.isChecked() else None,
+                "max_z": self._elev_max_z_spin.value() if self._elev_max_z_check.isChecked() else None,
+                "min_height_above_ground": self._elev_min_h_spin.value() if self._elev_min_h_check.isChecked() else None,
+                "max_height_above_ground": self._elev_max_h_spin.value() if self._elev_max_h_check.isChecked() else None,
+                "grid_size": 2.0,
+            }
+        elif ft == "dbscan_above":
+            return {
+                "type": "dbscan_above",
+                "eps": self._dbscan_eps_spin.value(),
+                "min_samples": self._dbscan_min_samples_spin.value(),
+                "min_cluster_size": self._dbscan_min_cluster_spin.value(),
+                "height_above_surface": self._dbscan_height_spin.value(),
+            }
+        elif ft == "dbscan_below":
+            return {
+                "type": "dbscan_below",
+                "eps": self._dbscan_eps_spin.value(),
+                "min_samples": self._dbscan_min_samples_spin.value(),
+                "min_cluster_size": self._dbscan_min_cluster_spin.value(),
+                "depth_below_surface": self._dbscan_depth_spin.value(),
+            }
         elif ft == "":
             return {"type": "sor", "nb_neighbors": 20, "std_ratio": 2.0}
         else:
@@ -582,6 +705,11 @@ class FilterDialog(QDialog):
         # Get live UI params for the currently selected filter type
         live_params = self._get_current_params()
 
+        # Work on copies of coordinates in case smoothing filters (bilateral) modify them
+        cur_x = pts["x"].copy()
+        cur_y = pts["y"].copy()
+        cur_z = pts["z"].copy()
+
         # Start with all points kept, then apply pipeline
         keep = np.ones(n, dtype=bool)
         for i, step in enumerate(self._pipeline):
@@ -593,47 +721,79 @@ class FilterDialog(QDialog):
             try:
                 if params["type"] == "sor":
                     k, _ = statistical_outlier_removal(
-                        pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                        cur_x[keep], cur_y[keep], cur_z[keep],
                         nb_neighbors=params["nb_neighbors"],
                         std_ratio=params["std_ratio"],
                     )
                 elif params["type"] == "ror":
                     k, _ = radius_outlier_removal(
-                        pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                        cur_x[keep], cur_y[keep], cur_z[keep],
                         radius=params["radius"],
                         min_points=params["min_points"],
                     )
                 elif params["type"] == "isolated":
                     k, _ = isolated_point_removal(
-                        pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                        cur_x[keep], cur_y[keep], cur_z[keep],
                         search_radius=params["search_radius"],
                         min_neighbors=params["min_neighbors"],
                     )
                 elif params["type"] == "low_points":
                     k, _ = low_point_removal(
-                        pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                        cur_x[keep], cur_y[keep], cur_z[keep],
                         search_radius=params["search_radius"],
                         below_threshold=params["below_threshold"],
                         above_threshold=params["above_threshold"],
                     )
                 elif params["type"] == "surface_noise":
                     k, _ = surface_noise_removal(
-                        pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                        cur_x[keep], cur_y[keep], cur_z[keep],
                         grid_size=params["grid_size"],
                         tolerance=params["tolerance"],
                     )
+                elif params["type"] == "multipath":
+                    k, _ = multipath_reflection_removal(
+                        cur_x[keep], cur_y[keep], cur_z[keep],
+                        depth_threshold=params.get("depth_threshold", 0.5),
+                    )
+                elif params["type"] == "bilateral":
+                    sx, sy, sz = bilateral_filter(
+                        cur_x[keep], cur_y[keep], cur_z[keep],
+                        spatial_sigma=params.get("spatial_sigma", 0.5),
+                        range_sigma=params.get("range_sigma", 0.1),
+                        knn=params.get("knn", 20),
+                    )
+                    keep_indices = np.where(keep)[0]
+                    cur_x[keep_indices] = sx
+                    cur_y[keep_indices] = sy
+                    cur_z[keep_indices] = sz
+                    continue
                 elif params["type"] == "thin_average":
                     k, _ = thin_points_average(
-                        pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                        cur_x[keep], cur_y[keep], cur_z[keep],
                         grid_size=params["grid_size"],
+                    )
+                elif params["type"] == "elevation_window":
+                    cls = pts.get("classification")
+                    k, _ = elevation_window_filter(
+                        cur_x[keep], cur_y[keep], cur_z[keep],
+                        min_z=params.get("min_z"),
+                        max_z=params.get("max_z"),
+                        min_height_above_ground=params.get("min_height_above_ground"),
+                        max_height_above_ground=params.get("max_height_above_ground"),
+                        grid_size=params.get("grid_size", 2.0),
+                        classifications=cls[keep] if cls is not None else None,
                     )
                 else:
                     mode = "above" if params["type"] == "dbscan_above" else "below"
+                    cls = pts.get("classification")
                     k, _ = dbscan_outlier_removal(
-                        pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                        cur_x[keep], cur_y[keep], cur_z[keep],
                         eps=params["eps"], min_samples=params["min_samples"],
                         min_cluster_size=params["min_cluster_size"],
                         mode=mode,
+                        height_above_surface=params.get("height_above_surface", 2.0),
+                        depth_below_surface=params.get("depth_below_surface", 2.0),
+                        classifications=cls[keep] if cls is not None else None,
                     )
                 # Map back to original indices
                 keep_indices = np.where(keep)[0]
@@ -670,11 +830,11 @@ class FilterDialog(QDialog):
             else:
                 colors[keep] = (0.6, 0.6, 0.6)
             colors[outlier] = (1.0, 0.15, 0.15)
-            self._preview_view.load_point_cloud_colored(pts["x"], pts["y"], pts["z"], colors)
+            self._preview_view.load_point_cloud_colored(cur_x, cur_y, cur_z, colors)
         else:
             # Only show kept points
             self._preview_view.load_point_cloud(
-                pts["x"][keep], pts["y"][keep], pts["z"][keep],
+                cur_x[keep], cur_y[keep], cur_z[keep],
                 classifications=(
                     pts["classification"][keep] if pts.get("classification") is not None else None
                 ),
@@ -688,6 +848,33 @@ class FilterDialog(QDialog):
                     pts["point_source_id"][keep] if pts.get("point_source_id") is not None else None
                 ),
             )
+
+    def cleanup(self) -> None:
+        """Explicitly release preview Open3D renderer resources before dialog destruction."""
+        if hasattr(self, "_preview_timer"):
+            try:
+                self._preview_timer.stop()
+            except Exception:
+                pass
+        self._preview_points = None
+        self._current_keep_mask = None
+        if hasattr(self, "_preview_view") and self._preview_view is not None:
+            try:
+                self._preview_view._cleanup_renderer()
+            except Exception:
+                pass
+
+    def closeEvent(self, event) -> None:
+        self.cleanup()
+        super().closeEvent(event)
+
+    def reject(self) -> None:
+        self.cleanup()
+        super().reject()
+
+    def accept(self) -> None:
+        self.cleanup()
+        super().accept()
 
     # ── apply ──────────────────────────────────────────────────────
 

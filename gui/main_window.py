@@ -206,6 +206,11 @@ class MainWindow(QMainWindow):
                 self._point_qc_window.close()
             except Exception:
                 pass
+        if hasattr(self, "_multi_view") and self._multi_view is not None:
+            try:
+                self._multi_view.cleanup()
+            except Exception:
+                pass
         super().closeEvent(event)
 
     def _mark_project_dirty(self) -> None:
@@ -728,7 +733,11 @@ class MainWindow(QMainWindow):
 
         dialog = FilterDialog(self._tm, selected, parent=self)
         dialog.filter_applied.connect(self._on_filter_applied)
-        dialog.exec()
+        try:
+            dialog.exec()
+        finally:
+            dialog.cleanup()
+            dialog.deleteLater()
 
     def _on_filter_applied(self, tile_ids: list, pipeline: list) -> None:
         """Apply a filter pipeline to the selected tiles in parallel

@@ -112,7 +112,26 @@ def main() -> int:
     # Run
     exit_code = app.exec()
 
-    # ── Cleanup (order matters: Open3D before Qt finalisation) ──
+    # ── Cleanup (order matters: Qt widgets & renderers before Open3D finalisation) ──
+    try:
+        window.close()
+        if hasattr(window, "_multi_view") and window._multi_view is not None:
+            window._multi_view.cleanup()
+        del window
+    except Exception:
+        pass
+
+    try:
+        app.processEvents()
+    except Exception:
+        pass
+
+    try:
+        from .gui._renderer import cleanup_shared_renderer
+        cleanup_shared_renderer()
+    except Exception:
+        pass
+
     try:
         import open3d.visualization.gui as o3d_gui
         o3d_gui.Application.instance.quit()
@@ -120,11 +139,14 @@ def main() -> int:
     except Exception:
         pass
 
-    # Cleanup
+    # Project cleanup
     if pm.is_open:
         pm.close()
     logger.info("LiDAR Workbench shutting down (code %d)", exit_code)
-    return exit_code
+
+    # Use os._exit to prevent C++ static destructor race conditions in shared libraries
+    import os
+    os._exit(exit_code)
 
 
 if __name__ == "__main__":
