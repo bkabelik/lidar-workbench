@@ -48,10 +48,15 @@ class RasterLayer:
         self.width: int = 0
         self.height: int = 0
         self.crs: str = ""
-        self.nodata: Optional[float] = None
-        self.is_diverging: bool = "diff" in self.name.lower() or "dz" in self.name.lower()
+        fname = self.name.lower()
+        self.is_diverging: bool = (
+            ("diff" in fname or "dz" in fname or "_vs_" in fname)
+            and ("max" not in fname)
+        )
         if self.is_diverging:
             self.colormap_name = "coolwarm"
+        elif "max" in fname and ("diff" in fname or "strip" in fname):
+            self.colormap_name = "turbo"
 
         self.open()
 
@@ -69,24 +74,39 @@ class RasterLayer:
             self.crs = str(self._dataset.crs)
             self.nodata = self._dataset.nodata
 
-            # Read a small decimated thumbnail to initialize robust vmin/vmax
-            thumb = self._dataset.read(1, out_shape=(100, 100))
-            valid = thumb != self.nodata if self.nodata is not None else np.isfinite(thumb)
-            if np.any(valid):
-                v = thumb[valid]
-                p1, p99 = np.percentile(v, [1.0, 99.0])
-                if self.is_diverging:
-                    m = max(abs(p1), abs(p99))
-                    self.vmin = -m
-                    self.vmax = m
-                else:
-                    self.vmin = float(p1)
-                    self.vmax = float(p99)
+            # If vmin/vmax not already specified, initialize with auto range
+            if self.vmin is None or self.vmax is None:
+                self.reset_auto_range()
             return True
         except Exception as exc:
             logger.error("Failed to open raster %s: %s", self.file_path, exc)
             self._dataset = None
             return False
+
+    def compute_auto_range(self) -> Tuple[float, float]:
+        """Compute robust auto-stretch limits from thumbnail statistics."""
+        if self._dataset is None:
+            return (0.0, 1.0)
+        try:
+            thumb = self._dataset.read(1, out_shape=(100, 100))
+            valid = (thumb != self.nodata) & np.isfinite(thumb) if self.nodata is not None else np.isfinite(thumb)
+            if np.any(valid):
+                v = thumb[valid]
+                p1, p99 = np.percentile(v, [1.0, 99.0])
+                if self.is_diverging:
+                    m = max(abs(float(p1)), abs(float(p99)))
+                    return (-m, m)
+                elif "max" in self.name.lower() and ("diff" in self.name.lower() or "strip" in self.name.lower()):
+                    return (0.0, max(0.2, float(p99)))
+                else:
+                    return (float(p1), float(p99))
+        except Exception as exc:
+            logger.warning("Failed to compute auto range for %s: %s", self.name, exc)
+        return (0.0, 1.0)
+
+    def reset_auto_range(self) -> None:
+        """Reset vmin and vmax to automatic thumbnail statistics."""
+        self.vmin, self.vmax = self.compute_auto_range()
 
     def close(self) -> None:
         """Close dataset handle and free resources."""
@@ -147,6 +167,8 @@ class RasterLayer:
 
         minx, miny, maxx, maxy = self.bounds
         vx0, vy0, vx1, vy1 = viewport_bounds
+        vx0, vx1 = min(vx0, vx1), max(vx0, vx1)
+        vy0, vy1 = min(vy0, vy1), max(vy0, vy1)
 
         # Intersect bounds
         ix0 = max(minx, vx0)
@@ -178,8 +200,16 @@ class RasterLayer:
             actual_bounds = rasterio.windows.bounds(window, transform=self._dataset.transform)
 
             # Apply colormap to RGBA
-            vmin = self.vmin if self.vmin is not None else float(np.nanmin(arr))
-            vmax = self.vmax if self.vmax is not None else float(np.nanmax(arr))
+            if self.vmin is not None and self.vmax is not None:
+                vmin = self.vmin
+                vmax = self.vmax
+            else:
+                valid_mask = (arr != self.nodata) & np.isfinite(arr) if self.nodata is not None else np.isfinite(arr)
+                if np.any(valid_mask):
+                    vmin = float(np.min(arr[valid_mask]))
+                    vmax = float(np.max(arr[valid_mask]))
+                else:
+                    vmin, vmax = 0.0, 1.0
             if np.isclose(vmin, vmax):
                 vmax = vmin + 1.0
 

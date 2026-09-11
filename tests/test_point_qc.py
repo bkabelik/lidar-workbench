@@ -21,7 +21,9 @@ import numpy as np
 import rasterio
 
 from lidar_workbench.point_qc import (
+    batch_export_all_strip_differences,
     generate_density_raster,
+    generate_max_strip_difference_raster,
     generate_spacing_raster,
     generate_strip_difference_raster,
     generate_tile_grid_vector,
@@ -457,6 +459,130 @@ class TestPointQC(unittest.TestCase):
         vec_group = win.groups[1]
         self.assertTrue(any(l.name == "drop_density" for l in qc_group.layers))
         self.assertTrue(any(l.name == "drop_grid" for l in vec_group.layers))
+
+        win.close()
+
+    def test_generate_max_strip_difference_raster(self):
+        """Test calculation of pixel-wise max distance across all overlapping strips."""
+        out_tif = self.root / "max_strip_diff.tif"
+        stats = generate_max_strip_difference_raster(
+            tile_manager=self.tm,
+            database=self.db,
+            cell_size=5.0,
+            output_path=out_tif,
+        )
+
+        self.assertTrue(out_tif.exists())
+        self.assertIn("max_dz", stats)
+        self.assertIn("overlap_cells", stats)
+        self.assertGreater(stats["overlap_cells"], 0)
+
+        with rasterio.open(out_tif) as src:
+            diff_data = src.read(1)
+            valid = (diff_data != src.nodata) & np.isfinite(diff_data)
+            self.assertTrue(np.any(valid))
+            # Max strip distance must be strictly non-negative
+            self.assertTrue(np.all(diff_data[valid] >= 0.0))
+
+    def test_batch_export_all_strip_differences(self):
+        """Test batch export of all overlapping strip difference pairs."""
+        # Ensure tiles have flightline_sensor_types
+        self.mock_tiles[0]["flightline_sensor_types"] = json.dumps({"1": "topo", "2": "topo"})
+        self.mock_tiles[1]["flightline_sensor_types"] = json.dumps({"2": "topo"})
+
+        out_dir = self.root / "batch_strip_diffs"
+        res = batch_export_all_strip_differences(
+            tile_manager=self.tm,
+            database=self.db,
+            cell_size=5.0,
+            output_dir=out_dir,
+        )
+
+        self.assertEqual(res["status"], "ok")
+        self.assertGreaterEqual(res["total_pairs"], 1)
+        for p in res["output_paths"]:
+            self.assertTrue(Path(p).exists())
+
+    def test_raster_viewport_rendering_bounds_inversion_and_colormap(self):
+        """Test that RasterLayer handles inverted viewport coordinates (vy0 > vy1) and diverging vs sequential colormaps."""
+        # Generate pairwise strip diff raster
+        pair_tif = self.root / "strip_1_vs_2_5.0m.tif"
+        generate_strip_difference_raster(
+            tile_manager=self.tm,
+            database=self.db,
+            strip_a=1,
+            strip_b=2,
+            cell_size=5.0,
+            output_path=pair_tif,
+        )
+
+        layer_pair = RasterLayer(pair_tif)
+        self.assertTrue(layer_pair.is_open)
+        self.assertTrue(layer_pair.is_diverging)
+        self.assertEqual(layer_pair.colormap_name, "coolwarm")
+
+        # Test rendering with inverted bounds: vy0 > vy1 (Qt view_rect.bottom() > view_rect.top())
+        b = layer_pair.bounds
+        res_inverted = layer_pair.render_viewport((b[0], b[3], b[2], b[1]), target_size=(200, 200))
+        self.assertIsNotNone(res_inverted)
+        rgba, bounds = res_inverted
+        self.assertEqual(len(rgba.shape), 3)
+        self.assertEqual(rgba.shape[2], 4)
+
+        # Generate max strip diff raster
+        max_tif = self.root / "max_strip_difference_5.0m.tif"
+        generate_max_strip_difference_raster(
+            tile_manager=self.tm,
+            database=self.db,
+            cell_size=5.0,
+            output_path=max_tif,
+        )
+
+        layer_max = RasterLayer(max_tif)
+        self.assertTrue(layer_max.is_open)
+        # Max difference is non-negative, so it should not be diverging
+        self.assertFalse(layer_max.is_diverging)
+        self.assertEqual(layer_max.colormap_name, "turbo")
+        self.assertGreaterEqual(layer_max.vmin, 0.0)
+
+    def test_raster_min_max_value_modification_and_presets(self):
+        """Test user interactive modification of raster min/max color stretch values and presets."""
+        from lidar_workbench.gui.point_qc_window import PointQCWindow
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+
+        win = PointQCWindow(project_dir=self.root, tile_manager=self.tm, database=self.db)
+        out_tif = self.root / "max_diff_test.tif"
+        generate_max_strip_difference_raster(
+            tile_manager=self.tm,
+            database=self.db,
+            cell_size=5.0,
+            output_path=out_tif,
+        )
+
+        rl = win.add_raster_layer(out_tif, group_name="QC Rasters")
+        # Select the layer in the tree
+        qc_item = win._tree.topLevelItem(0).child(0)
+        win._tree.setCurrentItem(qc_item)
+
+        # 1. Modify min and max value (e.g. 0.0m min and 0.3m max)
+        win._vmin_spin.setValue(0.0)
+        win._vmax_spin.setValue(0.3)
+        self.assertAlmostEqual(rl.vmin, 0.0, places=3)
+        self.assertAlmostEqual(rl.vmax, 0.3, places=3)
+
+        # 2. Select preset
+        idx = win._preset_combo.findText("0.0 m to 0.5 m")
+        self.assertGreaterEqual(idx, 0)
+        win._preset_combo.setCurrentIndex(idx)
+        self.assertAlmostEqual(rl.vmin, 0.0, places=3)
+        self.assertAlmostEqual(rl.vmax, 0.5, places=3)
+
+        # 3. Auto Range
+        win._auto_range_btn.click()
+        self.assertIsNotNone(rl.vmin)
+        self.assertIsNotNone(rl.vmax)
 
         win.close()
 

@@ -61,7 +61,9 @@ from PySide6.QtWidgets import (
 
 from ..point_qc import (
     _get_tile_bbox,
+    batch_export_all_strip_differences,
     generate_density_raster,
+    generate_max_strip_difference_raster,
     generate_spacing_raster,
     generate_strip_difference_raster,
     generate_tile_grid_vector,
@@ -119,16 +121,35 @@ class _QCWorker(QThread):
                 )
                 self.finished.emit(res)
             elif self.task_type == "strip_diff":
-                res = generate_strip_difference_raster(
-                    tile_manager=self.tile_manager,
-                    database=self.database,
-                    tile_ids=self.params.get("tile_ids"),
-                    strip_a=self.params.get("strip_a"),
-                    strip_b=self.params.get("strip_b"),
-                    cell_size=self.params.get("cell_size", 1.0),
-                    output_path=self.params.get("output_path"),
-                    progress_callback=self._on_progress,
-                )
+                diff_mode = self.params.get("diff_mode", "pairwise")
+                if diff_mode == "max_all":
+                    res = generate_max_strip_difference_raster(
+                        tile_manager=self.tile_manager,
+                        database=self.database,
+                        tile_ids=self.params.get("tile_ids"),
+                        cell_size=self.params.get("cell_size", 1.0),
+                        output_path=self.params.get("output_path"),
+                        progress_callback=self._on_progress,
+                    )
+                elif diff_mode == "batch":
+                    res = batch_export_all_strip_differences(
+                        tile_manager=self.tile_manager,
+                        database=self.database,
+                        cell_size=self.params.get("cell_size", 1.0),
+                        output_dir=self.params.get("output_dir"),
+                        progress_callback=self._on_progress,
+                    )
+                else:
+                    res = generate_strip_difference_raster(
+                        tile_manager=self.tile_manager,
+                        database=self.database,
+                        tile_ids=self.params.get("tile_ids"),
+                        strip_a=self.params.get("strip_a"),
+                        strip_b=self.params.get("strip_b"),
+                        cell_size=self.params.get("cell_size", 1.0),
+                        output_path=self.params.get("output_path"),
+                        progress_callback=self._on_progress,
+                    )
                 self.finished.emit(res)
             elif self.task_type == "tile_grid":
                 res = generate_tile_grid_vector(
@@ -389,8 +410,43 @@ class PointQCWindow(QMainWindow):
         self._cmap_combo.currentTextChanged.connect(self._on_colormap_changed)
         prop_layout.addRow("Colormap:", self._cmap_combo)
 
+        # Min / Max color value controls
+        self._vmin_spin = QDoubleSpinBox()
+        self._vmin_spin.setRange(-10000.0, 10000.0)
+        self._vmin_spin.setDecimals(3)
+        self._vmin_spin.setSingleStep(0.05)
+        self._vmin_spin.valueChanged.connect(self._on_color_range_changed)
+
+        self._vmax_spin = QDoubleSpinBox()
+        self._vmax_spin.setRange(-10000.0, 10000.0)
+        self._vmax_spin.setDecimals(3)
+        self._vmax_spin.setSingleStep(0.05)
+        self._vmax_spin.valueChanged.connect(self._on_color_range_changed)
+
+        prop_layout.addRow("Min Value (m):", self._vmin_spin)
+        prop_layout.addRow("Max Value (m):", self._vmax_spin)
+
+        # Preset range dropdown & Auto stretch button
+        range_btn_layout = QHBoxLayout()
+        self._preset_combo = QComboBox()
+        self._preset_combo.addItem("Presets…", None)
+        self._preset_combo.addItem("0.0 m to 0.3 m", (0.0, 0.3))
+        self._preset_combo.addItem("0.0 m to 0.5 m", (0.0, 0.5))
+        self._preset_combo.addItem("0.0 m to 1.0 m", (0.0, 1.0))
+        self._preset_combo.addItem("-0.3 m to +0.3 m", (-0.3, 0.3))
+        self._preset_combo.addItem("-0.5 m to +0.5 m", (-0.5, 0.5))
+        self._preset_combo.addItem("-1.0 m to +1.0 m", (-1.0, 1.0))
+        self._preset_combo.currentIndexChanged.connect(self._on_preset_range_changed)
+        range_btn_layout.addWidget(self._preset_combo)
+
+        self._auto_range_btn = QPushButton("↺ Auto")
+        self._auto_range_btn.setToolTip("Reset to automatic thumbnail data percentiles")
+        self._auto_range_btn.clicked.connect(self._on_auto_range_clicked)
+        range_btn_layout.addWidget(self._auto_range_btn)
+        prop_layout.addRow("Quick Stretch:", range_btn_layout)
+
         self._val_range_lbl = QLabel("Range: N/A")
-        prop_layout.addRow("Values:", self._val_range_lbl)
+        prop_layout.addRow("Data Range:", self._val_range_lbl)
         layer_layout.addWidget(prop_group)
 
         self._tab_widget.addTab(layer_tab, "Layers")
@@ -430,12 +486,22 @@ class PointQCWindow(QMainWindow):
         qc_form.addRow("Return Filter:", self._filter_combo)
 
         # Strip diff options
+        self._strip_mode_lbl = QLabel("Diff Mode:")
+        self._strip_mode_combo = QComboBox()
+        self._strip_mode_combo.addItem("Pairwise (Strip A vs Strip B)", "pairwise")
+        self._strip_mode_combo.addItem("Max Distance Across All Strips (All-in-One)", "max_all")
+        self._strip_mode_combo.addItem("Batch Export All Overlapping Pairs", "batch")
+        self._strip_mode_combo.currentIndexChanged.connect(self._on_strip_diff_mode_changed)
+
         self._strip_a_combo = QComboBox()
         self._strip_b_combo = QComboBox()
         self._strip_a_lbl = QLabel("Strip A (Ref):")
         self._strip_b_lbl = QLabel("Strip B (Compare):")
+        qc_form.addRow(self._strip_mode_lbl, self._strip_mode_combo)
         qc_form.addRow(self._strip_a_lbl, self._strip_a_combo)
         qc_form.addRow(self._strip_b_lbl, self._strip_b_combo)
+        self._strip_mode_lbl.hide()
+        self._strip_mode_combo.hide()
         self._strip_a_lbl.hide()
         self._strip_a_combo.hide()
         self._strip_b_lbl.hide()
@@ -686,6 +752,11 @@ class PointQCWindow(QMainWindow):
     def _on_layer_selection_changed(self) -> None:
         items = self._tree.selectedItems()
         if not items:
+            self._vmin_spin.setEnabled(False)
+            self._vmax_spin.setEnabled(False)
+            self._preset_combo.setEnabled(False)
+            self._auto_range_btn.setEnabled(False)
+            self._val_range_lbl.setText("Range: N/A")
             return
         obj = items[0].data(0, Qt.UserRole)
         if isinstance(obj, RasterLayer):
@@ -694,11 +765,33 @@ class PointQCWindow(QMainWindow):
             idx = self._cmap_combo.findText(obj.colormap_name)
             if idx >= 0:
                 self._cmap_combo.setCurrentIndex(idx)
+            self._vmin_spin.setEnabled(True)
+            self._vmax_spin.setEnabled(True)
+            self._preset_combo.setEnabled(True)
+            self._auto_range_btn.setEnabled(True)
+            self._vmin_spin.blockSignals(True)
+            self._vmax_spin.blockSignals(True)
+            if obj.vmin is not None:
+                self._vmin_spin.setValue(obj.vmin)
+            if obj.vmax is not None:
+                self._vmax_spin.setValue(obj.vmax)
+            self._vmin_spin.blockSignals(False)
+            self._vmax_spin.blockSignals(False)
             if obj.vmin is not None and obj.vmax is not None:
-                self._val_range_lbl.setText(f"Min: {obj.vmin:.2f} | Max: {obj.vmax:.2f}")
+                self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f}")
         elif isinstance(obj, VectorLayer):
             self._opacity_slider.setValue(int(obj.opacity * 100))
+            self._vmin_spin.setEnabled(False)
+            self._vmax_spin.setEnabled(False)
+            self._preset_combo.setEnabled(False)
+            self._auto_range_btn.setEnabled(False)
             self._val_range_lbl.setText(f"Features: {len(obj.features)}")
+        else:
+            self._vmin_spin.setEnabled(False)
+            self._vmax_spin.setEnabled(False)
+            self._preset_combo.setEnabled(False)
+            self._auto_range_btn.setEnabled(False)
+            self._val_range_lbl.setText("Range: N/A")
 
     def _on_opacity_slider_changed(self, val: int) -> None:
         items = self._tree.selectedItems()
@@ -717,6 +810,63 @@ class PointQCWindow(QMainWindow):
         if isinstance(obj, RasterLayer):
             obj.colormap_name = cmap_name
             self._render_all_layers()
+
+    def _on_color_range_changed(self) -> None:
+        items = self._tree.selectedItems()
+        if not items:
+            return
+        obj = items[0].data(0, Qt.UserRole)
+        if isinstance(obj, RasterLayer):
+            vmin = self._vmin_spin.value()
+            vmax = self._vmax_spin.value()
+            if vmin < vmax:
+                obj.vmin = vmin
+                obj.vmax = vmax
+                self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f}")
+                self._render_raster_layers()
+
+    def _on_preset_range_changed(self, idx: int) -> None:
+        data = self._preset_combo.currentData()
+        if not data:
+            return
+        vmin, vmax = data
+        items = self._tree.selectedItems()
+        if not items:
+            return
+        obj = items[0].data(0, Qt.UserRole)
+        if isinstance(obj, RasterLayer):
+            self._vmin_spin.blockSignals(True)
+            self._vmax_spin.blockSignals(True)
+            self._vmin_spin.setValue(vmin)
+            self._vmax_spin.setValue(vmax)
+            self._vmin_spin.blockSignals(False)
+            self._vmax_spin.blockSignals(False)
+            obj.vmin = vmin
+            obj.vmax = vmax
+            self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f}")
+            self._render_raster_layers()
+
+    def _on_auto_range_clicked(self) -> None:
+        items = self._tree.selectedItems()
+        if not items:
+            return
+        obj = items[0].data(0, Qt.UserRole)
+        if isinstance(obj, RasterLayer):
+            obj.reset_auto_range()
+            self._vmin_spin.blockSignals(True)
+            self._vmax_spin.blockSignals(True)
+            if obj.vmin is not None:
+                self._vmin_spin.setValue(obj.vmin)
+            if obj.vmax is not None:
+                self._vmax_spin.setValue(obj.vmax)
+            self._vmin_spin.blockSignals(False)
+            self._vmax_spin.blockSignals(False)
+            if obj.vmin is not None and obj.vmax is not None:
+                self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f}")
+            self._preset_combo.blockSignals(True)
+            self._preset_combo.setCurrentIndex(0)
+            self._preset_combo.blockSignals(False)
+            self._render_raster_layers()
 
     def _on_tree_context_menu(self, pos) -> None:
         item = self._tree.itemAt(pos)
@@ -778,7 +928,10 @@ class PointQCWindow(QMainWindow):
             return
         # Get current viewport bounds
         view_rect = self._view_box.viewRect()
-        vx0, vy0, vx1, vy1 = view_rect.left(), view_rect.bottom(), view_rect.right(), view_rect.top()
+        vx0 = min(view_rect.left(), view_rect.right())
+        vx1 = max(view_rect.left(), view_rect.right())
+        vy0 = min(view_rect.top(), view_rect.bottom())
+        vy1 = max(view_rect.top(), view_rect.bottom())
         target_size = (max(200, int(self._plot_widget.width())), max(200, int(self._plot_widget.height())))
 
         for grp in self.groups:
@@ -802,8 +955,11 @@ class PointQCWindow(QMainWindow):
 
                     if img_item is None:
                         img_item = pg.ImageItem()
+                        img_item.setZValue(10)
                         self._view_box.addItem(img_item)
                         self._raster_items[l.file_path.as_posix()] = img_item
+                    else:
+                        img_item.setZValue(10)
 
                     # Row 0 of rgba is top (ry1). To map to Y upward in Cartesian coords:
                     rgba_flipped = np.flipud(rgba)
@@ -848,6 +1004,7 @@ class PointQCWindow(QMainWindow):
 
                         # Loaded tiles item
                         path_item = QGraphicsPathItem(painter_path_loaded)
+                        path_item.setZValue(20)
                         pen = QPen(QColor(*l.line_color), l.line_width)
                         path_item.setPen(pen)
                         self._view_box.addItem(path_item)
@@ -856,6 +1013,7 @@ class PointQCWindow(QMainWindow):
                         # Empty tiles item (if present)
                         if has_empty:
                             empty_item = QGraphicsPathItem(painter_path_empty)
+                            empty_item.setZValue(20)
                             empty_pen = QPen(QColor(130, 130, 130, 120), 1.0, Qt.DashLine)
                             empty_item.setPen(empty_pen)
                             self._view_box.addItem(empty_item)
@@ -875,6 +1033,7 @@ class PointQCWindow(QMainWindow):
                             tid = f.fid or f.properties.get(l.label_field, "")
                             if tid:
                                 t_item = pg.TextItem(str(tid), color=l.label_color, anchor=(0.5, 0.5))
+                                t_item.setZValue(30)
                                 t_item.setFont(font)
                                 t_item.setPos(f.centroid[0], f.centroid[1])
                                 self._view_box.addItem(t_item)
@@ -1126,10 +1285,23 @@ class PointQCWindow(QMainWindow):
                 tiles = self.database.get_all_tiles()
                 sids = set()
                 for t in tiles:
+                    fl_json = t.get("flightline_sensor_types")
+                    if fl_json:
+                        try:
+                            d = json.loads(fl_json) if isinstance(fl_json, str) else fl_json
+                            for k in d.keys():
+                                sids.add(int(k))
+                        except Exception:
+                            pass
                     fl = t.get("flight_line")
                     if fl:
-                        sids.add(int(fl))
+                        try:
+                            sids.add(int(fl))
+                        except Exception:
+                            pass
                 if sids:
+                    self._strip_a_combo.clear()
+                    self._strip_b_combo.clear()
                     for sid in sorted(sids):
                         self._strip_a_combo.addItem(f"Strip {sid}", sid)
                         self._strip_b_combo.addItem(f"Strip {sid}", sid)
@@ -1145,10 +1317,21 @@ class PointQCWindow(QMainWindow):
 
     def _on_qc_type_changed(self, idx: int) -> None:
         is_diff = idx == 2
-        self._strip_a_lbl.setVisible(is_diff)
-        self._strip_a_combo.setVisible(is_diff)
-        self._strip_b_lbl.setVisible(is_diff)
-        self._strip_b_combo.setVisible(is_diff)
+        self._strip_mode_lbl.setVisible(is_diff)
+        self._strip_mode_combo.setVisible(is_diff)
+        self._update_strip_diff_visibility()
+
+    def _on_strip_diff_mode_changed(self, idx: int) -> None:
+        self._update_strip_diff_visibility()
+
+    def _update_strip_diff_visibility(self) -> None:
+        is_diff = self._qc_type_combo.currentIndex() == 2
+        mode = self._strip_mode_combo.currentData() if hasattr(self, "_strip_mode_combo") else "pairwise"
+        show_pairs = is_diff and (mode == "pairwise")
+        self._strip_a_lbl.setVisible(show_pairs)
+        self._strip_a_combo.setVisible(show_pairs)
+        self._strip_b_lbl.setVisible(show_pairs)
+        self._strip_b_combo.setVisible(show_pairs)
 
     def _on_generate_tile_grid(self) -> None:
         if not self.database:
@@ -1219,8 +1402,14 @@ class PointQCWindow(QMainWindow):
             params["generate_spacing_after"] = True
         elif qc_idx == 2:
             task_type = "strip_diff"
-            params["strip_a"] = self._strip_a_combo.currentData()
-            params["strip_b"] = self._strip_b_combo.currentData()
+            diff_mode = self._strip_mode_combo.currentData() if hasattr(self, "_strip_mode_combo") else "pairwise"
+            params["diff_mode"] = diff_mode
+            if diff_mode == "pairwise":
+                params["strip_a"] = self._strip_a_combo.currentData()
+                params["strip_b"] = self._strip_b_combo.currentData()
+                if params["strip_a"] is not None and params["strip_b"] is not None and params["strip_a"] == params["strip_b"]:
+                    QMessageBox.warning(self, "Invalid Strips", "Please select two different strips to compare.")
+                    return
 
         self._generate_qc_btn.setEnabled(False)
         self._qc_prog.setValue(0)
@@ -1257,9 +1446,27 @@ class PointQCWindow(QMainWindow):
                 self._qc_status_lbl.setText(f"Spacing derivation error: {exc}")
             return
 
+        # Check if batch export
+        output_paths = results.get("output_paths")
+        if output_paths:
+            for p in output_paths:
+                self.add_raster_layer(p, group_name="QC Rasters")
+            count = len(output_paths)
+            self._qc_status_lbl.setText(
+                f"✓ Batch export complete:\nExported {count} strip difference rasters to qc/rasters/"
+            )
+            self.statusBar().showMessage(f"Exported {count} strip difference rasters", 6000)
+            self._on_zoom_to_extent()
+            return
+
         if out_path:
             rl = self.add_raster_layer(out_path, group_name="QC Rasters")
-            if "rmse_dz" in results:
+            if "max_dz" in results and "p95_dz" in results:
+                self._qc_status_lbl.setText(
+                    f"✓ Max Strip Difference complete:\nMax dZ: {results['max_dz']:.3f} m\nMean dZ: {results['mean_dz']:.3f} m\nP95: {results['p95_dz']:.3f} m"
+                )
+                self.statusBar().showMessage(f"Generated Max Strip Difference raster: Max {results['max_dz']:.3f} m", 6000)
+            elif "rmse_dz" in results:
                 self._qc_status_lbl.setText(
                     f"✓ Strip Difference complete:\nRMSE dZ: {results['rmse_dz']:.3f} m\nMean dZ: {results['mean_dz']:.3f} m"
                 )

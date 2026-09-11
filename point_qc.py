@@ -374,6 +374,9 @@ def generate_strip_difference_raster(
         s_a = strip_a if strip_a is not None else int(unique_strips[0])
         s_b = strip_b if strip_b is not None else int(unique_strips[1] if len(unique_strips) > 1 else unique_strips[0])
 
+        if s_a not in unique_strips or s_b not in unique_strips:
+            continue
+
         mask_a = psid == s_a
         mask_b = psid == s_b
 
@@ -454,6 +457,270 @@ def generate_strip_difference_raster(
     }
     logger.info("Generated strip difference raster: %s (RMSE: %.3f m)", output_path, stats["rmse_dz"])
     return stats
+
+
+def generate_max_strip_difference_raster(
+    tile_manager: Any,
+    database: Any,
+    tile_ids: Optional[List[str]] = None,
+    cell_size: float = 1.0,
+    output_path: Optional[Path | str] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Generate maximum vertical elevation difference across all overlapping strips per pixel.
+
+    For each cell (r, c), among all strips s with points in that cell:
+    dZ_max = max_s(mean(Z_s)) - min_s(mean(Z_s)), provided at least 2 strips overlap.
+    If < 2 strips overlap, the cell is nodata (-9999.0).
+    """
+    if database is None or tile_manager is None:
+        raise ValueError("Both tile_manager and database must be provided.")
+
+    all_tiles = database.get_all_tiles()
+    tile_dict = {t["id"]: t for t in all_tiles}
+
+    if tile_ids is None or len(tile_ids) == 0:
+        target_tids = [t["id"] for t in all_tiles]
+    else:
+        target_tids = [tid for tid in tile_ids if tid in tile_dict]
+
+    bboxes = _get_target_bboxes(tile_manager, database, target_tids)
+    if not bboxes:
+        raise ValueError("Tile bounding boxes are missing in the database.")
+
+    global_min_x = np.floor(min(b[0] for b in bboxes) / cell_size) * cell_size
+    global_max_x = np.ceil(max(b[2] for b in bboxes) / cell_size) * cell_size
+    global_min_y = np.floor(min(b[1] for b in bboxes) / cell_size) * cell_size
+    global_max_y = np.ceil(max(b[3] for b in bboxes) / cell_size) * cell_size
+
+    width = int(round((global_max_x - global_min_x) / cell_size))
+    height = int(round((global_max_y - global_min_y) / cell_size))
+    total_pixels = width * height
+
+    logger.info("Allocating Max Strip Difference grid: %d x %d (cell size: %.2f m)", width, height, cell_size)
+
+    global_max_z = np.full(total_pixels, -np.inf, dtype=np.float32)
+    global_min_z = np.full(total_pixels, np.inf, dtype=np.float32)
+    strip_count = np.zeros(total_pixels, dtype=np.uint16)
+
+    total_tiles = len(target_tids)
+    for idx, tid in enumerate(target_tids):
+        if progress_callback:
+            progress_callback(idx, total_tiles, f"Scanning tile {tid} ({idx + 1}/{total_tiles})…")
+
+        data = tile_manager.load_tile_points_full(tid)
+        if data is None or "x" not in data or "point_source_id" not in data:
+            continue
+
+        psid = data["point_source_id"]
+        x = data["x"]
+        y = data["y"]
+        z = data["z"]
+
+        unique_strips = np.unique(psid)
+        if len(unique_strips) < 2:
+            # A single strip in this tile cannot produce overlap
+            continue
+
+        for s in unique_strips:
+            mask = psid == s
+            if not np.any(mask):
+                continue
+            sub_x = x[mask]
+            sub_y = y[mask]
+            sub_z = z[mask]
+
+            cols = np.floor((sub_x - global_min_x) / cell_size).astype(np.int64)
+            rows = np.floor((global_max_y - sub_y) / cell_size).astype(np.int64)
+
+            valid = (cols >= 0) & (cols < width) & (rows >= 0) & (rows < height)
+            if not np.any(valid):
+                continue
+            flat_idx = rows[valid] * width + cols[valid]
+            sub_z = sub_z[valid]
+
+            u_idx, inv = np.unique(flat_idx, return_inverse=True)
+            sum_z = np.zeros(len(u_idx), dtype=np.float64)
+            cnt_z = np.zeros(len(u_idx), dtype=np.int32)
+            np.add.at(sum_z, inv, sub_z)
+            np.add.at(cnt_z, inv, 1)
+            mean_z = (sum_z / cnt_z).astype(np.float32)
+
+            global_max_z[u_idx] = np.maximum(global_max_z[u_idx], mean_z)
+            global_min_z[u_idx] = np.minimum(global_min_z[u_idx], mean_z)
+            strip_count[u_idx] += 1
+
+    overlap_mask = strip_count >= 2
+    nodata_val = -9999.0
+    dz_grid = np.full((height, width), nodata_val, dtype=np.float32)
+
+    if np.any(overlap_mask):
+        dz_flat = dz_grid.ravel()
+        dz_flat[overlap_mask] = global_max_z[overlap_mask] - global_min_z[overlap_mask]
+
+    if output_path is None:
+        qc_dir = Path(tile_manager._pm.project_root) / "qc" / "rasters"
+        qc_dir.mkdir(parents=True, exist_ok=True)
+        output_path = qc_dir / f"max_strip_difference_{cell_size:.1f}m.tif"
+    else:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    crs_str = get_project_crs_string(database)
+    transform = from_origin(global_min_x, global_max_y, cell_size, cell_size)
+
+    with rasterio.open(
+        output_path,
+        "w",
+        driver="GTiff",
+        height=height,
+        width=width,
+        count=1,
+        dtype="float32",
+        crs=crs_str,
+        transform=transform,
+        nodata=nodata_val,
+        compress="lzw",
+    ) as dst:
+        dst.write(dz_grid, 1)
+
+    if max(width, height) >= 256:
+        with rasterio.open(output_path, "r+") as dst:
+            dst.build_overviews([2, 4, 8, 16, 32], Resampling.average)
+            dst.update_tags(ns="rio_overview", resampling="average")
+
+    overlap_vals = dz_grid.ravel()[overlap_mask]
+    stats = {
+        "output_path": str(output_path),
+        "overlap_cells": int(np.count_nonzero(overlap_mask)),
+        "mean_dz": float(overlap_vals.mean()) if len(overlap_vals) > 0 else 0.0,
+        "rmse_dz": float(np.sqrt(np.mean(overlap_vals**2))) if len(overlap_vals) > 0 else 0.0,
+        "min_dz": float(overlap_vals.min()) if len(overlap_vals) > 0 else 0.0,
+        "max_dz": float(overlap_vals.max()) if len(overlap_vals) > 0 else 0.0,
+        "p95_dz": float(np.percentile(overlap_vals, 95.0)) if len(overlap_vals) > 0 else 0.0,
+        "cell_size": float(cell_size),
+        "crs": crs_str,
+        "bbox": (global_min_x, global_min_y, global_max_x, global_max_y),
+    }
+    logger.info("Generated max strip difference raster: %s (Max: %.3f m, Mean: %.3f m)", output_path, stats["max_dz"], stats["mean_dz"])
+    return stats
+
+
+def batch_export_all_strip_differences(
+    tile_manager: Any,
+    database: Any,
+    cell_size: float = 1.0,
+    output_dir: Optional[Path | str] = None,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> Dict[str, Any]:
+    """
+    Batch export strip difference rasters for all overlapping strip pairs.
+
+    Sequentially processes each strip against all subsequent overlapping strips
+    (Strip 1 vs 2, 1 vs 3... then Strip 2 vs 3, 2 vs 4... etc.).
+    """
+    if database is None or tile_manager is None:
+        raise ValueError("Both tile_manager and database must be provided.")
+
+    from collections import defaultdict
+
+    all_tiles = database.get_all_tiles()
+    strip_to_tiles = defaultdict(set)
+
+    for t in all_tiles:
+        tid = t.get("id")
+        if not tid:
+            continue
+        fl_json = t.get("flightline_sensor_types")
+        if fl_json:
+            try:
+                d = json.loads(fl_json) if isinstance(fl_json, str) else fl_json
+                for k in d.keys():
+                    strip_to_tiles[int(k)].add(tid)
+            except Exception:
+                pass
+        fl = t.get("flight_line")
+        if fl:
+            try:
+                strip_to_tiles[int(fl)].add(tid)
+            except Exception:
+                pass
+
+    sorted_strips = sorted(strip_to_tiles.keys())
+    if len(sorted_strips) < 2:
+        return {
+            "status": "warning",
+            "message": "Fewer than 2 strips discovered in project.",
+            "total_pairs": 0,
+            "exported_rasters": [],
+            "output_paths": [],
+        }
+
+    # Find overlapping pairs
+    pairs: List[Tuple[int, int, List[str]]] = []
+    for i in range(len(sorted_strips)):
+        for j in range(i + 1, len(sorted_strips)):
+            s_a, s_b = sorted_strips[i], sorted_strips[j]
+            common_tids = strip_to_tiles[s_a].intersection(strip_to_tiles[s_b])
+            if common_tids:
+                pairs.append((s_a, s_b, sorted(common_tids)))
+
+    if not pairs:
+        return {
+            "status": "warning",
+            "message": "No overlapping strip pairs found.",
+            "total_pairs": 0,
+            "exported_rasters": [],
+            "output_paths": [],
+        }
+
+    if output_dir is None:
+        out_dir = Path(tile_manager._pm.project_root) / "qc" / "rasters"
+    else:
+        out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    exported_rasters = []
+    total_pairs = len(pairs)
+
+    for p_idx, (s_a, s_b, common_tids) in enumerate(pairs):
+        msg = f"Exporting Strip {s_a} vs {s_b} ({p_idx + 1}/{total_pairs})…"
+        if progress_callback:
+            progress_callback(p_idx, total_pairs, msg)
+
+        out_path = out_dir / f"strip_{s_a}_vs_{s_b}_{cell_size:.1f}m.tif"
+        try:
+            res = generate_strip_difference_raster(
+                tile_manager=tile_manager,
+                database=database,
+                tile_ids=common_tids,
+                strip_a=s_a,
+                strip_b=s_b,
+                cell_size=cell_size,
+                output_path=out_path,
+            )
+            if res.get("overlap_cells", 0) > 0:
+                exported_rasters.append(res)
+            else:
+                # Remove empty file if generated
+                if out_path.exists():
+                    try:
+                        out_path.unlink()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.warning("Error generating strip %s vs %s: %s", s_a, s_b, exc)
+
+    if progress_callback:
+        progress_callback(total_pairs, total_pairs, f"Completed export of {len(exported_rasters)} strip difference pairs.")
+
+    return {
+        "status": "ok",
+        "total_pairs": len(exported_rasters),
+        "exported_rasters": exported_rasters,
+        "output_paths": [r["output_path"] for r in exported_rasters],
+    }
 
 
 def generate_tile_grid_vector(
