@@ -52,40 +52,42 @@ Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.c
 ## Installation
 
 ### Prerequisites
-- **Python** ≥ 3.10
-- **pip** (or conda)
+- **Conda** (Miniconda or Anaconda)
+- **NVIDIA GPU** with CUDA 12.4+ driver support
+- **Git**
 
-### Quick Install
+### Environment Setup
+
+Create and activate the unified conda environment containing PyTorch 2.5.0 (CUDA 12.4), Pointcept dependencies, and LiDAR Workbench:
 
 ```bash
 # Clone the repository
-git clone https://github.com/<your-org>/lidar-workbench.git
+git clone https://github.com/bkabelik/lidar-workbench.git
 cd lidar-workbench
 
-# Install core dependencies (PyPI)
-pip install PySide6 numpy scipy laspy open3d
+# Create the conda environment
+conda env create -f environment.yml --verbose
 
-# For GeoTIFF output (optional), install GDAL:
-#   pip install gdal
-#   or: conda install -c conda-forge gdal
+# Activate the environment
+conda activate pointcept-torch2.5.0-cu12.4
 ```
 
-### Pointcept (Optional — for AI Classification)
+### C++/CUDA Operators (Optional)
+
+The C++/CUDA operators (`flash-attn`, `pointops`, `pointgroup_ops`, `pointrope`) are included in `environment.yml`. If they were not compiled during the initial environment creation, install them manually with:
 
 ```bash
-# Clone PointceptALS alongside the workbench
-git clone https://github.com/bkabelik/PointceptALS.git
-cd PointceptALS
-
-# Follow its README to set up the conda environment:
-conda env create -f environment.yml
-conda activate pointcept
+pip install flash-attn --no-build-isolation
+pip install -e ./Pointcept/libs/pointops --no-build-isolation
+pip install -e ./Pointcept/libs/pointgroup_ops --no-build-isolation
+pip install -e ./Pointcept/libs/pointrope --no-build-isolation
 ```
 
-You'll also need a trained model checkpoint (.pth) and config (.py).
-Place them in `models/` and `configs/` respectively.
+### Pointcept AI Model Checkpoints
 
-**Download here:** [Pointcept Model](https://drive.google.com/file/d/15MlZ6cwed0jFsd7WKOdkDjQIQTiCy5nJ/view?usp=sharing)
+For deep-learning classification, place your trained model checkpoint (`.pth`) and configuration (`.py`) into `models/` and `configs/`:
+
+**Download Model Weights:** [Pointcept Model](https://drive.google.com/file/d/15MlZ6cwed0jFsd7WKOdkDjQIQTiCy5nJ/view?usp=sharing)
 
 ---
 
