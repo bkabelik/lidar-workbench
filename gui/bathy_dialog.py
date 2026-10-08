@@ -2,11 +2,13 @@
 LiDAR Workbench — Bathymetry Processing Dialog.
 
 Dedicated dialog for bathymetric LiDAR processing:
+  - Water surface model cropping (removes points outside river reach)
   - Snell's law refraction correction (with trajectory file + per-point sensor)
   - Water surface from manual Z, GeoTIFF, or auto-detection
-  - Water surface + ghost removal
-  - Automatic river corridor cropping
-  - Benthic continuity filtering
+
+Note: Additional pipeline steps (water surface ghost removal, river corridor crop,
+benthic continuity filtering, and riverbed extraction) are retained in the processing
+backend and can be used programmatically.
 """
 
 from __future__ import annotations
@@ -587,98 +589,36 @@ class BathyDialog(QDialog):
         layout.addWidget(snells_group)
 
         # ═══════════════════════════════════════════════════════════
-        # 2. Water Surface + Ghost Removal
+        # Temporarily removed from GUI (pipeline backend code preserved):
+        #   - 2. Water Surface + Ghost Removal
+        #   - 3. River Corridor Crop
+        #   - 4. Benthic Continuity Filter
+        #   - 5. Extract Riverbed (bathy bed-only)
+        #
+        # Internal control handles are retained unchecked/headless for code
+        # compatibility with _on_run and headless pipeline calls.
         # ═══════════════════════════════════════════════════════════
-        ws_clean_group = QGroupBox("2. Water Surface + Ghost Removal")
-        wf = QFormLayout(ws_clean_group)
-        self._ws_enabled = QCheckBox(
-            "Remove water surface and near-surface ghost returns"
-        )
+        self._ws_enabled = QCheckBox()
         self._ws_enabled.setChecked(False)
-        wf.addRow(self._ws_enabled)
         self._ws_tile_spin = QDoubleSpinBox()
-        self._ws_tile_spin.setRange(10.0, 200.0)
-        self._ws_tile_spin.setDecimals(1)
         self._ws_tile_spin.setValue(40.0)
-        self._ws_tile_spin.setSuffix(" m")
-        self._ws_tile_spin.setToolTip(
-            "Along-track tile length for local surface fitting"
-        )
-        wf.addRow("Tile Length:", self._ws_tile_spin)
-        layout.addWidget(ws_clean_group)
 
-        # ═══════════════════════════════════════════════════════════
-        # 3. River Corridor Crop
-        # ═══════════════════════════════════════════════════════════
-        river_group = QGroupBox("3. River Corridor Crop")
-        rf = QFormLayout(river_group)
-        self._river_enabled = QCheckBox("Auto-crop to river corridor only")
+        self._river_enabled = QCheckBox()
         self._river_enabled.setChecked(False)
-        self._river_enabled.setToolTip(
-            "Uses local Z roughness and intensity to distinguish "
-            "water from land."
-        )
-        rf.addRow(self._river_enabled)
-        layout.addWidget(river_group)
 
-        # ═══════════════════════════════════════════════════════════
-        # 4. Benthic Continuity Filter
-        # ═══════════════════════════════════════════════════════════
-        benthic_group = QGroupBox("4. Benthic Continuity Filter")
-        bf = QFormLayout(benthic_group)
-        self._benthic_enabled = QCheckBox(
-            "Remove isolated water-column noise (flood-fill)"
-        )
-        bf.addRow(self._benthic_enabled)
+        self._benthic_enabled = QCheckBox()
+        self._benthic_enabled.setChecked(False)
         self._benthic_radius_spin = QDoubleSpinBox()
-        self._benthic_radius_spin.setRange(0.1, 5.0)
-        self._benthic_radius_spin.setDecimals(2)
         self._benthic_radius_spin.setValue(0.3)
-        self._benthic_radius_spin.setSuffix(" m")
-        bf.addRow("Search Radius:", self._benthic_radius_spin)
         self._benthic_slope_spin = QDoubleSpinBox()
-        self._benthic_slope_spin.setRange(0.05, 2.0)
-        self._benthic_slope_spin.setDecimals(2)
         self._benthic_slope_spin.setValue(0.35)
-        bf.addRow("Max Slope:", self._benthic_slope_spin)
-        layout.addWidget(benthic_group)
 
-        # ═══════════════════════════════════════════════════════════
-        # 5. Extract Riverbed (bathy bed-only)
-        # ═══════════════════════════════════════════════════════════
-        bed_group = QGroupBox("5. Extract Riverbed (bathy bed-only)")
-        bedf = QFormLayout(bed_group)
-        self._bed_extract_enabled = QCheckBox(
-            "Extract riverbed from green-laser points (keep bed only)"
-        )
+        self._bed_extract_enabled = QCheckBox()
         self._bed_extract_enabled.setChecked(False)
-        self._bed_extract_enabled.setToolTip(
-            "Keeps only the riverbed (bathymetric last returns at the "
-            "local minimum elevation) and drops the water surface, water "
-            "column, ghost and aquatic-vegetation returns.  Topographic "
-            "points are preserved."
-        )
-        bedf.addRow(self._bed_extract_enabled)
         self._bed_cell_spin = QDoubleSpinBox()
-        self._bed_cell_spin.setRange(1.0, 20.0)
-        self._bed_cell_spin.setDecimals(1)
         self._bed_cell_spin.setValue(3.0)
-        self._bed_cell_spin.setSuffix(" m")
-        self._bed_cell_spin.setToolTip(
-            "Grid cell size for the local bed reference."
-        )
-        bedf.addRow("Bed Cell Size:", self._bed_cell_spin)
         self._bed_tol_spin = QDoubleSpinBox()
-        self._bed_tol_spin.setRange(0.1, 10.0)
-        self._bed_tol_spin.setDecimals(2)
         self._bed_tol_spin.setValue(1.0)
-        self._bed_tol_spin.setSuffix(" m")
-        self._bed_tol_spin.setToolTip(
-            "Max height above the local bed a point may sit and still "
-            "count as bed."
-        )
-        bedf.addRow("Bed Tolerance:", self._bed_tol_spin)
-        layout.addWidget(bed_group)
 
         # ── Progress ──
         self._status = QLabel("Ready")

@@ -14,6 +14,12 @@ Axelsson 12° pass-1 angle can progressively climb them.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+_repo_root = Path(__file__).resolve().parents[2]
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
 import numpy as np
 
 from ground import (
@@ -474,6 +480,38 @@ class TestGroundBathy(unittest.TestCase):
 
     def test_egs_csf_crest(self):
         test_egs_csf_embankment_crest_recovery()
+
+    def test_bathy_dialog_gui_elements(self):
+        """Verify that BathyDialog presents step 0 and step 1, but removes steps 2-5 from the GUI."""
+        from PySide6.QtWidgets import QApplication, QGroupBox
+        app = QApplication.instance() or QApplication([])
+
+        try:
+            from gui.bathy_dialog import BathyDialog
+        except ImportError:
+            from lidar_workbench.gui.bathy_dialog import BathyDialog
+        dlg = BathyDialog(tile_ids=["tile_01"])
+
+        group_titles = [child.title() for child in dlg.findChildren(QGroupBox)]
+        self.assertTrue(any("0. Water Surface Crop" in t for t in group_titles))
+        self.assertTrue(any("1. Snell's Law" in t for t in group_titles))
+
+        # Steps 2, 3, 4, 5 must be absent from GUI
+        self.assertFalse(any("2. Water Surface" in t for t in group_titles))
+        self.assertFalse(any("3. River Corridor" in t for t in group_titles))
+        self.assertFalse(any("4. Benthic Continuity" in t for t in group_titles))
+        self.assertFalse(any("5. Extract Riverbed" in t for t in group_titles))
+
+        # Backend handles must exist and default to unchecked
+        self.assertFalse(dlg._ws_enabled.isChecked())
+        self.assertFalse(dlg._river_enabled.isChecked())
+        self.assertFalse(dlg._benthic_enabled.isChecked())
+        self.assertFalse(dlg._bed_extract_enabled.isChecked())
+
+        # Test running with no steps selected
+        dlg._on_run()
+        self.assertEqual(dlg._status.text(), "No steps selected")
+        dlg.deleteLater()
 
 
 if __name__ == "__main__":

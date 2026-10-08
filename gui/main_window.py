@@ -437,7 +437,7 @@ class MainWindow(QMainWindow):
         ground_btn.triggered.connect(self._on_ground_classify)
 
         bathy_btn = toolbar.addAction("Bathy")
-        bathy_btn.setToolTip("Bathymetry processing (refraction, river crop, benthic filter)")
+        bathy_btn.setToolTip("Bathymetry processing (refraction correction, water surface model crop)")
         bathy_btn.triggered.connect(self._on_bathy_process)
 
         gc_btn = toolbar.addAction("GndCtrl")

@@ -1,4 +1,8 @@
-# <img src="gui/assets/logo.png" alt="Kabelik" height="60"> LiDAR Workbench
+<p align="left">
+  <img src="gui/assets/logo.png" alt="Kabelik" height="70">
+</p>
+
+# LiDAR Workbench
 
 **Interactive airborne LiDAR point cloud analysis, classification, and raster export tool.**
 
@@ -6,6 +10,15 @@ Developed by **[Kabelik GmbH](https://kabelik.at)** — Remote Sensing, Geomatic
 Merbotogasse 58D, 2700 Wiener Neustadt, Austria · [office@kabelik.at](mailto:office@kabelik.at)
 
 Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.com/bkabelik/PointceptALS.git).
+
+---
+
+> [!WARNING]
+> ### ⚠️ Project Status & AI Development Disclaimer
+> - **AI-Assisted Development**: This software has been developed with AI assistance.
+> - **Early Development Stage**: The project is currently in active **Alpha / Beta** development and subject to continuous changes and updates.
+> - **Use at Your Own Risk**: All algorithms, geometric transformations, coordinate shifts, point classifications, refraction corrections, and raster products are provided on an **"as is"** basis without warranties of any kind.
+> - **Independent Verification Required**: Users must **always independently verify, inspect, and double-check all outputs** before relying on them for surveying, engineering, legal deliverables, or production operations.
 
 ---
 
