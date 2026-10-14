@@ -50,6 +50,12 @@ pip install -e "$SCRIPT_DIR/Pointcept/libs/pointgroup_ops" --no-build-isolation
 echo "[4/4] Compiling and installing pointrope..."
 pip install -e "$SCRIPT_DIR/Pointcept/libs/pointrope" --no-build-isolation
 
+# Register lidar_workbench in the active Python environment
+PYTHON_SITE_PACKAGES="$(python -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)"
+if [ -n "$PYTHON_SITE_PACKAGES" ] && [ -d "$PYTHON_SITE_PACKAGES" ]; then
+    ln -sfn "$SCRIPT_DIR" "$PYTHON_SITE_PACKAGES/lidar_workbench"
+fi
+
 echo ""
 echo "=== Verifying CUDA Operators in PyTorch ==="
 python -c '

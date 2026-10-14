@@ -22,13 +22,17 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication
 
 # Allow running directly (python main.py) as well as via -m
-if __name__ == "__main__" and __package__ is None:
+if __name__ == "__main__" and not __package__:
     import os as _os
+    import types as _types
 
     _pkg_dir = _os.path.dirname(_os.path.abspath(__file__))
-    _parent_dir = _os.path.dirname(_pkg_dir)
-    if _parent_dir not in sys.path:
-        sys.path.insert(0, _parent_dir)
+    if "lidar_workbench" not in sys.modules:
+        _mod = _types.ModuleType("lidar_workbench")
+        _mod.__path__ = [_pkg_dir]
+        _mod.__file__ = _os.path.join(_pkg_dir, "__init__.py")
+        _mod.__package__ = "lidar_workbench"
+        sys.modules["lidar_workbench"] = _mod
     __package__ = "lidar_workbench"
 
 from .config import APP_NAME, APP_ORG, APP_VERSION, setup_logging
