@@ -65,35 +65,35 @@ Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.c
 ## Installation
 
 ### Prerequisites
-- **Conda** (Miniconda or Anaconda)
-- **NVIDIA GPU** with CUDA 12.4+ driver support
+- **Conda / Mamba** (Miniforge, Mambaforge, or Anaconda)
+- **NVIDIA GPU** with CUDA 12.8+ driver capability (e.g. RTX 30xx, 40xx, or 50xx series)
+- **CUDA Toolkit 12.8 or 12.9** installed on host (`nvcc` in PATH)
 - **Git**
 
 ### Environment Setup
 
-Create and activate the unified conda environment containing PyTorch 2.5.0 (CUDA 12.4), Pointcept dependencies, and LiDAR Workbench:
+Create and activate the unified environment supporting RTX 30xx (sm_86), RTX 40xx (sm_89), and RTX 50xx (sm_120):
 
 ```bash
 # Clone the repository
 git clone https://github.com/bkabelik/lidar-workbench.git
 cd lidar-workbench
 
-# Create the conda environment
-conda env create -f environment.yml --verbose
+# Create the conda environment (mamba is recommended for speed)
+mamba env create -f environment.yml
+# or: conda env create -f environment.yml
 
 # Activate the environment
-conda activate pointcept-torch2.5.0-cu12.4
+conda activate lidar-workbench
 ```
 
-### C++/CUDA Operators (Optional)
+### C++/CUDA Operators (Pointcept & FlashAttention)
 
-The C++/CUDA operators (`flash-attn`, `pointops`, `pointgroup_ops`, `pointrope`) are included in `environment.yml`. If they were not compiled during the initial environment creation, install them manually with:
+To compile the high-performance C++/CUDA operators (`flash-attn`, `pointops`, `pointgroup_ops`, `pointrope`) targeting your GPU:
 
 ```bash
-pip install flash-attn --no-build-isolation
-pip install -e ./Pointcept/libs/pointops --no-build-isolation
-pip install -e ./Pointcept/libs/pointgroup_ops --no-build-isolation
-pip install -e ./Pointcept/libs/pointrope --no-build-isolation
+# Run the automated build script (targets sm_86, sm_89, sm_120+PTX)
+./install_ops.sh
 ```
 
 ### Pointcept AI Model Checkpoints

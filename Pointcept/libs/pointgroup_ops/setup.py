@@ -43,6 +43,11 @@ include_dirs = []
 if not (INCLUDE_DIRS is False):
     include_dirs += INCLUDE_DIRS
 
+import sys
+for inc in [os.path.join(sys.prefix, "include"), os.environ.get("CONDA_PREFIX", "") + "/include"]:
+    if os.path.exists(inc) and inc not in include_dirs:
+        include_dirs.append(inc)
+
 setup(
     name="pointgroup_ops",
     packages=["pointgroup_ops"],
