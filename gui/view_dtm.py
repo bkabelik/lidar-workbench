@@ -159,7 +159,7 @@ class ViewDTM(QWidget):
         # Subsample for fast 2D scatter rendering
         n = len(xs)
         if n > 200_000:
-            step = max(1, n // 200_000)
+            step = int(math.ceil(n / 200_000))
             self._points_x = xs[::step]
             self._points_y = ys[::step]
             self._points_z = zs[::step]
@@ -406,23 +406,23 @@ class ViewDTM(QWidget):
             cr = ((np.clip((t - 0.5) * 4, 0, 1) + np.clip((t - 0.75) * 4, 0, 1)) * 255).astype(np.uint8)
             cg = ((np.clip(t * 4, 0, 1) * (t <= 0.5) + np.clip((1 - t) * 4, 0, 1) * (t > 0.5)) * 255).astype(np.uint8)
             cb = ((np.clip((0.5 - t) * 4, 0, 1)) * 255).astype(np.uint8)
-            for k in range(len(zs)):
-                rgb = (int(cr[k]), int(cg[k]), int(cb[k]))
-                _stamp(row[k], col[k], rgb)
-                _stamp(row[k], col[k] + 1, rgb)
-                _stamp(row[k] + 1, col[k], rgb)
-                _stamp(row[k] + 1, col[k] + 1, rgb)
+            colors_rgb = np.column_stack((cr, cg, cb))
+            for dr, dc in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                rr = np.clip(row + dr, 0, h - 1)
+                cc = np.clip(col + dc, 0, w - 1)
+                img[rr, cc, :3] = colors_rgb
+                img[rr, cc, 3] = 255
         elif mode == "intensity" and intens is not None and len(intens) > 0:
             i_min, i_max = float(intens.min()), float(intens.max())
             i_span = max(1e-6, i_max - i_min)
             vals = (np.clip((intens - i_min) / i_span, 0.0, 1.0) * 255).astype(np.uint8)
-            for k in range(len(intens)):
-                v = int(vals[k])
-                rgb = (v, v, v)
-                _stamp(row[k], col[k], rgb)
-                _stamp(row[k], col[k] + 1, rgb)
-                _stamp(row[k] + 1, col[k], rgb)
-                _stamp(row[k] + 1, col[k] + 1, rgb)
+            for dr, dc in ((0, 0), (0, 1), (1, 0), (1, 1)):
+                rr = np.clip(row + dr, 0, h - 1)
+                cc = np.clip(col + dc, 0, w - 1)
+                img[rr, cc, 0] = vals
+                img[rr, cc, 1] = vals
+                img[rr, cc, 2] = vals
+                img[rr, cc, 3] = 255
         elif mode == "return_number" and rn is not None and len(rn) > 0:
             rn_palette = {1: (51, 178, 51), 2: (178, 178, 51), 3: (178, 102, 51), 4: (178, 51, 51)}
             for r_val in np.unique(rn):

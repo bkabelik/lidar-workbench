@@ -132,12 +132,11 @@ class TestFilterDialogLifecycle(unittest.TestCase):
             dialog._preview_view._renderer = mock_renderer
             dialog._preview_view._scene = mock_renderer.scene
 
-            # Explicit cleanup must safely null references and clear geometry
+            # Explicit cleanup must safely clear preview points and scene geometries
             dialog.cleanup()
             self.assertIsNone(dialog._preview_points)
-            self.assertIsNone(dialog._preview_view._renderer)
-            self.assertIsNone(dialog._preview_view._scene)
-            mock_renderer.scene.clear_geometry.assert_called()
+            # The shared renderer and scene must NOT be destroyed/nulled so subsequent renders remain valid
+            self.assertIsNotNone(dialog._preview_view._renderer)
 
             # Multiple cleanups must be idempotent
             dialog.cleanup()

@@ -685,7 +685,19 @@ class MainWindow(QMainWindow):
             self._preview_dlg = None
         self._preview_dlg = PreviewDialog(parent=self)
         self._preview_dlg.import_requested.connect(self._on_preview_import)
-        self._preview_dlg.destroyed.connect(lambda: setattr(self, '_preview_dlg', None))
+        def _on_preview_destroyed():
+            self._preview_dlg = None
+            if self._editor.tile_id and self._editor._point_data is not None:
+                self._multi_view._view_3d.load_point_cloud(
+                    self._editor._point_data["x"],
+                    self._editor._point_data["y"],
+                    self._editor._point_data["z"],
+                    self._editor._point_data.get("classification"),
+                    self._editor._point_data.get("intensity"),
+                    self._editor._point_data.get("return_number"),
+                    self._editor._point_data.get("point_source_id"),
+                )
+        self._preview_dlg.destroyed.connect(_on_preview_destroyed)
         self._preview_dlg.show()  # non-modal — user can keep interacting with main window
 
     def _on_preview_import(self, file_paths: list) -> None:
@@ -738,6 +750,16 @@ class MainWindow(QMainWindow):
         finally:
             dialog.cleanup()
             dialog.deleteLater()
+            if self._editor.tile_id and self._editor._point_data is not None:
+                self._multi_view._view_3d.load_point_cloud(
+                    self._editor._point_data["x"],
+                    self._editor._point_data["y"],
+                    self._editor._point_data["z"],
+                    self._editor._point_data.get("classification"),
+                    self._editor._point_data.get("intensity"),
+                    self._editor._point_data.get("return_number"),
+                    self._editor._point_data.get("point_source_id"),
+                )
 
     def _on_filter_applied(self, tile_ids: list, pipeline: list) -> None:
         """Apply a filter pipeline to the selected tiles in parallel
@@ -2516,8 +2538,8 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
             QMessageBox.warning(self, "Load Error", f"Failed to load tile {tile_id}.")
             return
 
-        # Open in editor
-        if not self._editor.open_tile(tile_id):
+        # Open in editor (reuse loaded data to avoid reading LAS from disk twice)
+        if not self._editor.open_tile(tile_id, point_data=data):
             QMessageBox.warning(self, "Edit Error", f"Failed to open tile {tile_id} for editing.")
             return
 

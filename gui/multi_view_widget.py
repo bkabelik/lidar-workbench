@@ -328,6 +328,10 @@ class MultiViewWidget(QWidget):
         self._current_tile_id = tile_id
         self._point_data = point_data
 
+        # Pre-assign 3D class visibility before loading so scene builds only once
+        if "3d" in self._class_visibility:
+            self._view_3d._class_visibility = self._class_visibility["3d"]
+
         # 3D overview
         self._view_3d.load_point_cloud(
             point_data["x"], point_data["y"], point_data["z"],

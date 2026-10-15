@@ -17,7 +17,12 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-from pathlib import Path
+import os
+if "__EGL_VENDOR_LIBRARY_DIRS" not in os.environ and "EGL_VENDOR_LIBRARY_DIRS" not in os.environ:
+    for _egl_dir in ("/usr/lib/x86_64-linux-gnu/GL/glvnd/egl_vendor.d", "/usr/share/glvnd/egl_vendor.d"):
+        if os.path.isdir(_egl_dir):
+            os.environ["__EGL_VENDOR_LIBRARY_DIRS"] = _egl_dir
+            break
 
 from PySide6.QtWidgets import QApplication
 

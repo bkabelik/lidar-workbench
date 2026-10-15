@@ -32,6 +32,13 @@ from ..config import ASPRS_CLASS_COLORS, FALLBACK_CLASS_COLOR
 
 logger = logging.getLogger("lidar_workbench.gui.view_3d")
 
+import os
+if "__EGL_VENDOR_LIBRARY_DIRS" not in os.environ and "EGL_VENDOR_LIBRARY_DIRS" not in os.environ:
+    for _egl_dir in ("/usr/lib/x86_64-linux-gnu/GL/glvnd/egl_vendor.d", "/usr/share/glvnd/egl_vendor.d"):
+        if os.path.isdir(_egl_dir):
+            os.environ["__EGL_VENDOR_LIBRARY_DIRS"] = _egl_dir
+            break
+
 try:
     import open3d as o3d
     import open3d.visualization.rendering as o3d_render
@@ -40,6 +47,9 @@ except ImportError:
     HAS_OPEN3D = False
     o3d = None
     o3d_render = None
+
+
+MAX_VIEW_3D_POINTS = 500_000  # Safe point limit for Filament OffscreenRenderer
 
 
 # ── _PreviewView (shared with preview_dialog — keep in sync) ───────
@@ -218,22 +228,11 @@ class View3D(QWidget):
         # Cleanup is done explicitly via MultiViewWidget.cleanup().
 
     def _cleanup_renderer(self):
-        """Release OpenGL and Filament resources safely."""
-        if self._renderer is not None:
-            if self._scene is not None:
-                try:
-                    self._scene.clear_geometry()
-                except Exception:
-                    pass
-            self._scene = None
-            self._picked_geom = None
-            self._highlight_geom = None
-            self._marker_geom = None
-            try:
-                del self._renderer
-            except Exception:
-                pass
-            self._renderer = None
+        """Safely release geometries without destroying the shared Filament engine."""
+        self._safe_clear_scene()
+        self._picked_geom = None
+        self._highlight_geom = None
+        self._marker_geom = None
 
     # ── public API ─────────────────────────────────────────────────
 
@@ -246,19 +245,20 @@ class View3D(QWidget):
         if n == 0:
             return
 
-        # Subsample for GPU budget
-        if n > 2_000_000:
-            step = max(1, n // 2_000_000)
-            idx = np.arange(0, n, step)
-            xs, ys, zs = xs[idx], ys[idx], zs[idx]
+        # Subsample for GPU budget (capped at MAX_VIEW_3D_POINTS for Filament buffer safety)
+        if n > MAX_VIEW_3D_POINTS:
+            step = int(math.ceil(n / MAX_VIEW_3D_POINTS))
+            xs = xs[::step]
+            ys = ys[::step]
+            zs = zs[::step]
             if classifications is not None:
-                classifications = classifications[idx]
+                classifications = classifications[::step]
             if intensities is not None:
-                intensities = intensities[idx]
+                intensities = intensities[::step]
             if return_numbers is not None:
-                return_numbers = return_numbers[idx]
+                return_numbers = return_numbers[::step]
             if point_source_ids is not None:
-                point_source_ids = point_source_ids[idx]
+                point_source_ids = point_source_ids[::step]
 
         self._point_data = {
             "x": xs, "y": ys, "z": zs,
@@ -286,10 +286,14 @@ class View3D(QWidget):
         n = len(xs)
         if n == 0:
             return
-        if n > 2_000_000:
-            step = max(1, n // 2_000_000)
-            idx = np.arange(0, n, step)
-            xs, ys, zs, colors = xs[idx], ys[idx], zs[idx], colors[idx]
+        if not isinstance(colors, np.ndarray):
+            colors = np.asarray(colors, dtype=np.float64)
+        if n > MAX_VIEW_3D_POINTS:
+            step = int(math.ceil(n / MAX_VIEW_3D_POINTS))
+            xs = xs[::step]
+            ys = ys[::step]
+            zs = zs[::step]
+            colors = colors[::step]
         self._point_data = {
             "x": xs, "y": ys, "z": zs,
             "classification": None, "intensity": None,
@@ -426,6 +430,8 @@ class View3D(QWidget):
     def set_class_visibility(self, visibility: np.ndarray) -> None:
         """Set which ASPRS classes are visible (bool array indexed by class code).
         Triggers an immediate scene rebuild."""
+        if self._class_visibility is not None and np.array_equal(self._class_visibility, visibility):
+            return
         self._class_visibility = visibility
         if self._point_data is not None:
             self._rebuild_scene()
@@ -467,9 +473,7 @@ class View3D(QWidget):
         self._marker_cloud_pt = None
         self._marker_geom = None
         self._world_offset = None
-        # Don't touch the Open3D scene — clear_geometry can segfault if
-        # the renderer is in an inconsistent state. _build_and_render
-        # will clear and rebuild the scene when new data arrives.
+        self._safe_clear_scene()
         self._view.set_pixmap(QPixmap())
         self._view.update()
 
@@ -507,28 +511,24 @@ class View3D(QWidget):
     # ── internals ──────────────────────────────────────────────────
 
     def _safe_clear_scene(self) -> None:
-        """Clear the Open3D scene, recreating the renderer if it crashes."""
+        """Safely clear geometries from the Open3D scene without destroying engine state."""
         if self._scene is None:
             return
-        try:
-            self._scene.clear_geometry()
-        except Exception:
-            # Open3D C++ may have crashed internally — recreate renderer
-            logger.warning("clear_geometry failed — recreating renderer")
-            self._renderer = None
-            self._scene = None
-            self._init_renderer()
+        for name in ("_points", "_highlight", "_picked_marker", "_focus_marker"):
+            try:
+                if self._scene.has_geometry(name):
+                    self._scene.remove_geometry(name)
+            except Exception:
+                pass
 
     def _init_renderer(self):
         if self._renderer is not None:
             return
-        try:
-            self._renderer = o3d_render.OffscreenRenderer(800, 600)
+        from ._renderer import get_shared_offscreen_renderer
+        self._renderer = get_shared_offscreen_renderer(800, 600)
+        if self._renderer is not None:
             self._scene = self._renderer.scene
-            self._scene.set_background([0.10, 0.10, 0.18, 1.0])
-        except Exception as exc:
-            logger.warning("OffscreenRenderer failed: %s", exc)
-            self._renderer = None
+        else:
             self._scene = None
 
     def _fit_camera(self, xs, ys, zs):
@@ -588,22 +588,25 @@ class View3D(QWidget):
         self._picked_geom = None
         self._marker_geom = None
 
-        pts = np.column_stack((xs, ys, zs))
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts)
-        pcd.colors = o3d.utility.Vector3dVector(np.clip(colors, 0, 1))
-        mat = o3d_render.MaterialRecord()
-        mat.shader = "defaultUnlit"
-        mat.point_size = 2.5
+        try:
+            pts = np.column_stack((xs, ys, zs))
+            pcd = o3d.geometry.PointCloud()
+            pcd.points = o3d.utility.Vector3dVector(pts)
+            pcd.colors = o3d.utility.Vector3dVector(np.clip(colors, 0, 1))
+            mat = o3d_render.MaterialRecord()
+            mat.shader = "defaultUnlit"
+            mat.point_size = 2.5
 
-        self._scene.add_geometry("_points", pcd, mat)
+            self._scene.add_geometry("_points", pcd, mat)
 
-        # Re-add pick marker if one exists
-        self._show_pick_marker()
-        # Re-add focus/GCP marker if one exists
-        self._show_focus_marker()
+            # Re-add pick marker if one exists
+            self._show_pick_marker()
+            # Re-add focus/GCP marker if one exists
+            self._show_focus_marker()
 
-        self._render()
+            self._render()
+        except Exception as exc:
+            logger.warning("3D rendering failed: %s", exc)
 
     def _compute_colours(self, d=None):
         if d is None:

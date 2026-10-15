@@ -384,13 +384,11 @@ class PreviewDialog(QDialog):
         self._setup_ui()
 
     def closeEvent(self, event):
-        """Cancel loaders and clean up OffscreenRenderer."""
+        """Cancel loaders and clear preview geometries without destroying shared renderer."""
         self._cancel_all_loaders()
-        if self._renderer is not None:
+        if self._scene is not None:
             try:
-                self._scene = None
-                del self._renderer
-                self._renderer = None
+                self._scene.clear_geometry()
             except Exception:
                 pass
         super().closeEvent(event)
@@ -479,17 +477,15 @@ class PreviewDialog(QDialog):
     # ── offscreen renderer ─────────────────────────────────────────
 
     def _init_renderer(self) -> None:
-        """Create the OffscreenRenderer (idempotent)."""
+        """Obtain the shared OffscreenRenderer (idempotent)."""
         if self._renderer is not None or not HAS_OPEN3D:
             return
-        try:
-            self._renderer = o3d_render.OffscreenRenderer(800, 600)
+        from ._renderer import get_shared_offscreen_renderer
+        self._renderer = get_shared_offscreen_renderer(800, 600)
+        if self._renderer is not None:
             self._scene = self._renderer.scene
-            self._scene.set_background([0.12, 0.12, 0.16, 1.0])
-            logger.info("OffscreenRenderer created")
-        except Exception as exc:
-            logger.warning("Failed to create OffscreenRenderer: %s", exc)
-            self._renderer = None
+            logger.info("Shared OffscreenRenderer attached to PreviewDialog")
+        else:
             self._scene = None
 
     def _placeholder_pixmap(self, text: str) -> QPixmap:

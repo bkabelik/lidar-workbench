@@ -427,13 +427,16 @@ class ManualEditor:
 
     # ── tile management ────────────────────────────────────────────
 
-    def open_tile(self, tile_id: str) -> bool:
+    def open_tile(self, tile_id: str, point_data: Optional[Dict[str, np.ndarray]] = None) -> bool:
         """
         Load a tile for editing.
 
         Returns ``True`` on success, ``False`` if the tile cannot be loaded.
         """
-        data = self._tm.load_tile_points_full(tile_id)
+        if point_data is not None:
+            data = point_data
+        else:
+            data = self._tm.load_tile_points_full(tile_id)
         if data is None:
             logger.error("Failed to load tile %s", tile_id)
             return False
