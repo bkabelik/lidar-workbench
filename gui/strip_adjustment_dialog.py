@@ -95,6 +95,10 @@ class _StripAdjustmentWorker(QThread):
         self.tile_ids = list(tile_ids) if tile_ids else []
         self.strip_data_map = strip_data_map
         self.strip_meta = strip_meta or {}
+        self._is_cancelled = False
+
+    def request_cancel(self):
+        self._is_cancelled = True
 
     def run(self):
         try:
@@ -124,6 +128,10 @@ class _StripAdjustmentWorker(QThread):
                 n_tiles = len(self.tile_ids)
 
                 for idx, tid in enumerate(self.tile_ids):
+                    if self._is_cancelled:
+                        self.error.emit("Strip adjustment calculation cancelled by user.")
+                        return
+
                     pct = 5.0 + (idx / max(1, n_tiles)) * 50.0
                     self.progress.emit(
                         f"Analyzing overlap in tile {idx+1}/{n_tiles} ({tid})…", pct
@@ -193,6 +201,10 @@ class _StripAdjustmentWorker(QThread):
 
                 total_pairs = len(pairs)
                 for idx, (s1, s2) in enumerate(pairs):
+                    if self._is_cancelled:
+                        self.error.emit("Strip adjustment calculation cancelled by user.")
+                        return
+
                     pct = 5.0 + (idx / max(1, total_pairs)) * 50.0
                     self.progress.emit(f"Checking overlap between Strip {s1} and Strip {s2}…", pct)
 
@@ -270,18 +282,28 @@ class _StripAdjustmentWorker(QThread):
                 cb = corrections[ts.strip_b]
 
                 pa_adj = ts.point_a.copy()
+                if abs(ca.droll) > 1e-6 or abs(ca.dpitch) > 1e-6 or abs(ca.dyaw) > 1e-6:
+                    sensor_a, ar_a, ap_a, ayaw = solver._get_sensor_pose(ts.strip_a, ts.time_a, ts.point_a)
+                    ra = pa_adj - sensor_a
+                    rot_vec_a = math.radians(ca.droll) * ar_a + math.radians(ca.dpitch) * ap_a + math.radians(ca.dyaw) * ayaw
+                    pa_adj += np.cross(rot_vec_a, ra)
+                pa_adj += np.array([ca.dx, ca.dy, ca.dz])
                 if ca.drift_nodes and len(ca.drift_nodes) > 0:
                     kt_a = np.array([n[0] for n in ca.drift_nodes])
                     kz_a = np.array([n[3] for n in ca.drift_nodes])
                     pa_adj[2] += float(np.interp(ts.time_a, kt_a, kz_a))
-                pa_adj += np.array([ca.dx, ca.dy, ca.dz])
 
                 cb_adj = ts.centroid_b.copy()
+                if abs(cb.droll) > 1e-6 or abs(cb.dpitch) > 1e-6 or abs(cb.dyaw) > 1e-6:
+                    sensor_b, ar_b, ap_b, ayaw = solver._get_sensor_pose(ts.strip_b, ts.time_b, ts.centroid_b)
+                    rb = cb_adj - sensor_b
+                    rot_vec_b = math.radians(cb.droll) * ar_b + math.radians(cb.dpitch) * ap_b + math.radians(cb.dyaw) * ayaw
+                    cb_adj += np.cross(rot_vec_b, rb)
+                cb_adj += np.array([cb.dx, cb.dy, cb.dz])
                 if cb.drift_nodes and len(cb.drift_nodes) > 0:
                     kt_b = np.array([n[0] for n in cb.drift_nodes])
                     kz_b = np.array([n[3] for n in cb.drift_nodes])
                     cb_adj[2] += float(np.interp(ts.time_b, kt_b, kz_b))
-                cb_adj += np.array([cb.dx, cb.dy, cb.dz])
 
                 res_adj = float(np.dot(pa_adj - cb_adj, ts.normal_b))
                 final_residuals.append(res_adj)
@@ -289,12 +311,26 @@ class _StripAdjustmentWorker(QThread):
             final_rmse = math.sqrt(float(np.mean(np.square(final_residuals))))
             final_mean_dz = float(np.mean(final_residuals))
 
+            # Compute strip origins (mean spatial position of tie surfaces for each strip)
+            strip_origins: Dict[int, Tuple[float, float, float]] = {}
+            for sid in self.strip_ids:
+                pts_sid = []
+                for ts in all_tie_surfaces:
+                    if ts.strip_a == sid:
+                        pts_sid.append(ts.point_a)
+                    if ts.strip_b == sid:
+                        pts_sid.append(ts.centroid_b)
+                if pts_sid:
+                    m = np.mean(pts_sid, axis=0)
+                    strip_origins[sid] = (float(m[0]), float(m[1]), float(m[2]))
+
             self.progress.emit("Strip adjustment complete.", 100.0)
 
             results = {
                 "strip_ids": self.strip_ids,
                 "ref_strip_id": ref_id,
                 "corrections": corrections,
+                "strip_origins": strip_origins,
                 "total_ties": len(all_tie_surfaces),
                 "initial_rmse": initial_rmse,
                 "initial_mean_dz": initial_mean_dz,
@@ -305,6 +341,130 @@ class _StripAdjustmentWorker(QThread):
 
         except Exception as exc:
             logger.exception("Error in strip adjustment worker")
+            self.error.emit(str(exc))
+
+
+class _ApplyAdjustmentWorker(QThread):
+    """Worker thread for applying strip corrections to project tile LAS files in background."""
+
+    progress = Signal(str, float)
+    finished = Signal(int)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        tile_manager,
+        database,
+        project_dir: str,
+        target_tids: Sequence[str],
+        corrections: Dict[int, StripCorrection],
+        trajectories: Dict[int, Trajectory],
+        strip_origins: Optional[Dict[int, Tuple[float, float, float]]] = None,
+        parent: Optional[QObject] = None,
+    ):
+        super().__init__(parent)
+        self.tile_manager = tile_manager
+        self.database = database
+        self.project_dir = project_dir
+        self.target_tids = list(target_tids)
+        self.corrections = corrections
+        self.trajectories = trajectories
+        self.strip_origins = strip_origins or {}
+        self._is_cancelled = False
+
+    def request_cancel(self):
+        self._is_cancelled = True
+
+    def run(self):
+        try:
+            import laspy
+            n_tiles = len(self.target_tids)
+            if n_tiles == 0:
+                self.finished.emit(0)
+                return
+
+            modified_count = 0
+            db_updates = []
+
+            for i, tid in enumerate(self.target_tids):
+                if self._is_cancelled:
+                    self.error.emit(f"Adjustment cancelled by user after processing {modified_count} tiles.")
+                    return
+
+                pct = (i / max(1, n_tiles)) * 100.0
+                self.progress.emit(f"Applying adjustment to tile {i+1}/{n_tiles} ({tid})…", pct)
+
+                tile_path = self.tile_manager.tile_las_path(tid) if self.tile_manager else None
+                if not tile_path or not os.path.exists(tile_path):
+                    direct = Path(self.project_dir) / "tiles" / f"{tid}.las"
+                    if direct.is_file():
+                        tile_path = direct
+                    else:
+                        continue
+
+                try:
+                    las = laspy.read(tile_path)
+                except Exception as exc:
+                    logger.error("Failed to read tile %s: %s", tid, exc)
+                    continue
+
+                psids = np.array(las.point_source_id) if hasattr(las, "point_source_id") else None
+                if psids is None or len(psids) == 0:
+                    continue
+
+                xs = np.array(las.x, dtype=np.float64)
+                ys = np.array(las.y, dtype=np.float64)
+                zs = np.array(las.z, dtype=np.float64)
+                ts = np.array(las.gps_time, dtype=np.float64) if hasattr(las, "gps_time") else np.zeros_like(zs)
+
+                needs_update = False
+                for sid, corr in self.corrections.items():
+                    mask = (psids == sid)
+                    if not mask.any():
+                        continue
+
+                    strip_origin = self.strip_origins.get(sid)
+                    sub_x, sub_y, sub_z = apply_strip_corrections(
+                        xs[mask], ys[mask], zs[mask], ts[mask],
+                        corr, self.trajectories.get(sid),
+                        strip_origin=strip_origin,
+                    )
+                    xs[mask] = sub_x
+                    ys[mask] = sub_y
+                    zs[mask] = sub_z
+                    needs_update = True
+
+                if needs_update:
+                    bak_path = str(tile_path) + ".bak"
+                    if not os.path.exists(bak_path):
+                        shutil.copy2(tile_path, bak_path)
+
+                    las.x = xs
+                    las.y = ys
+                    las.z = zs
+                    las.write(tile_path)
+                    modified_count += 1
+
+                    if hasattr(self.tile_manager, "_point_cache"):
+                        self.tile_manager._point_cache.pop(tid, None)
+
+                    bbox = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
+                    db_updates.append((tid, bbox, len(xs)))
+
+            # Batch update database bounding boxes
+            if self.database and db_updates:
+                try:
+                    with self.database.connect() as conn:
+                        for tid, bbox, pt_cnt in db_updates:
+                            self.database.update_tile_bbox(conn, tid, bbox, point_count=pt_cnt)
+                except Exception as exc:
+                    logger.warning("Failed to batch update tile bboxes in DB: %s", exc)
+
+            self.progress.emit(f"Successfully applied strip adjustment to {modified_count} tiles.", 100.0)
+            self.finished.emit(modified_count)
+
+        except Exception as exc:
+            logger.exception("Error applying strip adjustments")
             self.error.emit(str(exc))
 
 
@@ -339,6 +499,7 @@ class StripAdjustmentDialog(QDialog):
         self._strip_data_map: Dict[int, dict] = {}
         self._trajectories: Dict[int, Trajectory] = {}
         self._worker: Optional[_StripAdjustmentWorker] = None
+        self._apply_worker: Optional[_ApplyAdjustmentWorker] = None
         self._solved_results: Optional[dict] = None
 
         self._init_ui()
@@ -411,6 +572,15 @@ class StripAdjustmentDialog(QDialog):
         self._step3_chk = QCheckBox("Step 3: Dynamic Trajectory Drift (time-dependent smooth spline)")
         self._step3_chk.setChecked(False)
         v_steps.addWidget(self._step3_chk)
+
+        steps_hint = QLabel(
+            "<span style='color: #555; font-size: 11px;'>"
+            "💡 <b>Pipeline Tip:</b> Steps 1, 2, and 3 work cumulatively. "
+            "When enabling Step 3 (Drift), keep Step 1 and Step 2 checked so XYZ lever-arm shifts and boresight angles are solved alongside trajectory drift."
+            "</span>"
+        )
+        steps_hint.setWordWrap(True)
+        v_steps.addWidget(steps_hint)
         steps_layout.addLayout(v_steps, 2)
 
         v_params = QVBoxLayout()
@@ -462,6 +632,18 @@ class StripAdjustmentDialog(QDialog):
         self._apply_btn.clicked.connect(self._on_apply_adjustment)
         run_row.addWidget(self._apply_btn)
 
+        self._cancel_btn = QPushButton("⏹ Cancel")
+        self._cancel_btn.setVisible(False)
+        self._cancel_btn.setStyleSheet("font-weight: bold; padding: 6px 14px; background-color: #c62828; color: white;")
+        self._cancel_btn.clicked.connect(self._on_cancel_worker)
+        run_row.addWidget(self._cancel_btn)
+
+        self._revert_btn = QPushButton("↺ Revert Tiles from Backup (.bak)")
+        self._revert_btn.setEnabled(False)
+        self._revert_btn.setToolTip("Restore all tiles to their original pre-adjustment coordinates from backup (.bak) files")
+        self._revert_btn.clicked.connect(self._on_revert_backups)
+        run_row.addWidget(self._revert_btn)
+
         run_row.addStretch()
         diag_layout.addLayout(run_row)
         main_layout.addWidget(diag_grp)
@@ -488,7 +670,7 @@ class StripAdjustmentDialog(QDialog):
         """Return tile IDs corresponding to the current scope combo selection."""
         idx = self._scope_combo.currentIndex()
         if idx == 1 and self._selected_tile_ids:
-            return self._selected_tile_ids
+            return [tid for tid in self._selected_tile_ids if not tid.endswith("_noise")]
         return self._all_project_tile_ids
 
     def _on_scope_changed(self):
@@ -510,22 +692,27 @@ class StripAdjustmentDialog(QDialog):
                 if tdir.is_dir():
                     all_tids = [p.stem for p in sorted(tdir.glob("*.las")) if not p.name.endswith(".bak")]
 
+        # Exclude noise tiles and backup artifacts from flightline strip adjustment
+        all_tids = [
+            tid for tid in all_tids
+            if not tid.endswith("_noise") and not tid.endswith(".bak")
+        ]
+
         self._all_project_tile_ids = all_tids
 
-        # 2. Setup scope combo
+        # 2. Setup scope combo (default to All Project Tiles so adjustment runs globally)
         self._scope_combo.blockSignals(True)
         self._scope_combo.clear()
         self._scope_combo.addItem(f"All Project Tiles ({len(all_tids)} tiles)", "all")
         if self._selected_tile_ids and len(self._selected_tile_ids) < len(all_tids):
             self._scope_combo.addItem(f"Selected Tiles ({len(self._selected_tile_ids)} tiles)", "selected")
-            self._scope_combo.setCurrentIndex(1)
-        else:
-            self._scope_combo.setCurrentIndex(0)
+        self._scope_combo.setCurrentIndex(0)
         self._scope_combo.blockSignals(False)
 
         self._scan_tiles_for_strips()
         self._populate_strip_table()
         self._on_auto_match_trajectories(silent=True)
+        self._check_backup_status()
 
     def _scan_tiles_for_strips(self):
         """Discover flightlines, sensor types, and spanning tiles directly from database, sampling GPS bounds."""
@@ -819,6 +1006,32 @@ class StripAdjustmentDialog(QDialog):
             del self._trajectories[sid]
             self._populate_strip_table()
 
+    def _check_backup_status(self):
+        """Check if any backup (.bak) tile files exist in the project and update the Revert button."""
+        bak_count = 0
+        if self._project_dir:
+            tdir = Path(self._project_dir) / "tiles"
+            if tdir.is_dir():
+                bak_count = len(list(tdir.glob("*.las.bak")))
+
+        if bak_count > 0:
+            self._revert_btn.setEnabled(True)
+            self._revert_btn.setText(f"↺ Revert {bak_count} Tiles from Backup (.bak)")
+        else:
+            self._revert_btn.setEnabled(False)
+            self._revert_btn.setText("↺ Revert Tiles from Backup (.bak)")
+
+    def _on_cancel_worker(self):
+        """Cancel running calculation or application worker."""
+        if self._worker and self._worker.isRunning():
+            self._worker.request_cancel()
+            self._status_label.setText("Cancelling strip adjustment calculation…")
+            self._cancel_btn.setEnabled(False)
+        if self._apply_worker and self._apply_worker.isRunning():
+            self._apply_worker.request_cancel()
+            self._status_label.setText("Cancelling adjustment application…")
+            self._cancel_btn.setEnabled(False)
+
     # ── Calculation ───────────────────────────────────────────────────
 
     def _on_calculate(self):
@@ -831,11 +1044,30 @@ class StripAdjustmentDialog(QDialog):
             QMessageBox.warning(self, "Insufficient Strips", "Please check at least two active strips for adjustment.")
             return
 
+        # If user checked Step 3 (Drift) but unchecked Step 1 & Step 2
+        if self._step3_chk.isChecked() and not self._step1_chk.isChecked() and not self._step2_chk.isChecked():
+            res = QMessageBox.question(
+                self,
+                "Enable Step 1 & Step 2?",
+                "Step 3 (Dynamic Trajectory Drift) solves a time-varying vertical spline (dZ) to absorb IMU drift.\n\n"
+                "Because Step 1 (XYZ translation) and Step 2 (RPY boresight) are currently unchecked, "
+                "horizontal lever-arm shifts and angular mounting offsets will NOT be adjusted, leading to a higher residual RMSE.\n\n"
+                "Would you like to enable Step 1 and Step 2 as well for full 3D alignment?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if res == QMessageBox.Yes:
+                self._step1_chk.setChecked(True)
+                self._step2_chk.setChecked(True)
+
         ref_id = self._ref_strip_combo.currentData()
         target_tids = self._get_active_tile_ids()
 
         self._calc_btn.setEnabled(False)
         self._apply_btn.setEnabled(False)
+        self._revert_btn.setEnabled(False)
+        self._cancel_btn.setVisible(True)
+        self._cancel_btn.setEnabled(True)
         self._progress.setVisible(True)
         self._progress.setValue(0)
         self._status_label.setText("Starting strip adjustment calculation across tiles…")
@@ -865,15 +1097,19 @@ class StripAdjustmentDialog(QDialog):
 
     def _on_calculation_error(self, err: str):
         self._calc_btn.setEnabled(True)
+        self._cancel_btn.setVisible(False)
         self._progress.setVisible(False)
-        self._status_label.setText(f"Calculation failed: {err}")
+        self._check_backup_status()
+        self._status_label.setText(f"Calculation failed or cancelled: {err}")
         QMessageBox.critical(self, "Strip Adjustment Failed", err)
 
     def _on_calculation_finished(self, results: dict):
         self._solved_results = results
         self._calc_btn.setEnabled(True)
         self._apply_btn.setEnabled(True)
+        self._cancel_btn.setVisible(False)
         self._progress.setVisible(False)
+        self._check_backup_status()
         self._status_label.setText("Calculation complete. Review results below before applying.")
 
         corrections: Dict[int, StripCorrection] = results["corrections"]
@@ -884,12 +1120,32 @@ class StripAdjustmentDialog(QDialog):
 
         pct_improve = ((init_rmse - final_rmse) / init_rmse) * 100.0 if init_rmse > 1e-6 else 0.0
 
+        active_steps = []
+        if self._step1_chk.isChecked():
+            active_steps.append("Step 1 (XYZ)")
+        if self._step2_chk.isChecked():
+            active_steps.append("Step 2 (RPY)")
+        if self._step3_chk.isChecked():
+            active_steps.append("Step 3 (Drift)")
+        steps_str = " + ".join(active_steps) if active_steps else "None"
+
+        note = ""
+        if self._step3_chk.isChecked() and not self._step1_chk.isChecked() and not self._step2_chk.isChecked():
+            note = (
+                "<br><span style='color: #d32f2f; font-weight: bold;'>"
+                "⚠️ Note: Step 1 and Step 2 were disabled. Only 1D vertical drift was adjusted; "
+                "horizontal lever-arm offsets and boresight angles remain uncorrected."
+                "</span>"
+            )
+
         diag_text = (
             f"<b>Analysis Summary:</b> Extracted <b>{total_ties:,}</b> planar tie-surfaces across strip overlaps.<br>"
+            f"Active Steps: <b>{steps_str}</b><br>"
             f"Initial Overlap RMSE: <b>{init_rmse:.3f} m</b> ({init_rmse*100:.1f} cm)  ➜  "
             f"Adjusted Overlap RMSE: <b>{final_rmse:.3f} m</b> ({final_rmse*100:.1f} cm) "
             f"<span style='color: #2e7d32; font-weight: bold;'>({pct_improve:+.1f}% improvement)</span><br>"
             f"Reference Strip (Held Fixed): <b>Strip {ref_id}</b>"
+            f"{note}"
         )
         self._diag_label.setText(diag_text)
 
@@ -921,10 +1177,11 @@ class StripAdjustmentDialog(QDialog):
     # ── Apply to Project Tiles ────────────────────────────────────────
 
     def _on_apply_adjustment(self):
-        if not self._solved_results or not self._tm:
+        if not self._solved_results:
             return
 
         corrections: Dict[int, StripCorrection] = self._solved_results["corrections"]
+        strip_origins = self._solved_results.get("strip_origins", {})
         target_tids = self._get_active_tile_ids()
 
         reply = QMessageBox.question(
@@ -939,85 +1196,167 @@ class StripAdjustmentDialog(QDialog):
 
         self._apply_btn.setEnabled(False)
         self._calc_btn.setEnabled(False)
+        self._revert_btn.setEnabled(False)
+        self._cancel_btn.setVisible(True)
+        self._cancel_btn.setEnabled(True)
         self._progress.setVisible(True)
         self._progress.setValue(0)
+        self._status_label.setText(f"Starting adjustment on {len(target_tids)} tiles in background…")
 
-        n_tiles = len(target_tids)
-        modified_count = 0
+        self._apply_worker = _ApplyAdjustmentWorker(
+            tile_manager=self._tm,
+            database=self._db,
+            project_dir=self._project_dir,
+            target_tids=target_tids,
+            corrections=corrections,
+            trajectories=self._trajectories,
+            strip_origins=strip_origins,
+            parent=self,
+        )
+        self._apply_worker.progress.connect(self._on_progress)
+        self._apply_worker.finished.connect(self._on_apply_finished)
+        self._apply_worker.error.connect(self._on_apply_error)
+        self._apply_worker.start()
 
-        for i, tid in enumerate(target_tids):
-            pct = (i + 1) / n_tiles * 100
-            self._progress.setValue(int(pct))
-            self._status_label.setText(f"Applying adjustment to tile {i+1}/{n_tiles} ({tid})…")
-
-            tile_path = self._tm.tile_las_path(tid)
-            if not tile_path or not os.path.exists(tile_path):
-                direct = Path(self._project_dir) / "tiles" / f"{tid}.las"
-                if direct.is_file():
-                    tile_path = direct
-                else:
-                    continue
-
-            import laspy
-            try:
-                las = laspy.read(tile_path)
-            except Exception as exc:
-                logger.error("Failed to read tile %s: %s", tid, exc)
-                continue
-
-            psids = np.array(las.point_source_id) if hasattr(las, "point_source_id") else None
-            if psids is None:
-                continue
-
-            xs = np.array(las.x, dtype=np.float64)
-            ys = np.array(las.y, dtype=np.float64)
-            zs = np.array(las.z, dtype=np.float64)
-            ts = np.array(las.gps_time, dtype=np.float64) if hasattr(las, "gps_time") else np.zeros_like(zs)
-
-            needs_update = False
-            for sid, corr in corrections.items():
-                mask = (psids == sid)
-                if not mask.any():
-                    continue
-
-                sub_x, sub_y, sub_z = apply_strip_corrections(
-                    xs[mask], ys[mask], zs[mask], ts[mask],
-                    corr, self._trajectories.get(sid),
-                )
-                xs[mask] = sub_x
-                ys[mask] = sub_y
-                zs[mask] = sub_z
-                needs_update = True
-
-            if needs_update:
-                # Backup before modifying
-                bak_path = str(tile_path) + ".bak"
-                if not os.path.exists(bak_path):
-                    shutil.copy2(tile_path, bak_path)
-
-                las.x = xs
-                las.y = ys
-                las.z = zs
-                las.write(tile_path)
-                modified_count += 1
-
-                if hasattr(self._tm, "_point_cache"):
-                    self._tm._point_cache.pop(tid, None)
-
-                if self._db:
-                    with self._db.connect() as conn:
-                        bbox = (float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max()))
-                        self._db.update_tile_bbox(conn, tid, bbox, point_count=len(xs))
-
+    def _on_apply_finished(self, modified_count: int):
         self._progress.setVisible(False)
         self._calc_btn.setEnabled(True)
+        self._cancel_btn.setVisible(False)
+        self._cancel_btn.setEnabled(True)
+        self._check_backup_status()
+
         self._status_label.setText(f"Successfully applied strip adjustment to {modified_count} tiles.")
         self.adjustment_applied.emit(self._solved_results)
 
-        QMessageBox.information(
-            self, "Strip Adjustment Complete",
-            f"Successfully applied strip adjustment to {modified_count} tiles!\n\n"
-            f"Tile coordinates have been updated to align all flightlines seamlessly across the project.",
+        # Clear point caches in tile manager so subsequent calculations read the newly written files
+        if self._tm and hasattr(self._tm, "_point_cache"):
+            self._tm._point_cache.clear()
+
+        # Update diagnostic label to show applied status
+        init_rmse = self._solved_results.get("initial_rmse", 0.0) if self._solved_results else 0.0
+        final_rmse = self._solved_results.get("final_rmse", 0.0) if self._solved_results else 0.0
+        pct_improve = ((init_rmse - final_rmse) / init_rmse) * 100.0 if init_rmse > 1e-6 else 0.0
+
+        applied_banner = (
+            f"<div style='background-color: #e8f5e9; border: 1px solid #4caf50; border-radius: 4px; padding: 8px;'>"
+            f"<b style='color: #2e7d32;'>✔ Strip Adjustment Applied to {modified_count} Tiles!</b><br>"
+            f"Initial Overlap RMSE: <b>{init_rmse*100:.1f} cm</b>  ➜  "
+            f"Adjusted Overlap RMSE: <b>{final_rmse*100:.1f} cm</b> "
+            f"<span style='color: #2e7d32; font-weight: bold;'>({pct_improve:+.1f}% improvement)</span><br>"
+            f"<i>Tile coordinates have been updated on disk with .bak backups.<br>"
+            f"You can now run another pass (e.g. Step 3 Drift) to adjust from the new baseline, or close this dialog.</i>"
+            f"</div>"
         )
-        self.accept()
+        self._diag_label.setText(applied_banner)
+
+        QMessageBox.information(
+            self, "Strip Adjustment Applied",
+            f"Successfully applied strip adjustment to {modified_count} tiles!\n\n"
+            f"Tile coordinates on disk have been updated.\n"
+            f"You can now re-run calculation to verify the new baseline or close the dialog.",
+        )
+
+    def _on_apply_error(self, err: str):
+        self._calc_btn.setEnabled(True)
+        self._apply_btn.setEnabled(True)
+        self._cancel_btn.setVisible(False)
+        self._progress.setVisible(False)
+        self._check_backup_status()
+        self._status_label.setText(f"Adjustment interrupted: {err}")
+        QMessageBox.warning(self, "Strip Adjustment Interrupted", f"Adjustment could not be fully applied:\n{err}")
+
+    def _on_revert_backups(self):
+        """Restore all modified tiles from their original .las.bak backups."""
+        if not self._project_dir:
+            return
+
+        tdir = Path(self._project_dir) / "tiles"
+        if not tdir.is_dir():
+            return
+
+        bak_files = list(tdir.glob("*.las.bak"))
+        if not bak_files:
+            QMessageBox.information(self, "No Backups Found", "No tile backup (.bak) files were found to revert.")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Revert Tiles to Backup",
+            f"Are you sure you want to revert {len(bak_files)} tiles to their original pre-adjustment coordinates?\n\n"
+            f"All strip adjustment changes made to these tiles will be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        self._calc_btn.setEnabled(False)
+        self._apply_btn.setEnabled(False)
+        self._revert_btn.setEnabled(False)
+        self._progress.setVisible(True)
+        self._progress.setValue(0)
+
+        import laspy
+        reverted_count = 0
+        db_updates = []
+        n_total = len(bak_files)
+
+        for i, bak_path in enumerate(bak_files):
+            pct = ((i + 1) / max(1, n_total)) * 100.0
+            self._progress.setValue(int(pct))
+            tid = bak_path.name[:-8]  # strip ".las.bak"
+            self._status_label.setText(f"Reverting {tid} from backup…")
+
+            orig_path = bak_path.with_name(f"{tid}.las")
+            try:
+                shutil.copy2(bak_path, orig_path)
+                os.remove(bak_path)
+                reverted_count += 1
+
+                if self._tm and hasattr(self._tm, "_point_cache"):
+                    self._tm._point_cache.pop(tid, None)
+
+                if self._db:
+                    try:
+                        las = laspy.read(orig_path)
+                        bbox = (float(las.x.min()), float(las.y.min()), float(las.x.max()), float(las.y.max()))
+                        db_updates.append((tid, bbox, len(las.x)))
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.error("Failed to restore backup %s: %s", bak_path, exc)
+
+        if self._db and db_updates:
+            try:
+                with self._db.connect() as conn:
+                    for tid, bbox, pt_cnt in db_updates:
+                        self._db.update_tile_bbox(conn, tid, bbox, point_count=pt_cnt)
+            except Exception as exc:
+                logger.warning("Failed to batch update bboxes on revert: %s", exc)
+
+        if self._tm and hasattr(self._tm, "_point_cache"):
+            self._tm._point_cache.clear()
+
+        self._progress.setVisible(False)
+        self._calc_btn.setEnabled(True)
+        self._check_backup_status()
+        self._solved_results = None
+        self._diag_label.setText("Tiles reverted to pre-adjustment state. Re-run calculation if needed.")
+        self._status_label.setText(f"Successfully reverted {reverted_count} tiles from backup.")
+
+        QMessageBox.information(
+            self,
+            "Revert Complete",
+            f"Successfully reverted {reverted_count} tiles from their .bak backups to original state.",
+        )
+
+    def reject(self):
+        """Cancel background threads cleanly if dialog is closed."""
+        if self._worker and self._worker.isRunning():
+            self._worker.request_cancel()
+            self._worker.wait(1000)
+        if self._apply_worker and self._apply_worker.isRunning():
+            self._apply_worker.request_cancel()
+            self._apply_worker.wait(1000)
+        super().reject()
 

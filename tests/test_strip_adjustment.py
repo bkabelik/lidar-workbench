@@ -336,6 +336,79 @@ class TestStripAdjustment(unittest.TestCase):
         self.assertAlmostEqual(corr2.dz, -0.06, delta=0.015)
         self.assertLess(res["final_rmse"], res["initial_rmse"])
 
+    def test_apply_adjustment_worker_and_revert(self):
+        """Test _ApplyAdjustmentWorker background writing and backup restoration."""
+        import tempfile
+        from unittest.mock import patch
+        from PySide6.QtWidgets import QMessageBox
+        import laspy
+        from lidar_workbench.gui.strip_adjustment_dialog import _ApplyAdjustmentWorker
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tdir = Path(tmpdir) / "tiles"
+            tdir.mkdir(parents=True)
+            las_path = tdir / "tile_0001.las"
+
+            # Create synthetic LAS file
+            hdr = laspy.LasHeader(point_format=3, version="1.4")
+            hdr.scales = [0.001, 0.001, 0.001]
+            hdr.offsets = [0.0, 0.0, 0.0]
+            las = laspy.LasData(hdr)
+            las.x = np.array([100.0, 200.0], dtype=np.float64)
+            las.y = np.array([300.0, 400.0], dtype=np.float64)
+            las.z = np.array([50.0, 60.0], dtype=np.float64)
+            las.gps_time = np.array([10.0, 20.0], dtype=np.float64)
+            las.point_source_id = np.array([1, 2], dtype=np.uint16)
+            las.write(str(las_path))
+
+            corrections = {
+                1: StripCorrection(1, dx=0.0, dy=0.0, dz=0.0),
+                2: StripCorrection(2, dx=1.0, dy=-2.0, dz=0.5),
+            }
+
+            # Run Apply worker
+            worker = _ApplyAdjustmentWorker(
+                tile_manager=None,
+                database=None,
+                project_dir=tmpdir,
+                target_tids=["tile_0001"],
+                corrections=corrections,
+                trajectories={},
+            )
+            finished_holder = []
+            worker.finished.connect(lambda n: finished_holder.append(n))
+            worker.run()
+
+            self.assertEqual(finished_holder, [1])
+
+            # Verify backup was created
+            bak_path = tdir / "tile_0001.las.bak"
+            self.assertTrue(bak_path.is_file())
+
+            # Verify new coordinates in LAS
+            las_updated = laspy.read(str(las_path))
+            self.assertAlmostEqual(las_updated.x[0], 100.0, places=2)
+            self.assertAlmostEqual(las_updated.x[1], 201.0, places=2)
+            self.assertAlmostEqual(las_updated.y[1], 398.0, places=2)
+            self.assertAlmostEqual(las_updated.z[1], 60.5, places=2)
+
+            # Test Dialog Revert
+            dlg = StripAdjustmentDialog(tile_manager=None, database=None, project_dir=tmpdir)
+            dlg._check_backup_status()
+            self.assertTrue(dlg._revert_btn.isEnabled())
+
+            with patch("PySide6.QtWidgets.QMessageBox.question", return_value=QMessageBox.Yes), \
+                 patch("PySide6.QtWidgets.QMessageBox.information"):
+                dlg._on_revert_backups()
+
+            # Verify backup file was consumed and original coordinates restored
+            self.assertFalse(bak_path.exists())
+            las_reverted = laspy.read(str(las_path))
+            self.assertAlmostEqual(las_reverted.x[1], 200.0, places=2)
+            self.assertAlmostEqual(las_reverted.y[1], 400.0, places=2)
+            self.assertAlmostEqual(las_reverted.z[1], 60.0, places=2)
+            dlg.close()
+
 
 if __name__ == "__main__":
     unittest.main()

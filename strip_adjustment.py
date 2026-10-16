@@ -592,6 +592,7 @@ class StripAdjustmentSolver:
         """
         results: Dict[int, List[Tuple[float, float, float, float]]] = {}
         shifts = current_shifts or {sid: (0.0, 0.0, 0.0) for sid in self.strip_ids}
+        boresight = current_boresight or {sid: (0.0, 0.0, 0.0) for sid in self.strip_ids}
 
         # Group tie surfaces by strip to find timeline span
         for sid in self.strip_ids:
@@ -644,6 +645,22 @@ class StripAdjustmentSolver:
                 sb = np.array(shifts.get(ts.strip_b, (0.0, 0.0, 0.0)))
                 pa = ts.point_a + sa
                 cb = ts.centroid_b + sb
+
+                # Apply boresight rotation if present
+                ba = boresight.get(ts.strip_a, (0.0, 0.0, 0.0))
+                if abs(ba[0]) > 1e-6 or abs(ba[1]) > 1e-6 or abs(ba[2]) > 1e-6:
+                    sensor_a, ar_a, ap_a, ayaw = self._get_sensor_pose(ts.strip_a, ts.time_a, ts.point_a)
+                    ra = pa - sensor_a
+                    rot_vec_a = math.radians(ba[0]) * ar_a + math.radians(ba[1]) * ap_a + math.radians(ba[2]) * ayaw
+                    pa += np.cross(rot_vec_a, ra)
+
+                bb = boresight.get(ts.strip_b, (0.0, 0.0, 0.0))
+                if abs(bb[0]) > 1e-6 or abs(bb[1]) > 1e-6 or abs(bb[2]) > 1e-6:
+                    sensor_b, ar_b, ap_b, ayaw = self._get_sensor_pose(ts.strip_b, ts.time_b, ts.centroid_b)
+                    rb = cb - sensor_b
+                    rot_vec_b = math.radians(bb[0]) * ar_b + math.radians(bb[1]) * ap_b + math.radians(bb[2]) * ayaw
+                    cb += np.cross(rot_vec_b, rb)
+
                 res = float(np.dot(pa - cb, ts.normal_b))
 
                 A_list.append(row)
@@ -706,6 +723,7 @@ def apply_strip_corrections(
     times: np.ndarray,
     correction: StripCorrection,
     trajectory: Optional[Trajectory] = None,
+    strip_origin: Optional[Tuple[float, float, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Apply solved Step 1 (XYZ), Step 2 (Boresight), and Step 3 (Drift) corrections
@@ -728,6 +746,12 @@ def apply_strip_corrections(
             mean_yaw_rad = math.radians(float(q_yaw.mean()))
             a_roll = np.array([math.sin(mean_yaw_rad), math.cos(mean_yaw_rad), 0.0])
             a_pitch = np.array([math.cos(mean_yaw_rad), -math.sin(mean_yaw_rad), 0.0])
+        elif strip_origin is not None:
+            tx = np.full_like(out_x, strip_origin[0])
+            ty = np.full_like(out_y, strip_origin[1])
+            tz = np.full_like(out_z, strip_origin[2])
+            a_roll = np.array([0.0, 1.0, 0.0])
+            a_pitch = np.array([1.0, 0.0, 0.0])
         else:
             tx = np.full_like(out_x, out_x.mean())
             ty = np.full_like(out_y, out_y.mean())
