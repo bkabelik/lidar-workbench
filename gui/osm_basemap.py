@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -64,7 +65,7 @@ def fetch_osm_tile(z: int, x: int, y: int, cache_dir: Optional[Path] = None) -> 
 
 def fetch_osm_mosaic(
     viewport_bounds: Tuple[float, float, float, float],
-    project_crs: Union[str, int],
+    project_crs: Union[str, int, pyproj.CRS],
     target_size: Tuple[int, int] = (800, 800),
     cache_dir: Optional[Path] = None,
     max_tiles: int = 49,
@@ -74,7 +75,7 @@ def fetch_osm_mosaic(
 
     Args:
         viewport_bounds: (min_x, min_y, max_x, max_y) in project_crs units.
-        project_crs: EPSG code (e.g. 25833) or CRS string (e.g. "EPSG:25833").
+        project_crs: EPSG code (e.g. 25833), CRS string (e.g. "EPSG:25833", WKT), or pyproj.CRS.
         target_size: (width, height) desired output pixel resolution.
         cache_dir: Optional path for tile disk caching.
         max_tiles: Maximum number of tiles to download to prevent bandwidth overload.
@@ -82,12 +83,29 @@ def fetch_osm_mosaic(
     Returns:
         (rgba_hwc_uint8, (min_x, min_y, max_x, max_y)) or None if out of bounds.
     """
-    if isinstance(project_crs, int):
-        crs_str = f"EPSG:{project_crs}"
-    else:
-        crs_str = str(project_crs)
-        if not crs_str.upper().startswith("EPSG:"):
-            crs_str = f"EPSG:{crs_str}"
+    try:
+        if isinstance(project_crs, int):
+            crs_obj = pyproj.CRS.from_epsg(project_crs)
+        elif isinstance(project_crs, str):
+            s = project_crs.strip()
+            if s.isdigit():
+                crs_obj = pyproj.CRS.from_epsg(int(s))
+            elif s.upper().startswith("EPSG:") and s[5:].strip().isdigit():
+                crs_obj = pyproj.CRS.from_epsg(int(s[5:].strip()))
+            else:
+                crs_obj = pyproj.CRS.from_user_input(s)
+        elif isinstance(project_crs, pyproj.CRS):
+            crs_obj = project_crs
+        else:
+            crs_obj = pyproj.CRS.from_user_input(project_crs)
+
+        try:
+            crs_obj = crs_obj.to_2d()
+        except Exception:
+            pass
+    except Exception as exc:
+        logger.warning("Failed to parse project CRS %r: %s", project_crs, exc)
+        return None
 
     x0, y0, x1, y1 = viewport_bounds
     min_x, max_x = min(x0, x1), max(x0, x1)
@@ -97,9 +115,9 @@ def fetch_osm_mosaic(
         return None
 
     try:
-        to_3857 = pyproj.Transformer.from_crs(crs_str, "EPSG:3857", always_xy=True)
+        to_3857 = pyproj.Transformer.from_crs(crs_obj, "EPSG:3857", always_xy=True)
     except Exception as exc:
-        logger.warning("Failed to create CRS transformer to EPSG:3857 from %s: %s", crs_str, exc)
+        logger.warning("Failed to create CRS transformer to EPSG:3857 from %s: %s", crs_obj, exc)
         return None
 
     # Sample corners + midpoint to get conservative 3857 bounding box
@@ -202,6 +220,8 @@ def fetch_osm_mosaic(
     dst_tf = from_bounds(min_x, min_y, max_x, max_y, dst_w, dst_h)
     dst_rgba = np.zeros((4, dst_h, dst_w), dtype=np.uint8)
 
+    dst_crs_str = crs_obj.to_wkt() if crs_obj.to_epsg() is None else f"EPSG:{crs_obj.to_epsg()}"
+
     try:
         rasterio.warp.reproject(
             source=src_rgba,
@@ -209,11 +229,11 @@ def fetch_osm_mosaic(
             src_transform=src_tf,
             src_crs="EPSG:3857",
             dst_transform=dst_tf,
-            dst_crs=crs_str,
+            dst_crs=dst_crs_str,
             resampling=rasterio.warp.Resampling.bilinear,
         )
     except Exception as exc:
-        logger.warning("Reprojection from EPSG:3857 to %s failed: %s", crs_str, exc)
+        logger.warning("Reprojection from EPSG:3857 to %s failed: %s", dst_crs_str, exc)
         return None
 
     # Transpose to (H, W, 4)
@@ -224,39 +244,63 @@ def fetch_osm_mosaic(
 class OSMBasemapWorker(QThread):
     """
     Background worker that fetches and reprojects OSM basemap tiles
-    without stalling the UI.
+    without stalling the UI. Uses a condition variable to cleanly queue requests
+    and withstand window close/reopen and rapid pan/zoom without deadlocks or thread dropping.
     """
     mosaic_ready = Signal(object, tuple)  # (rgba_hwc: np.ndarray, (minx, miny, maxx, maxy))
 
     def __init__(self, parent: Optional[QObject] = None):
         super().__init__(parent)
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
         self._pending_request = None
         self._is_running = True
 
     def request_mosaic(
         self,
         bounds: Tuple[float, float, float, float],
-        crs: Union[str, int],
+        crs: Union[str, int, pyproj.CRS],
         target_size: Tuple[int, int] = (800, 800),
     ) -> None:
         """Post a new viewport bounding box to fetch."""
-        self._pending_request = (bounds, crs, target_size)
+        with self._cond:
+            self._is_running = True
+            self._pending_request = (bounds, crs, target_size)
+            self._cond.notify_all()
         if not self.isRunning():
             self.start()
 
     def run(self) -> None:
-        while self._is_running and self._pending_request is not None:
-            req = self._pending_request
-            self._pending_request = None
+        while True:
+            with self._cond:
+                while self._is_running and self._pending_request is None:
+                    # Wait for requests or timeout after 3s idle
+                    self._cond.wait(timeout=3.0)
+                if not self._is_running:
+                    break
+                if self._pending_request is None:
+                    # Idle timeout; thread safely exits until next request_mosaic
+                    break
+                req = self._pending_request
+                self._pending_request = None
+
             bounds, crs, target_size = req
-            res = fetch_osm_mosaic(bounds, crs, target_size=target_size)
-            if res is not None:
-                rgba, r_bounds = res
-                self.mosaic_ready.emit(rgba, r_bounds)
+            try:
+                res = fetch_osm_mosaic(bounds, crs, target_size=target_size)
+                if res is not None:
+                    with self._cond:
+                        still_alive = self._is_running
+                    if still_alive:
+                        rgba, r_bounds = res
+                        self.mosaic_ready.emit(rgba, r_bounds)
+            except Exception as exc:
+                logger.debug("Error in fetch_osm_mosaic worker: %s", exc)
 
     def stop(self) -> None:
-        self._is_running = False
-        self._pending_request = None
+        with self._cond:
+            self._is_running = False
+            self._pending_request = None
+            self._cond.notify_all()
         if self.isRunning():
             self.quit()
             self.wait(1000)

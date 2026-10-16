@@ -26,18 +26,28 @@ logger = logging.getLogger(__name__)
 
 
 def get_project_crs_string(database: Any) -> str:
-    """Retrieve the project CRS as an EPSG string (e.g. 'EPSG:25833')."""
+    """Retrieve the project CRS as an EPSG or WKT string."""
     if database is None:
-        return "EPSG:32633"
+        return "EPSG:25833"
     try:
         tiles = database.get_all_tiles()
         for t in tiles:
             epsg = t.get("crs_epsg")
             if epsg:
                 return f"EPSG:{epsg}"
+            wkt = t.get("crs_wkt")
+            if wkt:
+                try:
+                    import pyproj
+                    c = pyproj.CRS.from_user_input(wkt).to_2d()
+                    if c.to_epsg():
+                        return f"EPSG:{c.to_epsg()}"
+                    return c.to_wkt()
+                except Exception:
+                    pass
     except Exception as exc:
         logger.warning("Failed to retrieve CRS from database: %s", exc)
-    return "EPSG:32633"
+    return "EPSG:25833"
 
 
 def _get_tile_bbox(tile: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
@@ -94,7 +104,7 @@ def generate_density_raster(
     tile_ids: Optional[List[str]] = None,
     cell_size: float = 1.0,
     output_path: Optional[Path | str] = None,
-    return_filter: str = "all",  # "all", "first", "ground"
+    return_filter: str = "all",  # "all", "first", "last_only", "ground"
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Dict[str, Any]:
     """
@@ -106,7 +116,7 @@ def generate_density_raster(
         tile_ids: Optional subset of tile IDs (if None, all tiles are used).
         cell_size: Grid resolution in coordinate units (meters), default 1.0 m.
         output_path: Target GeoTIFF output path.
-        return_filter: "all", "first", or "ground".
+        return_filter: "all", "first", "last_only", or "ground".
         progress_callback: Optional fn(current, total, status_text).
 
     Returns:
@@ -172,6 +182,16 @@ def generate_density_raster(
             mask = data["return_number"] == 1
             x = x[mask]
             y = y[mask]
+        elif return_filter in ("last", "last_only", "last_and_only") and "return_number" in data:
+            rn = data["return_number"]
+            nr = data.get("number_of_returns")
+            if nr is not None:
+                # Last return of multi-return pulse (rn == nr) OR only return of single-return pulse (nr <= 1)
+                mask = (rn == nr) | (nr <= 1)
+            else:
+                mask = (rn >= 1)
+            x = x[mask]
+            y = y[mask]
         elif return_filter == "ground" and "classification" in data:
             mask = np.isin(data["classification"], [2, 9, 8])  # Ground, Water, Reserved
             x = x[mask]
@@ -206,7 +226,8 @@ def generate_density_raster(
     if output_path is None:
         qc_dir = Path(tile_manager._pm.project_root) / "qc" / "rasters"
         qc_dir.mkdir(parents=True, exist_ok=True)
-        output_path = qc_dir / f"point_density_{cell_size:.1f}m.tif"
+        suffix = f"_{return_filter}" if return_filter != "all" else ""
+        output_path = qc_dir / f"point_density_{cell_size:.1f}m{suffix}.tif"
     else:
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -246,6 +267,7 @@ def generate_density_raster(
         "total_cells": int(width * height),
         "active_cells": int(np.count_nonzero(active_mask)),
         "cell_size": float(cell_size),
+        "return_filter": return_filter,
         "crs": crs_str,
         "bbox": (global_min_x, global_min_y, global_max_x, global_max_y),
     }

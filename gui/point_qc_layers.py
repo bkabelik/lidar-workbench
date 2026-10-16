@@ -60,6 +60,42 @@ class RasterLayer:
 
         self.open()
 
+    @property
+    def unit(self) -> str:
+        fname = self.name.lower()
+        if "density" in fname:
+            return "pts/m²"
+        elif "spacing" in fname or "diff" in fname or "dz" in fname or "strip" in fname:
+            return "m"
+        return "m"
+
+    @property
+    def display_title(self) -> str:
+        fname = self.name.lower()
+        if "density" in fname:
+            filt = ""
+            if "last" in fname:
+                filt = " (Last/Only)"
+            elif "first" in fname:
+                filt = " (First)"
+            elif "ground" in fname:
+                filt = " (Ground)"
+            return f"Point Density{filt}"
+        elif "spacing" in fname:
+            filt = ""
+            if "last" in fname:
+                filt = " (Last/Only)"
+            elif "first" in fname:
+                filt = " (First)"
+            elif "ground" in fname:
+                filt = " (Ground)"
+            return f"Nominal Point Spacing{filt}"
+        elif "diff" in fname or "dz" in fname or "strip" in fname:
+            if "max" in fname:
+                return "Max Strip Difference (dZ)"
+            return "Strip Difference (dZ)"
+        return self.name
+
     def open(self) -> bool:
         """Open dataset handle and read metadata."""
         if not self.file_path.exists():

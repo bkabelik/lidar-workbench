@@ -21,11 +21,26 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import matplotlib
 import numpy as np
+import pyproj
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThread, Signal
-from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDragMoveEvent, QDropEvent, QFont, QPainterPath, QPen
+from PySide6.QtCore import QEvent, QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDragEnterEvent,
+    QDragMoveEvent,
+    QDropEvent,
+    QFont,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QColorDialog,
@@ -53,6 +68,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QTabWidget,
     QToolBar,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -165,6 +181,278 @@ class _QCWorker(QThread):
 
     def _on_progress(self, curr: int, total: int, msg: str) -> None:
         self.progress.emit(curr, total, msg)
+
+
+# ── Interactive Colorbar Legend Widget ──────────────────────────────────────
+
+class QCLegendWidget(QWidget):
+    """
+    Renders an interactive, high-contrast horizontal color legend bar
+    with tick marks, numerical values, and physical units.
+    Supports dynamic scaling for HD, 2K, and 4K displays, drag-and-drop repositioning,
+    and interactive zoom (Ctrl + mouse wheel or right-click menu).
+    """
+
+    scale_changed = Signal(float)
+    position_reset_requested = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None, is_overlay: bool = False, scale: float = 1.0):
+        super().__init__(parent)
+        self.is_overlay = is_overlay
+        self.scale_factor: float = scale
+        self.cmap_name: str = "viridis"
+        self.vmin: float = 0.0
+        self.vmax: float = 50.0
+        self.unit: str = "pts/m²"
+        self.title: str = "Point Density"
+        self._pixmap_cache: Optional[QPixmap] = None
+        self._cached_key: Tuple[str, int, int] = ("", 0, 0)
+        self._drag_pos: Optional[QPointF] = None
+        self._custom_pos: bool = False
+
+        if is_overlay:
+            self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+            self.setCursor(Qt.OpenHandCursor)
+        self.set_scale_factor(scale)
+
+    def set_scale_factor(self, scale: float) -> None:
+        self.scale_factor = max(0.75, min(3.5, float(scale)))
+        self._pixmap_cache = None
+        s = self.scale_factor
+        if self.is_overlay:
+            w = int(round(300 * s))
+            h = int(round(70 * s))
+            self.setFixedSize(w, h)
+        else:
+            self.setMinimumSize(int(round(220 * min(1.5, s))), int(round(65 * min(1.5, s))))
+            self.setMaximumHeight(int(round(90 * min(1.5, s))))
+        self.update()
+
+    def set_layer(self, layer: Optional[Any]) -> None:
+        if layer is None or not getattr(layer, "visible", True):
+            self.hide()
+            return
+
+        self.cmap_name = getattr(layer, "colormap_name", "viridis") or "viridis"
+        self.vmin = layer.vmin if getattr(layer, "vmin", None) is not None else 0.0
+        self.vmax = layer.vmax if getattr(layer, "vmax", None) is not None else 1.0
+        self.unit = getattr(layer, "unit", "")
+        self.title = getattr(layer, "display_title", getattr(layer, "name", "Raster"))
+        self._pixmap_cache = None
+        self.show()
+        self.update()
+
+    def set_style(
+        self, cmap_name: str, vmin: float, vmax: float, unit: str = "", title: str = ""
+    ) -> None:
+        self.cmap_name = cmap_name
+        self.vmin = vmin
+        self.vmax = vmax
+        if unit:
+            self.unit = unit
+        if title:
+            self.title = title
+        self._pixmap_cache = None
+        self.update()
+
+    def _format_tick_value(self, val: float, span: float) -> str:
+        if self.unit == "pts/m²":
+            if span < 5:
+                return f"{val:.1f}"
+            return f"{round(val):.0f}"
+        elif self.unit == "m":
+            if abs(span) <= 2.0 and max(abs(self.vmin), abs(self.vmax)) <= 5.0:
+                cm_val = val * 100.0
+                if abs(cm_val) < 0.05:
+                    return "0 cm"
+                if abs(cm_val - round(cm_val)) < 0.05:
+                    return f"{int(round(cm_val)):+d} cm" if self.vmin < 0 else f"{int(round(cm_val))} cm"
+                else:
+                    return f"{cm_val:+.1f} cm" if self.vmin < 0 else f"{cm_val:.1f} cm"
+            else:
+                if span < 10:
+                    return f"{val:.2f} m"
+                return f"{val:.1f} m"
+        else:
+            if abs(val) < 10:
+                return f"{val:.2f}"
+            return f"{val:.1f}"
+
+    def mousePressEvent(self, ev):
+        if self.is_overlay and ev.button() == Qt.LeftButton:
+            self._drag_pos = ev.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self.is_overlay and self._drag_pos is not None:
+            self._custom_pos = True
+            delta = ev.pos() - self._drag_pos
+            new_pos = self.pos() + delta
+            if self.parentWidget():
+                pw = self.parentWidget().width()
+                ph = self.parentWidget().height()
+                nx = max(0, min(new_pos.x(), pw - self.width()))
+                ny = max(0, min(new_pos.y(), ph - self.height()))
+                self.move(nx, ny)
+            else:
+                self.move(new_pos)
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if self.is_overlay and ev.button() == Qt.LeftButton:
+            self._drag_pos = None
+            self.setCursor(Qt.OpenHandCursor)
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
+
+    def wheelEvent(self, ev):
+        if self.is_overlay and ev.modifiers() & Qt.ControlModifier:
+            delta = ev.angleDelta().y()
+            if delta > 0:
+                new_scale = min(3.5, round((self.scale_factor + 0.25) * 4) / 4)
+            else:
+                new_scale = max(0.75, round((self.scale_factor - 0.25) * 4) / 4)
+            self.scale_changed.emit(new_scale)
+            ev.accept()
+            return
+        super().wheelEvent(ev)
+
+    def contextMenuEvent(self, ev):
+        menu = QMenu(self)
+        menu.setTitle("Color Legend")
+
+        scale_menu = menu.addMenu("🔍 Legend Size (HD / 4K)")
+        scale_presets = [
+            ("100% (Standard HD)", 1.0),
+            ("125%", 1.25),
+            ("150% (Medium)", 1.5),
+            ("175%", 1.75),
+            ("200% (4K UHD)", 2.0),
+            ("250% (Large 4K)", 2.5),
+            ("300% (Huge 4K)", 3.0),
+        ]
+        for name, val in scale_presets:
+            act = scale_menu.addAction(name)
+            act.setCheckable(True)
+            act.setChecked(abs(self.scale_factor - val) < 0.05)
+            act.triggered.connect(lambda checked=False, s=val: self.scale_changed.emit(s))
+
+        menu.addSeparator()
+        if self.is_overlay:
+            if self._custom_pos:
+                reset_act = menu.addAction("↺ Reset to Bottom-Right")
+                reset_act.triggered.connect(self._reset_position)
+            hide_act = menu.addAction("✕ Hide Legend")
+            hide_act.triggered.connect(self.hide)
+
+        menu.exec_(ev.globalPos())
+
+    def _reset_position(self) -> None:
+        self._custom_pos = False
+        self.position_reset_requested.emit()
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        rect = self.rect()
+        w = rect.width()
+        h = rect.height()
+        s = self.scale_factor
+
+        # Background
+        if self.is_overlay:
+            bg_brush = QColor(24, 24, 24, 220)
+            border_pen = QPen(QColor(80, 80, 80, 200), max(1.0, 1.0 * s))
+            painter.setBrush(bg_brush)
+            painter.setPen(border_pen)
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 6 * s, 6 * s)
+        else:
+            bg_brush = QColor(30, 30, 30, 255)
+            border_pen = QPen(QColor(60, 60, 60, 200), 1.0)
+            painter.setBrush(bg_brush)
+            painter.setPen(border_pen)
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 4 * s, 4 * s)
+
+        margin_x = int(round(12 * s))
+        margin_y = int(round(6 * s))
+        title_h = int(round(18 * s))
+
+        # Title text at top
+        title_font = QFont("SansSerif", max(8, int(round(8.5 * s))), QFont.Bold)
+        painter.setFont(title_font)
+        painter.setPen(QColor(220, 220, 220))
+        unit_str = f" ({self.unit})" if self.unit else ""
+        header_text = f"{self.title}{unit_str}"
+        painter.drawText(QRectF(margin_x, margin_y, w - 2 * margin_x, title_h), Qt.AlignLeft | Qt.AlignVCenter, header_text)
+
+        # Color bar rect
+        bar_y = margin_y + title_h + int(round(2 * s))
+        bar_h = int(round(14 * s))
+        bar_w = max(20, w - 2 * margin_x)
+
+        # Generate / draw pixmap gradient
+        cache_key = (self.cmap_name, bar_w, bar_h)
+        if self._pixmap_cache is None or self._cached_key != cache_key:
+            try:
+                cmap = matplotlib.colormaps.get_cmap(self.cmap_name)
+                samples = np.linspace(0.0, 1.0, 256)
+                rgba = (cmap(samples) * 255).astype(np.uint8)
+                img_data = np.tile(rgba[np.newaxis, :, :], (bar_h, 1, 1)).copy()
+                qimg = QImage(img_data.data, 256, bar_h, 256 * 4, QImage.Format_RGBA8888)
+                self._pixmap_cache = QPixmap.fromImage(qimg).scaled(
+                    bar_w, bar_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+                )
+                self._cached_key = cache_key
+            except Exception:
+                self._pixmap_cache = None
+
+        if self._pixmap_cache is not None:
+            painter.drawPixmap(margin_x, bar_y, self._pixmap_cache)
+        else:
+            painter.fillRect(margin_x, bar_y, bar_w, bar_h, QColor(100, 100, 100))
+
+        # Bar outline
+        painter.setPen(QPen(QColor(200, 200, 200, 120), max(1.0, 1.0 * s)))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(margin_x, bar_y, bar_w, bar_h)
+
+        # Tick marks & labels (5 ticks)
+        tick_font = QFont("SansSerif", max(7, int(round(7.5 * s))))
+        painter.setFont(tick_font)
+        painter.setPen(QColor(200, 200, 200))
+
+        tick_len = int(round(4 * s))
+        lbl_h = int(round(18 * s))
+        lbl_w = int(round(68 * s))
+        lbl_y = bar_y + bar_h + tick_len + 2
+
+        fractions = [0.0, 0.25, 0.5, 0.75, 1.0]
+        span = self.vmax - self.vmin
+
+        for i, frac in enumerate(fractions):
+            val = self.vmin + frac * span
+            tx = margin_x + frac * bar_w
+            painter.drawLine(int(round(tx)), bar_y + bar_h, int(round(tx)), bar_y + bar_h + tick_len)
+
+            lbl = self._format_tick_value(val, span)
+            if i == 0:
+                align = Qt.AlignLeft | Qt.AlignTop
+                rect_text = QRectF(tx, lbl_y, lbl_w, lbl_h)
+            elif i == len(fractions) - 1:
+                align = Qt.AlignRight | Qt.AlignTop
+                rect_text = QRectF(tx - lbl_w, lbl_y, lbl_w, lbl_h)
+            else:
+                align = Qt.AlignHCenter | Qt.AlignTop
+                rect_text = QRectF(tx - lbl_w / 2.0, lbl_y, lbl_w, lbl_h)
+
+            painter.drawText(rect_text, align, lbl)
 
 
 # ── Custom ViewBox for Navigation & Selection ───────────────────────────────
@@ -280,6 +568,13 @@ class PointQCWindow(QMainWindow):
 
         self._active_selected_tids: List[str] = []
         self._qc_worker: Optional[_QCWorker] = None
+        self._initial_legend_scale: float = self._detect_initial_legend_scale()
+
+        self._view_debounce_timer = QTimer(self)
+        self._view_debounce_timer.setSingleShot(True)
+        self._view_debounce_timer.timeout.connect(self._do_view_range_update)
+        self._last_osm_raw_rgba: Optional[np.ndarray] = None
+        self._last_osm_bounds: Optional[Tuple[float, float, float, float]] = None
 
         # Build UI
         self._setup_toolbar()
@@ -351,6 +646,42 @@ class PointQCWindow(QMainWindow):
         self._osm_action.triggered.connect(self._on_toggle_osm_action)
         tb.addAction(self._osm_action)
 
+        tb.addSeparator()
+
+        self._legend_action = QAction("📊 Color Legend", self)
+        self._legend_action.setCheckable(True)
+        self._legend_action.setChecked(True)
+        self._legend_action.setToolTip("Toggle on-canvas color legend bar")
+        self._legend_action.triggered.connect(self._on_toggle_canvas_legend)
+        tb.addAction(self._legend_action)
+
+        self._legend_scale_btn = QToolButton(self)
+        btn_label = f"🔍 Size: {int(self._initial_legend_scale * 100)}%"
+        if abs(self._initial_legend_scale - 2.0) < 0.05:
+            btn_label += " (4K)"
+        self._legend_scale_btn.setText(btn_label)
+        self._legend_scale_btn.setToolTip("Adjust color legend display size (HD, 2K, 4K UHD)")
+        self._legend_scale_btn.setPopupMode(QToolButton.InstantPopup)
+        scale_menu = QMenu(self)
+        scale_presets = [
+            ("100% (Standard HD)", 1.0),
+            ("125%", 1.25),
+            ("150% (Medium)", 1.5),
+            ("175%", 1.75),
+            ("200% (4K UHD)", 2.0),
+            ("250% (Large 4K)", 2.5),
+            ("300% (Huge 4K)", 3.0),
+        ]
+        self._legend_scale_actions = []
+        for text, sc in scale_presets:
+            act = scale_menu.addAction(text)
+            act.setCheckable(True)
+            act.setChecked(abs(sc - self._initial_legend_scale) < 0.05)
+            act.triggered.connect(lambda checked=False, s=sc: self._on_legend_scale_changed(s))
+            self._legend_scale_actions.append((act, sc))
+        self._legend_scale_btn.setMenu(scale_menu)
+        tb.addWidget(self._legend_scale_btn)
+
     def _setup_central_canvas(self) -> None:
         self._view_box = QCViewBox()
         self._view_box.setAspectLocked(True)
@@ -365,6 +696,14 @@ class PointQCWindow(QMainWindow):
         self._osm_item = pg.ImageItem()
         self._osm_item.setZValue(-50)
         self._view_box.addItem(self._osm_item)
+
+        # Floating canvas overlay colorbar legend
+        self._canvas_legend = QCLegendWidget(
+            parent=self._plot_widget, is_overlay=True, scale=self._initial_legend_scale
+        )
+        self._canvas_legend.scale_changed.connect(self._on_legend_scale_changed)
+        self._canvas_legend.position_reset_requested.connect(self._reposition_overlay_legend)
+        self._canvas_legend.hide()
 
         self._view_box.tile_clicked.connect(self._on_canvas_tile_clicked)
         self._view_box.box_selected.connect(self._on_canvas_box_selected)
@@ -432,20 +771,22 @@ class PointQCWindow(QMainWindow):
         prop_layout.addRow("Colormap:", self._cmap_combo)
 
         # Min / Max color value controls
+        self._vmin_lbl = QLabel("Min Value (m):")
         self._vmin_spin = QDoubleSpinBox()
         self._vmin_spin.setRange(-10000.0, 10000.0)
         self._vmin_spin.setDecimals(3)
         self._vmin_spin.setSingleStep(0.05)
         self._vmin_spin.valueChanged.connect(self._on_color_range_changed)
 
+        self._vmax_lbl = QLabel("Max Value (m):")
         self._vmax_spin = QDoubleSpinBox()
         self._vmax_spin.setRange(-10000.0, 10000.0)
         self._vmax_spin.setDecimals(3)
         self._vmax_spin.setSingleStep(0.05)
         self._vmax_spin.valueChanged.connect(self._on_color_range_changed)
 
-        prop_layout.addRow("Min Value (m):", self._vmin_spin)
-        prop_layout.addRow("Max Value (m):", self._vmax_spin)
+        prop_layout.addRow(self._vmin_lbl, self._vmin_spin)
+        prop_layout.addRow(self._vmax_lbl, self._vmax_spin)
 
         # Preset range dropdown & Auto stretch button
         range_btn_layout = QHBoxLayout()
@@ -465,6 +806,28 @@ class PointQCWindow(QMainWindow):
         self._auto_range_btn.clicked.connect(self._on_auto_range_clicked)
         range_btn_layout.addWidget(self._auto_range_btn)
         prop_layout.addRow("Quick Stretch:", range_btn_layout)
+
+        # Legend Scale dropdown in dock
+        self._legend_scale_combo = QComboBox()
+        self._legend_scale_combo.addItem("100% (Standard HD)", 1.0)
+        self._legend_scale_combo.addItem("125%", 1.25)
+        self._legend_scale_combo.addItem("150% (Medium)", 1.5)
+        self._legend_scale_combo.addItem("175%", 1.75)
+        self._legend_scale_combo.addItem("200% (4K UHD)", 2.0)
+        self._legend_scale_combo.addItem("250% (Large 4K)", 2.5)
+        self._legend_scale_combo.addItem("300% (Huge 4K)", 3.0)
+        for i in range(self._legend_scale_combo.count()):
+            d = self._legend_scale_combo.itemData(i)
+            if d is not None and abs(d - self._initial_legend_scale) < 0.05:
+                self._legend_scale_combo.setCurrentIndex(i)
+                break
+        self._legend_scale_combo.currentIndexChanged.connect(self._on_legend_scale_combo_changed)
+        prop_layout.addRow("Legend Scale:", self._legend_scale_combo)
+
+        # Colorbar Legend in Dock
+        self._dock_legend = QCLegendWidget(is_overlay=False, scale=min(1.5, self._initial_legend_scale))
+        self._dock_legend.hide()
+        prop_layout.addRow("Color Legend:", self._dock_legend)
 
         self._val_range_lbl = QLabel("Range: N/A")
         prop_layout.addRow("Data Range:", self._val_range_lbl)
@@ -503,7 +866,10 @@ class PointQCWindow(QMainWindow):
         qc_form.addRow("Scope:", scope_box)
 
         self._filter_combo = QComboBox()
-        self._filter_combo.addItems(["All Returns", "First Returns Only", "Ground Returns Only"])
+        self._filter_combo.addItem("All Returns / Pulses", "all")
+        self._filter_combo.addItem("First Returns Only", "first")
+        self._filter_combo.addItem("Last & Only Returns", "last_only")
+        self._filter_combo.addItem("Ground Returns Only", "ground")
         qc_form.addRow("Return Filter:", self._filter_combo)
 
         # Strip diff options
@@ -636,7 +1002,15 @@ class PointQCWindow(QMainWindow):
         if self._active_raster_layer and self._active_raster_layer.visible:
             val = self._active_raster_layer.get_value_at(x, y)
             if val is not None:
-                self._val_lbl.setText(f"Value: {val:.3f}")
+                if self._active_raster_layer.unit == "pts/m²":
+                    self._val_lbl.setText(f"Density: {val:.1f} pts/m²")
+                elif self._active_raster_layer.unit == "m":
+                    if abs(val) <= 2.0:
+                        self._val_lbl.setText(f"Value: {val:.3f} m ({val * 100:+.1f} cm)")
+                    else:
+                        self._val_lbl.setText(f"Value: {val:.3f} m")
+                else:
+                    self._val_lbl.setText(f"Value: {val:.3f}")
             else:
                 self._val_lbl.setText("Value: NoData")
         else:
@@ -768,16 +1142,148 @@ class PointQCWindow(QMainWindow):
         if isinstance(data, (RasterLayer, VectorLayer)):
             data.visible = is_checked
             self._render_all_layers()
+            if isinstance(data, RasterLayer) and data == self._active_raster_layer:
+                self._update_legends(data if is_checked else None)
         elif isinstance(data, OSMBasemapLayer):
             data.visible = is_checked
             self._osm_action.setChecked(is_checked)
+            grp = self._get_osm_group()
+            if is_checked and grp and not grp.visible:
+                grp.visible = True
+                self._tree.blockSignals(True)
+                for i in range(self._tree.topLevelItemCount()):
+                    grp_item = self._tree.topLevelItem(i)
+                    if grp_item.data(0, Qt.UserRole) is grp:
+                        grp_item.setCheckState(0, Qt.Checked)
+                self._tree.blockSignals(False)
             self._render_osm_basemap()
         elif isinstance(data, LayerGroup):
             data.visible = is_checked
             for i in range(item.childCount()):
                 child_item = item.child(i)
                 child_item.setCheckState(0, Qt.Checked if is_checked else Qt.Unchecked)
+                child_data = child_item.data(0, Qt.UserRole)
+                if hasattr(child_data, "visible"):
+                    child_data.visible = is_checked
+            if hasattr(self, "_osm_layer") and data is self._get_osm_group():
+                self._osm_action.setChecked(is_checked and self._osm_layer.visible)
             self._render_all_layers()
+            self._update_legends()
+
+    def _update_presets_for_layer(self, layer: RasterLayer) -> None:
+        self._preset_combo.blockSignals(True)
+        self._preset_combo.clear()
+        self._preset_combo.addItem("Presets…", None)
+
+        if layer.unit == "pts/m²":
+            self._preset_combo.addItem("0 to 10 pts/m²", (0.0, 10.0))
+            self._preset_combo.addItem("0 to 25 pts/m²", (0.0, 25.0))
+            self._preset_combo.addItem("0 to 50 pts/m²", (0.0, 50.0))
+            self._preset_combo.addItem("0 to 100 pts/m²", (0.0, 100.0))
+            self._preset_combo.addItem("0 to 200 pts/m²", (0.0, 200.0))
+        elif layer.is_diverging:
+            self._preset_combo.addItem("-0.3 m to +0.3 m", (-0.3, 0.3))
+            self._preset_combo.addItem("-0.5 m to +0.5 m", (-0.5, 0.5))
+            self._preset_combo.addItem("-1.0 m to +1.0 m", (-1.0, 1.0))
+        else:
+            self._preset_combo.addItem("0.0 m to 0.3 m", (0.0, 0.3))
+            self._preset_combo.addItem("0.0 m to 0.5 m", (0.0, 0.5))
+            self._preset_combo.addItem("0.0 m to 1.0 m", (0.0, 1.0))
+            self._preset_combo.addItem("0.0 m to 2.0 m", (0.0, 2.0))
+
+        self._preset_combo.blockSignals(False)
+
+    def _detect_initial_legend_scale(self) -> float:
+        try:
+            screen = self.screen() if hasattr(self, "screen") and self.screen() else None
+            if not screen:
+                app = QApplication.instance()
+                if app:
+                    screen = app.primaryScreen()
+            if screen:
+                geom = screen.geometry()
+                dpr = screen.devicePixelRatio()
+                if dpr >= 1.5 or geom.height() >= 1800 or geom.width() >= 3000:
+                    return 2.0
+                elif geom.height() >= 1300:
+                    return 1.5
+        except Exception:
+            pass
+        return 1.0
+
+    def _on_legend_scale_changed(self, scale: float) -> None:
+        self._canvas_legend.set_scale_factor(scale)
+        self._dock_legend.set_scale_factor(min(1.5, scale))
+        self._reposition_overlay_legend()
+
+        # Update dock scale combo if present
+        if hasattr(self, "_legend_scale_combo"):
+            self._legend_scale_combo.blockSignals(True)
+            for i in range(self._legend_scale_combo.count()):
+                d = self._legend_scale_combo.itemData(i)
+                if d is not None and abs(d - scale) < 0.05:
+                    self._legend_scale_combo.setCurrentIndex(i)
+                    break
+            self._legend_scale_combo.blockSignals(False)
+
+        # Update toolbar button text & actions
+        if hasattr(self, "_legend_scale_btn"):
+            lbl = f"🔍 Size: {int(scale * 100)}%"
+            if abs(scale - 2.0) < 0.05:
+                lbl += " (4K)"
+            self._legend_scale_btn.setText(lbl)
+        if hasattr(self, "_legend_scale_actions"):
+            for act, sc in self._legend_scale_actions:
+                act.setChecked(abs(sc - scale) < 0.05)
+
+    def _on_legend_scale_combo_changed(self, idx: int) -> None:
+        val = self._legend_scale_combo.currentData()
+        if val is not None:
+            self._on_legend_scale_changed(float(val))
+
+    def _reposition_overlay_legend(self) -> None:
+        if not hasattr(self, "_canvas_legend") or not hasattr(self, "_plot_widget"):
+            return
+        lw = self._canvas_legend.width()
+        lh = self._canvas_legend.height()
+        pw = self._plot_widget.width()
+        ph = self._plot_widget.height()
+
+        if getattr(self._canvas_legend, "_custom_pos", False):
+            cx = max(10, min(self._canvas_legend.x(), pw - lw - 10))
+            cy = max(10, min(self._canvas_legend.y(), ph - lh - 10))
+            self._canvas_legend.move(cx, cy)
+        else:
+            px = max(10, pw - lw - 20)
+            py = max(10, ph - lh - 40)
+            self._canvas_legend.move(px, py)
+
+    def _on_toggle_canvas_legend(self, checked: bool) -> None:
+        if checked and self._active_raster_layer and self._active_raster_layer.visible:
+            self._canvas_legend.show()
+            self._reposition_overlay_legend()
+        else:
+            self._canvas_legend.hide()
+
+    def _update_legends(self, layer: Optional[RasterLayer] = None) -> None:
+        if layer is None:
+            layer = self._active_raster_layer
+
+        if layer is not None and isinstance(layer, RasterLayer) and layer.visible:
+            self._dock_legend.set_layer(layer)
+            self._canvas_legend.set_layer(layer)
+            if hasattr(self, "_legend_action") and not self._legend_action.isChecked():
+                self._canvas_legend.hide()
+            else:
+                self._canvas_legend.show()
+                self._reposition_overlay_legend()
+        else:
+            self._dock_legend.hide()
+            self._canvas_legend.hide()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._reposition_overlay_legend()
 
     def _on_layer_selection_changed(self) -> None:
         items = self._tree.selectedItems()
@@ -787,6 +1293,7 @@ class PointQCWindow(QMainWindow):
             self._preset_combo.setEnabled(False)
             self._auto_range_btn.setEnabled(False)
             self._val_range_lbl.setText("Range: N/A")
+            self._update_legends(None)
             return
         obj = items[0].data(0, Qt.UserRole)
         if isinstance(obj, RasterLayer):
@@ -799,6 +1306,29 @@ class PointQCWindow(QMainWindow):
             self._vmax_spin.setEnabled(True)
             self._preset_combo.setEnabled(True)
             self._auto_range_btn.setEnabled(True)
+
+            # Adapt labels and spinbox parameters to physical unit
+            if obj.unit == "pts/m²":
+                self._vmin_lbl.setText("Min Density:")
+                self._vmax_lbl.setText("Max Density:")
+                self._vmin_spin.setSuffix(" pts/m²")
+                self._vmax_spin.setSuffix(" pts/m²")
+                self._vmin_spin.setSingleStep(1.0)
+                self._vmax_spin.setSingleStep(1.0)
+                self._vmin_spin.setDecimals(1)
+                self._vmax_spin.setDecimals(1)
+            else:
+                self._vmin_lbl.setText("Min Value:")
+                self._vmax_lbl.setText("Max Value:")
+                self._vmin_spin.setSuffix(" m")
+                self._vmax_spin.setSuffix(" m")
+                self._vmin_spin.setSingleStep(0.05)
+                self._vmax_spin.setSingleStep(0.05)
+                self._vmin_spin.setDecimals(3)
+                self._vmax_spin.setDecimals(3)
+
+            self._update_presets_for_layer(obj)
+
             self._vmin_spin.blockSignals(True)
             self._vmax_spin.blockSignals(True)
             if obj.vmin is not None:
@@ -808,7 +1338,9 @@ class PointQCWindow(QMainWindow):
             self._vmin_spin.blockSignals(False)
             self._vmax_spin.blockSignals(False)
             if obj.vmin is not None and obj.vmax is not None:
-                self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f}")
+                self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f} {obj.unit}")
+
+            self._update_legends(obj)
         elif isinstance(obj, VectorLayer):
             self._opacity_slider.setValue(int(obj.opacity * 100))
             self._vmin_spin.setEnabled(False)
@@ -816,6 +1348,7 @@ class PointQCWindow(QMainWindow):
             self._preset_combo.setEnabled(False)
             self._auto_range_btn.setEnabled(False)
             self._val_range_lbl.setText(f"Features: {len(obj.features)}")
+            self._update_legends(None)
         elif isinstance(obj, OSMBasemapLayer):
             self._opacity_slider.setValue(int(obj.opacity * 100))
             self._vmin_spin.setEnabled(False)
@@ -823,12 +1356,14 @@ class PointQCWindow(QMainWindow):
             self._preset_combo.setEnabled(False)
             self._auto_range_btn.setEnabled(False)
             self._val_range_lbl.setText(f"Basemap CRS: {obj.crs}")
+            self._update_legends(None)
         else:
             self._vmin_spin.setEnabled(False)
             self._vmax_spin.setEnabled(False)
             self._preset_combo.setEnabled(False)
             self._auto_range_btn.setEnabled(False)
             self._val_range_lbl.setText("Range: N/A")
+            self._update_legends(None)
 
     def _on_opacity_slider_changed(self, val: int) -> None:
         items = self._tree.selectedItems()
@@ -840,7 +1375,10 @@ class PointQCWindow(QMainWindow):
             self._render_all_layers()
         elif isinstance(obj, OSMBasemapLayer):
             obj.opacity = val / 100.0
-            self._render_osm_basemap()
+            if hasattr(self, "_last_osm_raw_rgba") and self._last_osm_raw_rgba is not None:
+                self._update_osm_item_display()
+            else:
+                self._render_osm_basemap()
 
     def _on_colormap_changed(self, cmap_name: str) -> None:
         items = self._tree.selectedItems()
@@ -849,6 +1387,7 @@ class PointQCWindow(QMainWindow):
         obj = items[0].data(0, Qt.UserRole)
         if isinstance(obj, RasterLayer):
             obj.colormap_name = cmap_name
+            self._update_legends(obj)
             self._render_all_layers()
 
     def _on_color_range_changed(self) -> None:
@@ -862,7 +1401,8 @@ class PointQCWindow(QMainWindow):
             if vmin < vmax:
                 obj.vmin = vmin
                 obj.vmax = vmax
-                self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f}")
+                self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f} {obj.unit}")
+                self._update_legends(obj)
                 self._render_raster_layers()
 
     def _on_preset_range_changed(self, idx: int) -> None:
@@ -883,7 +1423,8 @@ class PointQCWindow(QMainWindow):
             self._vmax_spin.blockSignals(False)
             obj.vmin = vmin
             obj.vmax = vmax
-            self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f}")
+            self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f} {obj.unit}")
+            self._update_legends(obj)
             self._render_raster_layers()
 
     def _on_auto_range_clicked(self) -> None:
@@ -902,10 +1443,11 @@ class PointQCWindow(QMainWindow):
             self._vmin_spin.blockSignals(False)
             self._vmax_spin.blockSignals(False)
             if obj.vmin is not None and obj.vmax is not None:
-                self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f}")
+                self._val_range_lbl.setText(f"Min: {obj.vmin:.3f} | Max: {obj.vmax:.3f} {obj.unit}")
             self._preset_combo.blockSignals(True)
             self._preset_combo.setCurrentIndex(0)
             self._preset_combo.blockSignals(False)
+            self._update_legends(obj)
             self._render_raster_layers()
 
     def _on_tree_context_menu(self, pos) -> None:
@@ -955,24 +1497,52 @@ class PointQCWindow(QMainWindow):
             maxy = max(b[3] for b in all_bounds)
             self._view_box.setRange(QRectF(minx, miny, maxx - minx, maxy - miny), padding=0.05)
 
+    def _get_osm_group(self) -> Optional[LayerGroup]:
+        for grp in self.groups:
+            if hasattr(self, "_osm_layer") and self._osm_layer in grp.children:
+                return grp
+        return None
+
     def _on_toggle_osm_action(self, checked: bool) -> None:
         self._osm_layer.visible = checked
+        grp = self._get_osm_group()
+        if checked and grp:
+            grp.visible = True
+
         self._tree.blockSignals(True)
         for i in range(self._tree.topLevelItemCount()):
             grp_item = self._tree.topLevelItem(i)
+            if checked and grp and grp_item.data(0, Qt.UserRole) is grp:
+                grp_item.setCheckState(0, Qt.Checked)
             for j in range(grp_item.childCount()):
                 c_item = grp_item.child(j)
                 if c_item.data(0, Qt.UserRole) is self._osm_layer:
                     c_item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
         self._tree.blockSignals(False)
+
+        if checked:
+            # If canvas has not been zoomed to data yet, auto-zoom to project bounds
+            view_rect = self._view_box.viewRect()
+            if abs(view_rect.width()) <= 1.0 and abs(view_rect.height()) <= 1.0:
+                self._on_zoom_to_extent()
+
         self._render_osm_basemap()
 
     def _detect_project_crs(self) -> str:
         if self.database:
             try:
                 crs_info = self.database.get_project_crs()
-                if crs_info and crs_info.get("epsg"):
-                    return f"EPSG:{crs_info['epsg']}"
+                if crs_info:
+                    if crs_info.get("epsg"):
+                        return f"EPSG:{crs_info['epsg']}"
+                    if crs_info.get("wkt"):
+                        try:
+                            c = pyproj.CRS.from_user_input(crs_info["wkt"]).to_2d()
+                            if c.to_epsg():
+                                return f"EPSG:{c.to_epsg()}"
+                            return c.to_wkt()
+                        except Exception:
+                            pass
             except Exception:
                 pass
         for grp in self.groups:
@@ -984,7 +1554,7 @@ class PointQCWindow(QMainWindow):
     def _render_osm_basemap(self) -> None:
         if not hasattr(self, "_plot_widget") or self._plot_widget is None:
             return
-        basemap_grp = self.groups[2] if len(self.groups) > 2 else None
+        basemap_grp = self._get_osm_group()
         if not self._osm_layer.visible or (basemap_grp and not basemap_grp.visible):
             if hasattr(self, "_osm_item") and self._osm_item is not None:
                 self._osm_item.hide()
@@ -996,6 +1566,15 @@ class PointQCWindow(QMainWindow):
         vy0 = min(view_rect.top(), view_rect.bottom())
         vy1 = max(view_rect.top(), view_rect.bottom())
 
+        # If canvas is uninitialized default (0, 0, 1, 1), zoom to extent first
+        if abs(vx1 - vx0) <= 1.0 and abs(vy1 - vy0) <= 1.0:
+            self._on_zoom_to_extent()
+            view_rect = self._view_box.viewRect()
+            vx0 = min(view_rect.left(), view_rect.right())
+            vx1 = max(view_rect.left(), view_rect.right())
+            vy0 = min(view_rect.top(), view_rect.bottom())
+            vy1 = max(view_rect.top(), view_rect.bottom())
+
         if abs(vx1 - vx0) < 1.0 or abs(vy1 - vy0) < 1.0:
             return
 
@@ -1003,19 +1582,29 @@ class PointQCWindow(QMainWindow):
             max(256, int(self._plot_widget.width())),
             max(256, int(self._plot_widget.height())),
         )
-        crs = self._osm_layer.crs or self._detect_project_crs()
+        crs = self._detect_project_crs()
         self._osm_layer.crs = crs
         self._osm_worker.request_mosaic((vx0, vy0, vx1, vy1), crs, target_size=target_size)
 
     def _on_osm_mosaic_ready(self, rgba: np.ndarray, bounds: Tuple[float, float, float, float]) -> None:
         if not hasattr(self, "_osm_item") or self._osm_item is None:
             return
-        basemap_grp = self.groups[2] if len(self.groups) > 2 else None
+        self._last_osm_raw_rgba = rgba
+        self._last_osm_bounds = bounds
+        self._update_osm_item_display()
+
+    def _update_osm_item_display(self) -> None:
+        if not hasattr(self, "_osm_item") or self._osm_item is None:
+            return
+        if not hasattr(self, "_last_osm_raw_rgba") or self._last_osm_raw_rgba is None:
+            return
+        basemap_grp = self._get_osm_group()
         if not self._osm_layer.visible or (basemap_grp and not basemap_grp.visible):
             self._osm_item.hide()
             return
 
-        minx, miny, maxx, maxy = bounds
+        minx, miny, maxx, maxy = self._last_osm_bounds
+        rgba = self._last_osm_raw_rgba
         if self._osm_layer.opacity < 1.0:
             rgba = rgba.copy()
             rgba[..., 3] = (rgba[..., 3].astype(float) * max(0.0, min(1.0, self._osm_layer.opacity))).astype(np.uint8)
@@ -1025,13 +1614,23 @@ class PointQCWindow(QMainWindow):
         self._osm_item.setRect(QRectF(minx, miny, maxx - minx, maxy - miny))
         self._osm_item.show()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if hasattr(self, "_osm_worker") and self._osm_worker is not None:
+            self._osm_worker._is_running = True
+        if hasattr(self, "_osm_layer") and self._osm_layer.visible:
+            self._render_osm_basemap()
+
     def closeEvent(self, event) -> None:
         if hasattr(self, "_osm_worker") and self._osm_worker is not None:
             self._osm_worker.stop()
         super().closeEvent(event)
 
     def _on_view_range_changed(self) -> None:
-        """Called dynamically on pan/zoom to fetch decimated raster viewports."""
+        """Called dynamically on pan/zoom to fetch decimated raster and basemap viewports."""
+        self._view_debounce_timer.start(100)
+
+    def _do_view_range_update(self) -> None:
         self._render_osm_basemap()
         self._render_raster_layers()
 
@@ -1196,11 +1795,26 @@ class PointQCWindow(QMainWindow):
         grp = next((g for g in self.groups if g.name == group_name), self.groups[0])
         grp.add_layer(rl)
         self._active_raster_layer = rl
+
+        # If OSM basemap is enabled, initialize the raster with 70% opacity so the
+        # basemap streets/terrain remain visible beneath it rather than fully occluded.
+        if hasattr(self, "_osm_layer") and self._osm_layer.visible:
+            rl.opacity = 0.70
+
         if render:
             self._populate_tree()
             self._render_all_layers()
             if zoom:
                 self._zoom_to_layer(rl)
+            self._update_legends(rl)
+            # Select the newly added raster item in the tree
+            for i in range(self._tree.topLevelItemCount()):
+                grp_item = self._tree.topLevelItem(i)
+                for j in range(grp_item.childCount()):
+                    c_item = grp_item.child(j)
+                    if c_item.data(0, Qt.UserRole) is rl:
+                        self._tree.setCurrentItem(c_item)
+                        break
         return rl
 
     def _on_add_vector_dialog(self) -> None:
@@ -1274,7 +1888,9 @@ class PointQCWindow(QMainWindow):
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         etype = event.type()
-        if etype == QEvent.DragEnter:
+        if etype == QEvent.Resize and (watched is getattr(self, "_plot_widget", None) or watched is getattr(self._plot_widget, "viewport", lambda: None)()):
+            self._reposition_overlay_legend()
+        elif etype == QEvent.DragEnter:
             if self._is_valid_drop(event.mimeData()):
                 event.acceptProposedAction()
                 return True
@@ -1504,11 +2120,7 @@ class PointQCWindow(QMainWindow):
             "tile_ids": target_tids,
         }
 
-        ret_filter = "all"
-        if self._filter_combo.currentIndex() == 1:
-            ret_filter = "first"
-        elif self._filter_combo.currentIndex() == 2:
-            ret_filter = "ground"
+        ret_filter = self._filter_combo.currentData() or "all"
         params["return_filter"] = ret_filter
 
         if qc_idx == 0:

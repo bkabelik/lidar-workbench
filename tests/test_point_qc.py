@@ -586,6 +586,136 @@ class TestPointQC(unittest.TestCase):
 
         win.close()
 
+    def test_last_and_only_returns_density_generation(self):
+        """Test point density raster filtering for last & only returns."""
+        custom_data = {
+            "x": np.array([500010.0, 500020.0, 500030.0, 500040.0, 500050.0, 500060.0]),
+            "y": np.array([6000010.0, 6000020.0, 6000030.0, 6000040.0, 6000050.0, 6000060.0]),
+            "z": np.array([100.0, 100.0, 100.0, 100.0, 100.0, 100.0]),
+            "point_source_id": np.ones(6, dtype=np.uint16),
+            "classification": np.ones(6, dtype=np.uint8),
+            "return_number": np.array([1, 1, 2, 1, 2, 3], dtype=np.uint8),
+            "number_of_returns": np.array([1, 2, 2, 3, 3, 3], dtype=np.uint8),
+        }
+        mock_tiles = [self.mock_tiles[0].copy()]
+        mock_tiles[0]["point_count"] = 6
+        db = MockDatabase(mock_tiles, db_path=str(self.root / "project_last.db"))
+        tm = MockTileManager({"tile_01": custom_data}, root=self.root)
+
+        out_tif = self.root / "density_last_only.tif"
+        stats = generate_density_raster(
+            tile_manager=tm,
+            database=db,
+            tile_ids=["tile_01"],
+            cell_size=10.0,
+            output_path=out_tif,
+            return_filter="last_only",
+        )
+        self.assertEqual(stats["return_filter"], "last_only")
+        self.assertEqual(stats["active_cells"], 3)
+        with rasterio.open(out_tif) as src:
+            arr = src.read(1)
+            valid = (arr > 0) & (arr != src.nodata)
+            # 3 points each counted in 100m² cells = 3 * 0.01 = 0.03 pts/m²
+            self.assertAlmostEqual(float(arr[valid].sum() * 100.0), 3.0, places=2)
+
+    def test_point_qc_color_legend_widget(self):
+        """Test QCLegendWidget rendering, dock & overlay modes, and tick formatting."""
+        from lidar_workbench.gui.point_qc_window import QCLegendWidget
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+
+        dock_legend = QCLegendWidget(is_overlay=False)
+        self.assertFalse(dock_legend.is_overlay)
+
+        overlay_legend = QCLegendWidget(is_overlay=True)
+        self.assertTrue(overlay_legend.is_overlay)
+
+        # Test unit formatting for pts/m²
+        dock_legend.set_style("viridis", vmin=0.0, vmax=50.0, unit="pts/m²", title="Point Density")
+        self.assertEqual(dock_legend.unit, "pts/m²")
+        self.assertEqual(dock_legend._format_tick_value(0.0, 50.0), "0")
+        self.assertEqual(dock_legend._format_tick_value(25.0, 50.0), "25")
+        self.assertEqual(dock_legend._format_tick_value(50.0, 50.0), "50")
+
+        # Test unit formatting for m (small elevation difference in cm)
+        dock_legend.set_style("coolwarm", vmin=-0.3, vmax=0.3, unit="m", title="Strip Difference (dZ)")
+        self.assertEqual(dock_legend._format_tick_value(-0.3, 0.6), "-30 cm")
+        self.assertEqual(dock_legend._format_tick_value(0.0, 0.6), "0 cm")
+        self.assertEqual(dock_legend._format_tick_value(0.3, 0.6), "+30 cm")
+
+        # Test paintEvent grab without crash
+        pm = dock_legend.grab()
+        self.assertFalse(pm.isNull())
+        pm_overlay = overlay_legend.grab()
+        self.assertFalse(pm_overlay.isNull())
+
+        # Test 4K / 2.0x scaling
+        overlay_legend.set_scale_factor(2.0)
+        self.assertEqual(overlay_legend.width(), 600)
+        self.assertEqual(overlay_legend.height(), 140)
+        pm_4k = overlay_legend.grab()
+        self.assertEqual(pm_4k.width(), 600)
+        self.assertEqual(pm_4k.height(), 140)
+
+    def test_point_qc_window_filter_combo_and_unit_adaptation(self):
+        """Test PointQCWindow return filter options, toolbar legend toggle, and style adaptation."""
+        from lidar_workbench.gui.point_qc_window import PointQCWindow
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance() or QApplication([])
+        win = PointQCWindow(project_dir=self.root, tile_manager=self.tm, database=self.db)
+        win.show()
+
+        # Check 4 return filter options
+        self.assertEqual(win._filter_combo.count(), 4)
+        filter_data = [win._filter_combo.itemData(i) for i in range(win._filter_combo.count())]
+        self.assertListEqual(filter_data, ["all", "first", "last_only", "ground"])
+
+        # Create density raster and load
+        out_tif = self.root / "test_density_units.tif"
+        generate_density_raster(
+            tile_manager=self.tm,
+            database=self.db,
+            cell_size=5.0,
+            output_path=out_tif,
+        )
+        rl = win.add_raster_layer(out_tif, group_name="QC Rasters")
+        qc_item = win._tree.topLevelItem(0).child(0)
+        win._tree.setCurrentItem(qc_item)
+
+        # Verify spinbox label and suffix for density
+        self.assertEqual(win._vmin_lbl.text(), "Min Density:")
+        self.assertEqual(win._vmax_lbl.text(), "Max Density:")
+        self.assertEqual(win._vmin_spin.suffix(), " pts/m²")
+        self.assertFalse(win._dock_legend.isHidden())
+        self.assertFalse(win._canvas_legend.isHidden())
+
+        # Toggle canvas legend via toolbar action
+        win._legend_action.setChecked(False)
+        win._on_toggle_canvas_legend(False)
+        self.assertTrue(win._canvas_legend.isHidden())
+
+        win._legend_action.setChecked(True)
+        win._on_toggle_canvas_legend(True)
+        self.assertFalse(win._canvas_legend.isHidden())
+
+        # Test adjustable scaling synchronization (Dock combo <-> Toolbar button <-> Legend)
+        win._on_legend_scale_changed(2.0)
+        self.assertEqual(win._canvas_legend.scale_factor, 2.0)
+        self.assertEqual(win._canvas_legend.width(), 600)
+        self.assertIn("200%", win._legend_scale_btn.text())
+        self.assertIn("4K", win._legend_scale_btn.text())
+        self.assertEqual(win._legend_scale_combo.currentData(), 2.0)
+
+        # Test repositioning reset
+        win._canvas_legend._custom_pos = True
+        win._canvas_legend._reset_position()
+        self.assertFalse(win._canvas_legend._custom_pos)
+
+        win.close()
+
 
 if __name__ == "__main__":
     unittest.main()
