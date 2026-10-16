@@ -1026,6 +1026,17 @@ class _GroundControlWorker(QThread):
             z_med = float(np.median(nearby_xyz[:, 2])) if len(nearby_xyz) else float("nan")
             return z_med, gz - z_med, float(np.std(nearby_xyz[:, 2])) if len(nearby_xyz) else 0.0
 
+        # Multi-tier vertical stratification check:
+        # If candidate points have a large vertical spread (> 1.5 m) and multiple height tiers
+        # (e.g. ground beneath an elevated roof eaves checkpoint, or tree branches above a ground GCP),
+        # isolate points within vertical proximity (<= 2.5 m) of the checkpoint elevation gz.
+        z_span = float(nearby_xyz[:, 2].max() - nearby_xyz[:, 2].min())
+        if z_span > 1.5:
+            z_diffs = np.abs(nearby_xyz[:, 2] - gz)
+            near_gz_mask = z_diffs <= 2.5
+            if near_gz_mask.sum() >= 4:
+                nearby_xyz = nearby_xyz[near_gz_mask]
+
         dx = nearby_xyz[:, 0] - gx
         dy = nearby_xyz[:, 1] - gy
         dists = np.sqrt(dx * dx + dy * dy)
@@ -2363,6 +2374,54 @@ class GroundControlDialog(QDialog):
                 labels = cluster_roof_points_spatially(coords, radius=radius)
                 groups = [f"Patch {lbl + 1}" for lbl in labels]
 
+        # Pre-analyze each group's geometry (slope, 2D diameter, Z span) and naming conventions
+        # to intelligently classify Roof vs Ground (e.g. flat patios, concrete pads, or wide ground networks)
+        from collections import defaultdict
+        group_records = defaultdict(list)
+        for rec, grp in zip(records, groups):
+            group_records[grp].append(rec)
+
+        group_types = {}
+        for grp, r_list in group_records.items():
+            combined_names = " ".join(str(r["name"]) for r in r_list) + " " + str(grp)
+            low_name = combined_names.lower()
+            if any(k in low_name for k in ("ground", "gnd", "boden", "flur", "terrain", "pad", "slab")):
+                group_types[grp] = "ground"
+                continue
+
+            str_grp = str(grp).strip()
+            # Austrian / European surveyor convention: 05=ground pad/slab, 06=ground network points
+            if len(str_grp) >= 2 and str_grp[-2:] in ("05", "06") and str_grp.isdigit():
+                group_types[grp] = "ground"
+                continue
+
+            if len(r_list) >= 3:
+                pts_xyz = np.array([[r["x"], r["y"], r["z"]] for r in r_list], dtype=np.float64)
+                dx = float(pts_xyz[:, 0].max() - pts_xyz[:, 0].min())
+                dy = float(pts_xyz[:, 1].max() - pts_xyz[:, 1].min())
+                dz = float(pts_xyz[:, 2].max() - pts_xyz[:, 2].min())
+                span_2d = max(dx, dy)
+
+                if span_2d > 25.0:
+                    group_types[grp] = "ground"
+                    continue
+
+                try:
+                    centered = pts_xyz - pts_xyz.mean(axis=0)
+                    _, _, vh = np.linalg.svd(centered)
+                    n = vh[2]
+                    if n[2] < 0: n = -n
+                    slope_deg = float(np.degrees(np.arccos(np.clip(n[2], 0.0, 1.0))))
+                except Exception:
+                    slope_deg = 45.0
+
+                # Flat pads/terraces have near-horizontal slopes (< 5°) and very small vertical relief (dz < 0.35m)
+                if slope_deg < 5.0 and dz < 0.35:
+                    group_types[grp] = "ground"
+                    continue
+
+            group_types[grp] = "roof"
+
         # Populate _roof_points_table
         self._roof_points_table.blockSignals(True)
         self._roof_points_table.setRowCount(len(records))
@@ -2381,8 +2440,7 @@ class GroundControlDialog(QDialog):
             combo = QComboBox()
             combo.addItem("🏠 Roof", "roof")
             combo.addItem("🌱 Ground", "ground")
-            low_name = (str(rec["name"]) + " " + str(grp)).lower()
-            if any(k in low_name for k in ("ground", "gnd", "boden", "flur", "terrain", "pad", "slab")):
+            if group_types.get(grp) == "ground":
                 combo.setCurrentIndex(1)
             else:
                 combo.setCurrentIndex(0)
@@ -2460,7 +2518,18 @@ class GroundControlDialog(QDialog):
         self._roof_table.setRowCount(len(surfaces))
         for r_idx, (sid, verts, ptype) in enumerate(surfaces):
             type_str = "🏠 Roof" if ptype == "roof" else "🌱 Ground"
-            chk_item = _CheckboxTableWidgetItem(checked=True)
+            verts_np = np.asarray(verts)
+            dx = float(verts_np[:, 0].max() - verts_np[:, 0].min()) if len(verts_np) else 0.0
+            dy = float(verts_np[:, 1].max() - verts_np[:, 1].min()) if len(verts_np) else 0.0
+            span_2d = max(dx, dy)
+            is_wide_network = (span_2d > 25.0)
+
+            chk_item = _CheckboxTableWidgetItem(checked=not is_wide_network)
+            if is_wide_network:
+                chk_item.setToolTip(
+                    f"Wide GCP network ({span_2d:.0f}m spread) — unselected by default for plane fitting. "
+                    "Best evaluated individually in GCP tab."
+                )
             chk_item.setData(Qt.UserRole, r_idx)
             self._roof_table.setItem(r_idx, 0, chk_item)
             self._roof_table.setItem(r_idx, 1, QTableWidgetItem(str(sid)))

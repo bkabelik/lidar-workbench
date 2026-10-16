@@ -64,20 +64,13 @@ def generate_dtm(
 
     logger.info("DTM: %d ground points for interpolation (from %d)", len(gx), n_ground)
 
-    # Define grid extent
-    x_min, x_max = gx.min(), gx.max()
-    y_min, y_max = gy.min(), gy.max()
+    # Define grid extent directly from ground points without artificial padding
+    x_min, x_max = float(gx.min()), float(gx.max())
+    y_min, y_max = float(gy.min()), float(gy.max())
 
-    # Pad slightly to avoid edge effects
-    pad = resolution * 2
-    x_min -= pad
-    x_max += pad
-    y_min -= pad
-    y_max += pad
-
-    # Create regular grid
-    nx = max(2, int((x_max - x_min) / resolution) + 1)
-    ny = max(2, int((y_max - y_min) / resolution) + 1)
+    # Create regular grid matching ground point bounds
+    nx = max(2, int(np.ceil((x_max - x_min) / resolution)) + 1)
+    ny = max(2, int(np.ceil((y_max - y_min) / resolution)) + 1)
 
     grid_x = np.linspace(x_min, x_max, nx)
     grid_y = np.linspace(y_min, y_max, ny)
@@ -90,16 +83,23 @@ def generate_dtm(
             (gx, gy), gz, (grid_xx, grid_yy),
             method=method,
         )
-        # Fill NaN values (outside convex hull) with nearest-neighbour
+        # Inpaint NaN cells (e.g. outside convex hull corners) from the nearest valid grid cell
+        # to prevent artificial Voronoi facet steps and jagged border lighting artifacts
         if np.any(np.isnan(grid_z)):
             nan_mask = np.isnan(grid_z)
-            grid_z_nn = griddata(
-                (gx, gy), gz, (grid_xx, grid_yy),
-                method="nearest",
-            )
-            grid_z[nan_mask] = grid_z_nn[nan_mask]
+            if not np.all(nan_mask):
+                try:
+                    from scipy.ndimage import distance_transform_edt
+                    ind = distance_transform_edt(nan_mask, return_distances=False, return_indices=True)
+                    grid_z[nan_mask] = grid_z[tuple(ind[:, nan_mask])]
+                except Exception:
+                    grid_z_nn = griddata(
+                        (gx, gy), gz, (grid_xx, grid_yy),
+                        method="nearest",
+                    )
+                    grid_z[nan_mask] = grid_z_nn[nan_mask]
             logger.debug(
-                "Filled %d NaN DTM cells with nearest-neighbour interpolation",
+                "Filled %d NaN DTM cells with smooth raster inpainting",
                 nan_mask.sum(),
             )
     except ImportError:

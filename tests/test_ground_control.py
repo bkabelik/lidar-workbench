@@ -258,3 +258,28 @@ if __name__ == "__main__":
         self.assertAlmostEqual(emitted[0][3], 100.00)   # Z_cloud
 
         dlg.close()
+
+    def test_gcp_elevation_multi_tier(self):
+        # Test a roof GCP at elevation Z=1113.24 with ground points directly beneath at Z=1110.0
+        rng = np.random.default_rng(77)
+        gx, gy, gz = 394043.75, 5216681.27, 1113.24
+
+        # 100 ground points beneath the roof at ~1110.0
+        gnd_xs = gx + rng.uniform(-3.0, 3.0, 100)
+        gnd_ys = gy + rng.uniform(-3.0, 3.0, 100)
+        gnd_zs = 1110.0 + rng.normal(0, 0.02, 100)
+
+        # 50 roof points around gz at ~1113.25
+        roof_xs = gx + rng.uniform(-1.0, 1.0, 50)
+        roof_ys = gy + rng.uniform(-1.0, 1.0, 50)
+        roof_zs = 1113.25 + rng.normal(0, 0.02, 50)
+
+        nearby_xyz = np.vstack([
+            np.column_stack((gnd_xs, gnd_ys, gnd_zs)),
+            np.column_stack((roof_xs, roof_ys, roof_zs)),
+        ])
+
+        z_cloud, dz, z_std = _GroundControlWorker._compare_gcp_to_surface(gx, gy, gz, nearby_xyz)
+        # Should lock onto the roof tier ~1113.25 and ignore ground at 1110.0
+        self.assertAlmostEqual(z_cloud, 1113.25, delta=0.05)
+        self.assertAlmostEqual(dz, -0.01, delta=0.05)

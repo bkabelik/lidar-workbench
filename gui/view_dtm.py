@@ -516,6 +516,14 @@ class ViewDTM(QWidget):
         dz_dy[0, :] = (z_north[0, :] - z_north[1, :]) / cell_size
         dz_dy[-1, :] = (z_north[-2, :] - z_north[-1, :]) / cell_size
 
+        # Clamp boundary gradients to adjacent interior cells to avoid 1-sided boundary shading artifacts
+        if nx >= 3:
+            dz_dx[:, 0] = dz_dx[:, 1]
+            dz_dx[:, -1] = dz_dx[:, -2]
+        if ny >= 3:
+            dz_dy[0, :] = dz_dy[1, :]
+            dz_dy[-1, :] = dz_dy[-2, :]
+
         # Upward terrain surface normal: N = (-dz_dx, -dz_dy, 1) / |N|
         norm_len = np.sqrt(dz_dx * dz_dx + dz_dy * dz_dy + 1.0)
         n_x = -dz_dx / norm_len
@@ -559,7 +567,7 @@ class ViewDTM(QWidget):
         img[:, :, 2] = b
         img[:, :, 3] = np.where(np.isnan(z_north), 0, 255).astype(np.uint8)
 
-        qimg = QImage(img.data, nx, ny, QImage.Format_RGBA8888)
+        qimg = QImage(img.data, nx, ny, nx * 4, QImage.Format_RGBA8888)
         self._dtm_pixmap = QPixmap.fromImage(qimg.copy())
 
     def paintEvent(self, event) -> None:

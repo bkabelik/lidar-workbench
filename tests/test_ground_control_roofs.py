@@ -595,6 +595,56 @@ class TestDialogTableEditing(unittest.TestCase):
         mock_win._mark_project_dirty.assert_called_once()
         mock_win._regenerate_dtm.assert_called_once()
 
+    def test_roof_vs_ground_classification(self):
+        # Test that GroundControlDialog classifies flat ground pads and wide networks as 'ground'
+        dlg = GroundControlDialog(tile_data={})
+
+        # Synthetic records matching utm33n_etrs89.csv conventions:
+        # 1. House 0101 (pitched roof, slope ~35°)
+        # 2. Patch 0105 (flat concrete pad, slope < 1°, dz = 0.06m)
+        # 3. Patch 0106 (wide ground network, 57m spread)
+        dlg._roof_raw_records = [
+            # 0101 (Pitched roof)
+            {"name": "010101", "raw_id": "010101", "x": 100.0, "y": 200.0, "z": 50.0},
+            {"name": "010102", "raw_id": "010102", "x": 105.0, "y": 200.0, "z": 52.5},
+            {"name": "010103", "raw_id": "010103", "x": 105.0, "y": 205.0, "z": 52.5},
+            {"name": "010104", "raw_id": "010104", "x": 100.0, "y": 205.0, "z": 50.0},
+            # 0105 (Flat ground slab)
+            {"name": "010501", "raw_id": "010501", "x": 120.0, "y": 220.0, "z": 45.00},
+            {"name": "010502", "raw_id": "010502", "x": 125.0, "y": 220.0, "z": 45.02},
+            {"name": "010503", "raw_id": "010503", "x": 125.0, "y": 225.0, "z": 45.01},
+            {"name": "010504", "raw_id": "010504", "x": 120.0, "y": 225.0, "z": 45.00},
+            # 0106 (Wide ground GCP network, 50m spread)
+            {"name": "010601", "raw_id": "010601", "x": 150.0, "y": 250.0, "z": 44.0},
+            {"name": "010602", "raw_id": "010602", "x": 190.0, "y": 250.0, "z": 44.2},
+            {"name": "010603", "raw_id": "010603", "x": 190.0, "y": 300.0, "z": 44.1},
+            {"name": "010604", "raw_id": "010604", "x": 150.0, "y": 300.0, "z": 44.0},
+        ]
+
+        dlg._detect_and_group_roof_points()
+
+        # Check types in _roof_surfaces
+        surfaces_by_id = {s[0]: s for s in dlg._roof_surfaces}
+        self.assertIn("0101", surfaces_by_id)
+        self.assertIn("0105", surfaces_by_id)
+        self.assertIn("0106", surfaces_by_id)
+
+        self.assertEqual(surfaces_by_id["0101"][2], "roof")
+        self.assertEqual(surfaces_by_id["0105"][2], "ground")
+        self.assertEqual(surfaces_by_id["0106"][2], "ground")
+
+        # In summary table, 0101 and 0105 should be checked, 0106 (wide) should be unchecked
+        table_checked = {}
+        for row in range(dlg._roof_table.rowCount()):
+            sid = dlg._roof_table.item(row, 1).text()
+            chk = dlg._roof_table.item(row, 0).checkState() == Qt.Checked
+            table_checked[sid] = chk
+
+        self.assertTrue(table_checked["0101"])
+        self.assertTrue(table_checked["0105"])
+        self.assertFalse(table_checked["0106"])  # Wide network unchecked by default
+
+        dlg.close()
 
 
 if __name__ == "__main__":
