@@ -282,6 +282,19 @@ class View3D(QWidget):
         self._fit_camera(xs_local, ys_local, zs_local)
         self._rebuild_scene()
 
+    def update_point_classifications(self, classifications: np.ndarray) -> None:
+        """
+        Fast in-memory update of point classifications in 3D viewer without camera refit.
+        """
+        if self._point_data is None or "x" not in self._point_data:
+            return
+        n = len(self._point_data["x"])
+        if len(classifications) >= n:
+            self._point_data["classification"] = classifications[:n].copy()
+        elif len(classifications) == len(self._point_data.get("classification", [])):
+            self._point_data["classification"] = classifications.copy()
+        self._rebuild_scene()
+
     def load_point_cloud_colored(self, xs, ys, zs, colors):
         n = len(xs)
         if n == 0:

@@ -203,6 +203,15 @@ class ViewProfile(QWidget):
         self._fit_view()
         self._invalidate_base()
 
+    def update_classifications(self, classifications: np.ndarray) -> None:
+        """
+        Fast in-memory update of point classifications without resetting view zoom/pan.
+        """
+        self._classifications = classifications
+        self._current_mask = None
+        self._invalidate_base()
+        self.update()
+
     def set_colour_mode(self, mode: str) -> None:
         """Set point cloud colouring mode (class, height, intensity, return_number, flightline)."""
         self._colour_mode = mode

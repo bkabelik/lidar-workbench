@@ -48,36 +48,56 @@ class EditCommand(ABC):
 @dataclass
 class ClassifyPointsCommand(EditCommand):
     """
-    Reclassify a set of points.
+    Reclassify a set of points in-memory.
 
     Stores the old and new class values so the operation can be
-    undone by swapping them back.
+    executed and undone instantaneously in RAM.
     """
 
-    tile_manager: TileManager
     tile_id: str
     point_indices: np.ndarray
     old_classes: np.ndarray
     new_class: int
+    tile_manager: Optional[TileManager] = None
+    editor: Optional[Any] = None
 
     def execute(self) -> bool:
-        return self.tile_manager.update_tile_classifications(
-            self.tile_id, self.point_indices, self.new_class
-        )
+        if self.editor is not None and getattr(self.editor, "_point_data", None) is not None:
+            pd = self.editor._point_data
+            if "classification" in pd:
+                pd["classification"][self.point_indices] = self.new_class
+                self.editor._is_dirty = True
+                if self.tile_manager and self.tile_id in getattr(self.tile_manager, "_point_cache", {}):
+                    self.tile_manager._point_cache[self.tile_id]["classification"][self.point_indices] = self.new_class
+                return True
+        if self.tile_manager is not None:
+            return self.tile_manager.update_tile_classifications(
+                self.tile_id, self.point_indices, self.new_class
+            )
+        return False
 
     def undo(self) -> bool:
-        # Restore original classes
-        result = True
-        for code in np.unique(self.old_classes):
-            mask = self.old_classes == code
-            indices_subset = self.point_indices[mask]
-            if len(indices_subset) == 0:
-                continue
-            ok = self.tile_manager.update_tile_classifications(
-                self.tile_id, indices_subset, int(code)
-            )
-            result = result and ok
-        return result
+        if self.editor is not None and getattr(self.editor, "_point_data", None) is not None:
+            pd = self.editor._point_data
+            if "classification" in pd:
+                pd["classification"][self.point_indices] = self.old_classes
+                self.editor._is_dirty = True
+                if self.tile_manager and self.tile_id in getattr(self.tile_manager, "_point_cache", {}):
+                    self.tile_manager._point_cache[self.tile_id]["classification"][self.point_indices] = self.old_classes
+                return True
+        if self.tile_manager is not None:
+            result = True
+            for code in np.unique(self.old_classes):
+                mask = self.old_classes == code
+                indices_subset = self.point_indices[mask]
+                if len(indices_subset) == 0:
+                    continue
+                ok = self.tile_manager.update_tile_classifications(
+                    self.tile_id, indices_subset, int(code)
+                )
+                result = result and ok
+            return result
+        return False
 
     @property
     def description(self) -> str:
@@ -418,6 +438,7 @@ class ManualEditor:
         # Current tile state
         self._tile_id: Optional[str] = None
         self._point_data: Optional[Dict[str, np.ndarray]] = None
+        self._is_dirty: bool = False
 
         # Current profile
         self._profile: Optional[ProfileData] = None
@@ -427,12 +448,39 @@ class ManualEditor:
 
     # ── tile management ────────────────────────────────────────────
 
+    @property
+    def is_dirty(self) -> bool:
+        """True if the currently open tile has unsaved classification edits in RAM."""
+        return self._is_dirty
+
+    def save_tile(self) -> bool:
+        """
+        Commit in-memory classification changes for the open tile to disk.
+        Returns True on success or if there were no unsaved edits.
+        """
+        if not self._is_dirty or self._tile_id is None or self._point_data is None:
+            return True
+
+        logger.info("Saving in-memory tile edits to disk for %s...", self._tile_id)
+        cls_data = self._point_data.get("classification")
+        if cls_data is not None:
+            ok = self._tm.save_tile_classifications_full(self._tile_id, cls_data)
+            if ok:
+                self._is_dirty = False
+                return True
+            else:
+                logger.error("Failed to save tile %s to disk", self._tile_id)
+                return False
+        return True
+
     def open_tile(self, tile_id: str, point_data: Optional[Dict[str, np.ndarray]] = None) -> bool:
         """
-        Load a tile for editing.
-
-        Returns ``True`` on success, ``False`` if the tile cannot be loaded.
+        Load a tile for editing. If the previous tile had unsaved edits in RAM,
+        it is automatically saved to disk before loading the new tile.
         """
+        if self._tile_id is not None and self._tile_id != tile_id and self._is_dirty:
+            self.save_tile()
+
         if point_data is not None:
             data = point_data
         else:
@@ -443,6 +491,7 @@ class ManualEditor:
 
         self._tile_id = tile_id
         self._point_data = data
+        self._is_dirty = False
         self._profile = None
         self._selected_indices = None
         self._edit_stack.clear()
@@ -453,10 +502,13 @@ class ManualEditor:
     def tile_id(self) -> Optional[str]:
         return self._tile_id
 
-    def close_tile(self) -> None:
-        """Close the currently open tile, releasing in-memory data."""
+    def close_tile(self, save: bool = True) -> None:
+        """Close the currently open tile, saving any pending RAM edits to disk first unless save=False."""
+        if save and self._tile_id is not None and self._is_dirty:
+            self.save_tile()
         self._tile_id = None
         self._point_data = None
+        self._is_dirty = False
         self._profile = None
         self._selected_indices = None
         self._edit_stack.clear()
@@ -603,9 +655,8 @@ class ManualEditor:
 
     def assign_class(self, new_class: int) -> bool:
         """
-        Assign a new ASPRS class to the currently selected points.
-
-        Returns ``True`` on success.
+        Assign a new ASPRS class to the currently selected points in RAM.
+        Fast, in-memory operation (sub-millisecond).
         """
         if self._tile_id is None:
             logger.warning("No tile open — cannot assign class")
@@ -622,24 +673,26 @@ class ManualEditor:
         else:
             old_classes = np.zeros(len(original_indices), dtype=np.uint8)
 
-        # Create and execute command
+        # Create and execute command in-memory
         cmd = ClassifyPointsCommand(
-            tile_manager=self._tm,
             tile_id=self._tile_id,
             point_indices=original_indices,
             old_classes=old_classes,
             new_class=new_class,
+            tile_manager=self._tm,
+            editor=self,
         )
         self._edit_stack.push(cmd)
 
-        # Refresh local point data
-        self._point_data = self._tm.load_tile_points_full(self._tile_id)
+        # Update profile view data in memory directly
+        if self._profile is not None and self._selected_indices is not None:
+            self._profile.classifications[self._selected_indices] = new_class
 
         # Clear selection
         self._selected_indices = None
 
-        logger.info(
-            "Assigned class %d to %d point(s) in %s",
+        logger.debug(
+            "Assigned class %d to %d point(s) in %s (in RAM)",
             new_class, len(original_indices), self._tile_id,
         )
         return True
@@ -648,24 +701,27 @@ class ManualEditor:
 
     def undo(self) -> Optional[str]:
         """
-        Undo the last classification edit.
-
-        Returns a description of the undone command, or ``None``.
+        Undo the last classification edit in RAM.
         """
+        if not self._edit_stack.can_undo:
+            return None
         cmd = self._edit_stack.undo()
         if cmd:
-            # Refresh local data
-            self._point_data = self._tm.load_tile_points_full(self._tile_id)
+            if self._profile is not None and self._point_data is not None:
+                self._profile.classifications[:] = self._point_data["classification"][self._profile.indices]
             return cmd.description
         return None
 
     def redo(self) -> Optional[str]:
         """
-        Redo the last undone classification edit.
+        Redo the last undone classification edit in RAM.
         """
+        if not self._edit_stack.can_redo:
+            return None
         cmd = self._edit_stack.redo()
         if cmd:
-            self._point_data = self._tm.load_tile_points_full(self._tile_id)
+            if self._profile is not None and self._point_data is not None:
+                self._profile.classifications[:] = self._point_data["classification"][self._profile.indices]
             return cmd.description
         return None
 

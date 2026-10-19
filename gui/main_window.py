@@ -172,6 +172,11 @@ class MainWindow(QMainWindow):
         # File → Save Project (tile/geometry edits, processing results, …).
         self._project_dirty = False
 
+        # Debounced DTM update timer for manual editing
+        self._dtm_update_timer = QTimer(self)
+        self._dtm_update_timer.setSingleShot(True)
+        self._dtm_update_timer.timeout.connect(self._regenerate_dtm)
+
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.setMinimumSize(1200, 700)
         self.setAcceptDrops(True)
@@ -226,7 +231,8 @@ class MainWindow(QMainWindow):
         If the current project has unsaved changes, prompt with
         Save / Discard / Cancel.  Returns ``False`` only on Cancel.
         """
-        if not self._pm.is_open or not self._project_dirty:
+        is_dirty = self._project_dirty or (hasattr(self, "_editor") and self._editor.is_dirty)
+        if not self._pm.is_open or not is_dirty:
             return True
 
         reply = QMessageBox.question(
@@ -250,6 +256,8 @@ class MainWindow(QMainWindow):
                 return False
             return True
         if reply == QMessageBox.Discard:
+            if hasattr(self, "_editor"):
+                self._editor.close_tile(save=False)
             return True
         return False  # Cancel
 
@@ -437,7 +445,7 @@ class MainWindow(QMainWindow):
         ground_btn.triggered.connect(self._on_ground_classify)
 
         bathy_btn = toolbar.addAction("Bathy")
-        bathy_btn.setToolTip("Bathymetry processing (refraction correction, water surface model crop)")
+        bathy_btn.setToolTip("Bathymetry processing (refraction, river crop, benthic filter)")
         bathy_btn.triggered.connect(self._on_bathy_process)
 
         gc_btn = toolbar.addAction("GndCtrl")
@@ -658,6 +666,9 @@ class MainWindow(QMainWindow):
 
     def _on_save_project(self) -> None:
         if self._pm.is_open:
+            if hasattr(self, "_editor") and self._editor.is_dirty:
+                self.set_status("Saving open tile edits to disk…", timeout=0)
+                self._editor.save_tile()
             self._pm.save()
             self._clear_project_dirty()
             self.set_status("Project saved", timeout=3000)
@@ -685,19 +696,7 @@ class MainWindow(QMainWindow):
             self._preview_dlg = None
         self._preview_dlg = PreviewDialog(parent=self)
         self._preview_dlg.import_requested.connect(self._on_preview_import)
-        def _on_preview_destroyed():
-            self._preview_dlg = None
-            if self._editor.tile_id and self._editor._point_data is not None:
-                self._multi_view._view_3d.load_point_cloud(
-                    self._editor._point_data["x"],
-                    self._editor._point_data["y"],
-                    self._editor._point_data["z"],
-                    self._editor._point_data.get("classification"),
-                    self._editor._point_data.get("intensity"),
-                    self._editor._point_data.get("return_number"),
-                    self._editor._point_data.get("point_source_id"),
-                )
-        self._preview_dlg.destroyed.connect(_on_preview_destroyed)
+        self._preview_dlg.destroyed.connect(lambda: setattr(self, '_preview_dlg', None))
         self._preview_dlg.show()  # non-modal — user can keep interacting with main window
 
     def _on_preview_import(self, file_paths: list) -> None:
@@ -745,21 +744,12 @@ class MainWindow(QMainWindow):
 
         dialog = FilterDialog(self._tm, selected, parent=self)
         dialog.filter_applied.connect(self._on_filter_applied)
+        dialog.exec()
         try:
             dialog.exec()
         finally:
             dialog.cleanup()
             dialog.deleteLater()
-            if self._editor.tile_id and self._editor._point_data is not None:
-                self._multi_view._view_3d.load_point_cloud(
-                    self._editor._point_data["x"],
-                    self._editor._point_data["y"],
-                    self._editor._point_data["z"],
-                    self._editor._point_data.get("classification"),
-                    self._editor._point_data.get("intensity"),
-                    self._editor._point_data.get("return_number"),
-                    self._editor._point_data.get("point_source_id"),
-                )
 
     def _on_filter_applied(self, tile_ids: list, pipeline: list) -> None:
         """Apply a filter pipeline to the selected tiles in parallel
@@ -2529,6 +2519,10 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
 
     def _on_tile_open(self, tile_id: str) -> None:
         """Open a tile in the multi-view for inspection and editing."""
+        if hasattr(self, "_editor") and self._editor.tile_id and self._editor.tile_id != tile_id and self._editor.is_dirty:
+            self.set_status(f"Saving changes to tile {self._editor.tile_id}…", timeout=0)
+            self._editor.save_tile()
+
         self.set_status(f"Opening {tile_id}…", timeout=0)
         logger.info("Open requested for tile: %s", tile_id)
 
@@ -2538,8 +2532,8 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
             QMessageBox.warning(self, "Load Error", f"Failed to load tile {tile_id}.")
             return
 
-        # Open in editor (reuse loaded data to avoid reading LAS from disk twice)
-        if not self._editor.open_tile(tile_id, point_data=data):
+        # Open in editor
+        if not self._editor.open_tile(tile_id):
             QMessageBox.warning(self, "Edit Error", f"Failed to open tile {tile_id} for editing.")
             return
 
@@ -2732,21 +2726,30 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
             self._properties_panel.set_selection_count(0)
             self._properties_panel.set_undo_info(*self._editor.undo_stack_info)
 
-            # Refresh 3D and DTM views (preserve profile view)
+            # Update Profile View in RAM (instant repaint, preserves zoom/pan)
+            profile = self._editor.profile
+            if profile is not None:
+                self._multi_view._view_profile.update_classifications(profile.classifications)
+                self._multi_view._apply_class_visibility("profile")
+
+            # Update 3D View in RAM (fast color recomputation, preserves camera)
+            v3d = self._multi_view._view_3d
+            if self._editor.point_data is not None and "classification" in self._editor.point_data:
+                v3d.update_point_classifications(self._editor.point_data["classification"])
+
+            # Mark tile and project dirty
             if self._editor.tile_id:
-                data = self._tm.load_tile_points_full(self._editor.tile_id)
-                if data:
-                    self._multi_load_for_edit(data)
-                # Update tile status in the list widget
                 self._tile_list_widget.update_tile_status(
                     self._editor.tile_id, TileStatus.EDITED
                 )
                 self._mark_project_dirty()
-                self._regenerate_dtm()
+
+            # Debounce DTM regeneration so rapid editing remains fluid
+            self._dtm_update_timer.start(1500)
 
             self.set_status(
-                f"Reclassified points to class {new_class}",
-                timeout=3000,
+                f"Reclassified points to class {new_class} (in RAM)",
+                timeout=1500,
             )
 
     # ── slot: undo / redo ─────────────────────────────────────
@@ -2755,39 +2758,45 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
         desc = self._editor.undo()
         if desc:
             self._properties_panel.set_undo_info(*self._editor.undo_stack_info)
+            profile = self._editor.profile
+            if profile is not None:
+                self._multi_view._view_profile.update_classifications(profile.classifications)
+                self._multi_view._apply_class_visibility("profile")
+            v3d = self._multi_view._view_3d
+            if self._editor.point_data is not None and "classification" in self._editor.point_data:
+                v3d.update_point_classifications(self._editor.point_data["classification"])
             if self._editor.tile_id:
-                data = self._tm.load_tile_points_full(self._editor.tile_id)
-                if data:
-                    self._multi_load_for_edit(data)
                 self._tile_list_widget.update_tile_status(
                     self._editor.tile_id, TileStatus.EDITED
                 )
                 self._mark_project_dirty()
-                self._regenerate_dtm()
-            self.set_status(f"Undo: {desc}", timeout=3000)
+            self._dtm_update_timer.start(1500)
+            self.set_status(f"Undo: {desc} (in RAM)", timeout=2000)
 
     def _on_redo(self) -> None:
         desc = self._editor.redo()
         if desc:
             self._properties_panel.set_undo_info(*self._editor.undo_stack_info)
+            profile = self._editor.profile
+            if profile is not None:
+                self._multi_view._view_profile.update_classifications(profile.classifications)
+                self._multi_view._apply_class_visibility("profile")
+            v3d = self._multi_view._view_3d
+            if self._editor.point_data is not None and "classification" in self._editor.point_data:
+                v3d.update_point_classifications(self._editor.point_data["classification"])
             if self._editor.tile_id:
-                data = self._tm.load_tile_points_full(self._editor.tile_id)
-                if data:
-                    self._multi_load_for_edit(data)
                 self._tile_list_widget.update_tile_status(
                     self._editor.tile_id, TileStatus.EDITED
                 )
                 self._mark_project_dirty()
-                self._regenerate_dtm()
-            self.set_status(f"Redo: {desc}", timeout=3000)
+            self._dtm_update_timer.start(1500)
+            self.set_status(f"Redo: {desc} (in RAM)", timeout=2000)
 
     def _regenerate_dtm(self) -> None:
         """Regenerate DTM from the current editor tile data after an edit."""
-        if self._editor.tile_id:
-            data = self._tm.load_tile_points_full(self._editor.tile_id)
-            if data:
-                self._multi_view._view_dtm.load_points(data)
-                self._multi_view._view_dtm.generate_dtm()
+        if self._editor.tile_id and self._editor.point_data is not None:
+            self._multi_view._view_dtm.load_points(self._editor.point_data)
+            self._multi_view._view_dtm.generate_dtm()
 
     def _on_tiles_filter(self, tile_ids: List[str]) -> None:
         self._on_filter()

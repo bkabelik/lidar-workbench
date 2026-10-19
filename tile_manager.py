@@ -842,6 +842,54 @@ class TileManager:
         logger.info("Updated %d point(s) in %s to class %d", len(indices), tile_id, new_class)
         return True
 
+    def save_tile_classifications_full(
+        self, tile_id: str, classifications: np.ndarray
+    ) -> bool:
+        """
+        Commit in-memory classifications for an entire tile to disk in one shot.
+        Creates a backup (.bak) once before first modification, writes the LAS file,
+        syncs in-memory point cache, and marks the tile as EDITED in database.
+        """
+        tile_info = self._db.get_tile(tile_id)
+        if tile_info is None:
+            return False
+
+        tiles_dir = self._pm.tiles_dir
+        if tiles_dir is None:
+            return False
+        las_path = tiles_dir / tile_info["filename"]
+        if not las_path.is_file():
+            return False
+
+        # Backup before modifying (once per tile)
+        backup_path = las_path.with_suffix(las_path.suffix + ".bak")
+        if not backup_path.exists():
+            import shutil
+            try:
+                shutil.copy2(las_path, backup_path)
+                logger.debug("Backup created: %s", backup_path)
+            except Exception as exc:
+                logger.warning("Could not create backup for %s: %s", las_path, exc)
+
+        try:
+            las_data = laspy.read(las_path)
+            n_pts = min(len(las_data.classification), len(classifications))
+            las_data.classification[:n_pts] = classifications[:n_pts]
+            las_data.write(str(las_path))
+        except Exception as exc:
+            logger.error("Failed to write tile classifications for %s: %s", tile_id, exc)
+            return False
+
+        # Keep point cache in sync rather than dropping it
+        if tile_id in self._point_cache:
+            self._point_cache[tile_id]["classification"] = classifications.copy()
+
+        with self._db.connect() as conn:
+            self._db.update_status(conn, tile_id, TileStatus.EDITED)
+
+        logger.info("Saved in-memory tile edits to disk for %s (%d points)", tile_id, n_pts)
+        return True
+
     def update_tile_status(self, tile_id: str, status: str) -> None:
         """Update a tile's processing status in the database."""
         with self._db.connect() as conn:
