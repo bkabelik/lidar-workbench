@@ -46,7 +46,7 @@ from ..manual_edit import ManualEditor
 from ..project_manager import ProjectManager
 from ..tile_manager import TileManager
 from .classification_dialog import ClassificationDialog
-from .export_dialog import ExportDialog, ExportLasDialog, _ExportLasWorker
+from .export_dialog import ExportDialog, ExportLasDialog, ExportTileFootprintsDialog, _ExportLasWorker
 from .filter_dialog import FilterDialog
 from .ground_control_dialog import GroundControlDialog
 from .multi_view_widget import MultiViewWidget
@@ -310,6 +310,11 @@ class MainWindow(QMainWindow):
         export_las_action.triggered.connect(self._on_export_las)
         tools_menu.addAction(export_las_action)
 
+        export_footprints_action = QAction("&Export Tile Footprints (Shapefile / GeoPackage)…", self)
+        export_footprints_action.setObjectName("export_tile_footprints")
+        export_footprints_action.triggered.connect(self._on_export_tile_footprints)
+        tools_menu.addAction(export_footprints_action)
+
         tools_menu.addSeparator()
 
         crs_action = QAction("&CRS / Projection…", self)
@@ -415,6 +420,7 @@ class MainWindow(QMainWindow):
         self._tile_list_widget.classify_requested.connect(self._on_tiles_classify)
         self._tile_list_widget.export_requested.connect(self._on_tiles_export)
         self._tile_list_widget.export_las_requested.connect(self._on_tiles_export_las)
+        self._tile_list_widget.export_footprints_requested.connect(self._on_tiles_export_footprints)
         self._tile_list_widget.delete_requested.connect(self._on_tiles_delete)
         self._tile_list_widget.qc_status_changed.connect(self._on_qc_status_changed_batch)
         splitter.addWidget(self._tile_list_widget)
@@ -1936,6 +1942,9 @@ class MainWindow(QMainWindow):
             elif isinstance(meta_cs, int):
                 crs_epsg = meta_cs
 
+        overlap_m = float(self._pm.metadata.get("tile_overlap_m", 0.0) or 0.0)
+        tile_size_m = float(self._pm.metadata.get("tile_size_m", 200.0) or 200.0)
+
         dialog = ExportDialog(
             jobs,
             global_bbox,
@@ -1943,6 +1952,8 @@ class MainWindow(QMainWindow):
             workers=workers,
             crs_epsg=crs_epsg,
             crs_wkt=crs_wkt,
+            overlap_m=overlap_m,
+            tile_size_m=tile_size_m,
             parent=self,
         )
         if dialog.exec() == QDialog.Accepted:
@@ -1952,6 +1963,81 @@ class MainWindow(QMainWindow):
             )
         else:
             self.set_status("Export cancelled", timeout=3000)
+
+    def _on_tiles_export_footprints(self, tile_ids: List[str]) -> None:
+        """Handler for 'Export Tile Footprints…' requested from tile list context menu."""
+        self._on_export_tile_footprints(tile_ids=tile_ids)
+
+    def _on_export_tile_footprints(self, tile_ids: Optional[List[str]] = None) -> None:
+        """Export non-overlapping tile footprint polygons as Shapefile / GeoPackage / GeoJSON."""
+        if tile_ids is not None:
+            selected = list(tile_ids)
+        else:
+            selected = self._tile_list_widget.get_selected_tile_ids()
+        if not selected:
+            selected = self._db.get_all_tile_ids() if self._db else []
+        if not selected:
+            QMessageBox.information(
+                self, "No Tiles Available",
+                "No tiles found in project."
+            )
+            return
+
+        jobs: list = []
+        tile_bboxes: dict = {}
+        tiles_dir = self._pm.tiles_dir
+
+        for tile_id in selected:
+            tile_info = self._db.get_tile(tile_id)
+            if tile_info is None:
+                continue
+            las_path = tiles_dir / tile_info["filename"] if tiles_dir else Path("")
+            bbox = self._tm.sync_tile_bbox_from_las(tile_id)
+            if bbox is None:
+                bbox = self._tm.get_tile_bbox(tile_id)
+            if bbox is None:
+                continue
+            jobs.append({"tile_id": tile_id, "las_path": str(las_path), "bbox": bbox})
+            tile_bboxes[tile_id] = bbox
+
+        if not jobs:
+            QMessageBox.warning(self, "Load Error", "Failed to read tile metadata.")
+            return
+
+        global_bbox = (
+            min(b[0] for b in tile_bboxes.values()),
+            min(b[1] for b in tile_bboxes.values()),
+            max(b[2] for b in tile_bboxes.values()),
+            max(b[3] for b in tile_bboxes.values()),
+        )
+        overlap_m = float(self._pm.metadata.get("tile_overlap_m", 0.0) or 0.0)
+        tile_size_m = float(self._pm.metadata.get("tile_size_m", 200.0) or 200.0)
+
+        default_dir = str(self._pm.project_root) if self._pm.project_root else "."
+
+        crs_info = self._db.get_project_crs() if self._db else None
+        crs_epsg = crs_info.get("epsg") if crs_info else None
+        crs_wkt = crs_info.get("wkt") if crs_info else None
+        if not crs_epsg and self._pm.is_open:
+            meta_cs = self._pm.metadata.get("coordinate_system")
+            if isinstance(meta_cs, dict):
+                crs_epsg = meta_cs.get("epsg")
+                crs_wkt = crs_wkt or meta_cs.get("wkt")
+            elif isinstance(meta_cs, int):
+                crs_epsg = meta_cs
+
+        dialog = ExportTileFootprintsDialog(
+            jobs,
+            global_bbox,
+            default_dir,
+            overlap_m=overlap_m,
+            tile_size_m=tile_size_m,
+            crs_epsg=crs_epsg,
+            crs_wkt=crs_wkt,
+            parent=self,
+        )
+        if dialog.exec() == QDialog.Accepted:
+            self.set_status(f"Exported {len(dialog.written_files)} footprint file(s)", timeout=8000)
 
     def _on_tiles_export_las(self, tile_ids: List[str]) -> None:
         """Handler for 'Export LAS…' requested from tile list context menu."""

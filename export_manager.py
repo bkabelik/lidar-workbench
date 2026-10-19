@@ -71,6 +71,15 @@ class ExportConfig:
     crs_epsg: Optional[int] = None
     crs_wkt: Optional[str] = None
 
+    # Overlap handling (so adjacent exported tiles fit together with no overlap)
+    clip_overlap: bool = True
+    overlap_m: float = 0.0
+    tile_size_m: Optional[float] = None
+
+    # Vector footprint layer (tile index for ESRI ArcGIS and QGIS)
+    export_footprints: bool = True
+    footprint_format: str = "both"  # "both" | "shp" | "gpkg" | "geojson"
+
 
 @dataclass
 class RasterGrid:
@@ -125,6 +134,7 @@ def export_dtm(
     tile_subs: Dict[str, Tuple[Tuple[float, float, float, float], RasterGrid]] = {}
 
     written: List[Path] = []
+    tile_footprint_records: List[Dict] = []
     total = len(config.tile_ids)
 
     for idx, tile_id in enumerate(config.tile_ids):
@@ -148,11 +158,41 @@ def export_dtm(
         gy = pts["y"][ground_mask]
         gz = pts["z"][ground_mask]
 
+        # Include neighbor ground points within buffer_m for seamless boundaries
+        buffer_m = max(15.0, config.resolution * 10)
+        buf_minx, buf_miny = bbox[0] - buffer_m, bbox[1] - buffer_m
+        buf_maxx, buf_maxy = bbox[2] + buffer_m, bbox[3] + buffer_m
+        nb_gxs, nb_gys, nb_gzs = [gx], [gy], [gz]
+        for nb_id, nb_bbox in tile_bboxes.items():
+            if nb_id == tile_id:
+                continue
+            if (nb_bbox[0] <= buf_maxx and nb_bbox[2] >= buf_minx and
+                nb_bbox[1] <= buf_maxy and nb_bbox[3] >= buf_miny):
+                nb_pts = tile_points.get(nb_id)
+                if nb_pts is not None:
+                    nb_cls = nb_pts["classification"]
+                    nb_ground = nb_cls == config.ground_class
+                    if nb_ground.any():
+                        nx = nb_pts["x"][nb_ground]
+                        ny = nb_pts["y"][nb_ground]
+                        in_buf = (nx >= buf_minx) & (nx <= buf_maxx) & (ny >= buf_miny) & (ny <= buf_maxy)
+                        if in_buf.any():
+                            nb_gxs.append(nx[in_buf])
+                            nb_gys.append(ny[in_buf])
+                            nb_gzs.append(nb_pts["z"][nb_ground][in_buf])
+        all_gx = np.concatenate(nb_gxs)
+        all_gy = np.concatenate(nb_gys)
+        all_gz = np.concatenate(nb_gzs)
+
         # ── 3. slice master grid to tile extent ──────────────────────
-        sub = _slice_grid(master, bbox)
+        if config.clip_overlap and config.overlap_m > 0:
+            core_bbox = compute_core_bbox(bbox, (global_bbox[0], global_bbox[2], global_bbox[1], global_bbox[3]), config.overlap_m, tile_size_m=config.tile_size_m)
+        else:
+            core_bbox = bbox
+        sub = _slice_grid(master, core_bbox)
 
         # ── 4. TIN interpolation ─────────────────────────────────────
-        sub.data = _tin_interpolate(gx, gy, gz, sub)
+        sub.data = _tin_interpolate(all_gx, all_gy, all_gz, sub)
 
         # ── 5. write ─────────────────────────────────────────────────
         stem = tile_id if tile_id.startswith("tile_") else f"tile_{tile_id}"
@@ -160,8 +200,19 @@ def export_dtm(
         _write_ascii_grid(sub, asc_path, crs_wkt=config.crs_wkt)
         written.append(asc_path)
 
+        tile_footprint_records.append({
+            "tile_id": tile_id,
+            "bbox": (sub.xllcorner, sub.yllcorner, sub.xllcorner + sub.ncols * sub.cellsize, sub.yllcorner + sub.nrows * sub.cellsize),
+            "dtm_file": asc_path.name,
+            "dsm_file": "",
+            "hs_file": f"{stem}_dtm_hillshade.tif" if config.compute_hillshade else "",
+            "las_file": "",
+            "cellsize": config.resolution,
+            "epsg": config.crs_epsg,
+        })
+
         if config.compute_hillshade and acc is not None:
-            tile_subs[tile_id] = (bbox, sub)
+            tile_subs[tile_id] = (core_bbox, sub)
             col_start = int(round((sub.xllcorner - master.xllcorner) / master.cellsize))
             row_start = int(round((sub.yllcorner - master.yllcorner) / master.cellsize))
             acc_slice = acc[row_start:row_start + sub.nrows, col_start:col_start + sub.ncols]
@@ -194,6 +245,18 @@ def export_dtm(
             hs_path = out / f"{stem}_dtm_hillshade.tif"
             _write_geotiff(tile_hs, hs_path, crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt)
             written.append(hs_path)
+
+    # Vector footprint layer (Shapefile & GeoPackage)
+    if config.export_footprints and tile_footprint_records:
+        fp_files = export_tile_footprints(
+            tile_footprint_records,
+            output_dir=out,
+            stem="tile_footprints_dtm",
+            formats=config.footprint_format,
+            crs_epsg=config.crs_epsg,
+            crs_wkt=config.crs_wkt,
+        )
+        written.extend(fp_files)
 
     if progress_callback:
         progress_callback(100.0, f"DTM export complete — {len(written)} file(s)")
@@ -477,6 +540,7 @@ def export_dsm_streaming(
     master = _master_grid(global_bbox, config.resolution)
 
     written: List[Path] = []
+    tile_footprint_records: List[Dict] = []
     total = len(config.tile_ids)
 
     for idx, tile_id in enumerate(config.tile_ids):
@@ -498,7 +562,11 @@ def export_dsm_streaming(
             del pts
             continue
 
-        sub = _slice_grid(master, bbox)
+        if config.clip_overlap and config.overlap_m > 0:
+            core_bbox = compute_core_bbox(bbox, (global_bbox[0], global_bbox[2], global_bbox[1], global_bbox[3]), config.overlap_m, tile_size_m=config.tile_size_m)
+        else:
+            core_bbox = bbox
+        sub = _slice_grid(master, core_bbox)
         sub.data = _bin_max(pts["x"][keep], pts["y"][keep], pts["z"][keep], sub, fill_voids=config.fill_dsm_voids)
         del pts
 
@@ -507,6 +575,17 @@ def export_dsm_streaming(
         _write_ascii_grid(sub, asc_path, crs_wkt=config.crs_wkt)
         written.append(asc_path)
 
+        tile_footprint_records.append({
+            "tile_id": tile_id,
+            "bbox": (sub.xllcorner, sub.yllcorner, sub.xllcorner + sub.ncols * sub.cellsize, sub.yllcorner + sub.nrows * sub.cellsize),
+            "dtm_file": "",
+            "dsm_file": asc_path.name,
+            "hs_file": f"{stem}_dsm_hillshade.tif" if config.compute_hillshade else "",
+            "las_file": "",
+            "cellsize": config.resolution,
+            "epsg": config.crs_epsg,
+        })
+
         if config.compute_hillshade:
             hs_path = out / f"{stem}_dsm_hillshade.tif"
             _write_hillshade(
@@ -514,6 +593,18 @@ def export_dsm_streaming(
                 crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt,
             )
             written.append(hs_path)
+
+    # Vector footprint layer (Shapefile & GeoPackage)
+    if config.export_footprints and tile_footprint_records:
+        fp_files = export_tile_footprints(
+            tile_footprint_records,
+            output_dir=out,
+            stem="tile_footprints_dsm",
+            formats=config.footprint_format,
+            crs_epsg=config.crs_epsg,
+            crs_wkt=config.crs_wkt,
+        )
+        written.extend(fp_files)
 
     if progress_callback:
         progress_callback(100.0, f"DSM export complete — {len(written)} file(s)")
@@ -635,6 +726,31 @@ def _load_las_xyz_cls(las_path: str):
         )
 
 
+def _attach_neighbor_paths(jobs: List[Dict], buffer_m: float = 15.0) -> List[Dict]:
+    """
+    Find adjacent neighbor tiles for each job within *buffer_m* so that
+    interpolation across tile boundaries uses points from both tiles seamlessly.
+    """
+    enriched_jobs = []
+    tile_list = [(tuple(j["bbox"]), j["las_path"], j["tile_id"]) for j in jobs]
+    for j in jobs:
+        b = j["bbox"]
+        minx, miny = b[0] - buffer_m, b[1] - buffer_m
+        maxx, maxy = b[2] + buffer_m, b[3] + buffer_m
+        neighbors = []
+        for nb_bbox, nb_path, nb_id in tile_list:
+            if nb_id == j["tile_id"]:
+                continue
+            if (nb_bbox[0] <= maxx and nb_bbox[2] >= minx and
+                nb_bbox[1] <= maxy and nb_bbox[3] >= miny):
+                neighbors.append(nb_path)
+        j_copy = dict(j)
+        j_copy["neighbor_las_paths"] = neighbors
+        j_copy["buffer_m"] = buffer_m
+        enriched_jobs.append(j_copy)
+    return enriched_jobs
+
+
 def _rasterize_tile_job(job: Dict, global_bbox: tuple, config: ExportConfig) -> Optional[dict]:
     """
     Rasterise one tile in a worker process.
@@ -642,22 +758,111 @@ def _rasterize_tile_job(job: Dict, global_bbox: tuple, config: ExportConfig) -> 
     Returns a picklable dict with the tile raster plus its georeferencing,
     or ``None`` when the tile has no points for the requested export.
     """
+    import laspy
+
     xs, ys, zs, cls = _load_las_xyz_cls(job["las_path"])
-    bbox = tuple(job["bbox"])
+    raw_bbox = tuple(job["bbox"])
+    overlap_m = float(job.get("overlap_m", getattr(config, "overlap_m", 0.0) or 0.0))
+    tile_size_m = job.get("tile_size_m", getattr(config, "tile_size_m", None))
+    clip_overlap = job.get("clip_overlap", getattr(config, "clip_overlap", True))
+
+    if clip_overlap and overlap_m > 0:
+        core_global = (global_bbox[0], global_bbox[2], global_bbox[1], global_bbox[3])
+        bbox = compute_core_bbox(raw_bbox, core_global, overlap_m, tile_size_m=tile_size_m)
+    else:
+        bbox = raw_bbox
+
+    buffer_m = float(job.get("buffer_m", max(15.0, config.resolution * 10)))
 
     master = _master_grid(global_bbox, config.resolution)
     sub = _slice_grid(master, bbox)
+
+    nb_paths = job.get("neighbor_las_paths", [])
 
     if config.mode == "dtm":
         ground_mask = cls == config.ground_class
         if not ground_mask.any():
             return None
-        sub.data = _tin_interpolate(xs[ground_mask], ys[ground_mask], zs[ground_mask], sub)
+        gx = xs[ground_mask]
+        gy = ys[ground_mask]
+        gz = zs[ground_mask]
+
+        if nb_paths:
+            buf_minx = raw_bbox[0] - buffer_m
+            buf_miny = raw_bbox[1] - buffer_m
+            buf_maxx = raw_bbox[2] + buffer_m
+            buf_maxy = raw_bbox[3] + buffer_m
+            nb_xs, nb_ys, nb_zs = [], [], []
+            for nb_path in nb_paths:
+                try:
+                    with laspy.open(nb_path) as reader:
+                        h = reader.header
+                        if (h.x_max < buf_minx or h.x_min > buf_maxx or
+                            h.y_max < buf_miny or h.y_min > buf_maxy):
+                            continue
+                        las = reader.read()
+                        if hasattr(las, "classification"):
+                            nb_cls = np.array(las.classification)
+                            m = (nb_cls == config.ground_class)
+                        else:
+                            m = np.ones(len(las.x), dtype=bool)
+                        nx = np.array(las.x)
+                        ny = np.array(las.y)
+                        in_buf = m & (nx >= buf_minx) & (nx <= buf_maxx) & (ny >= buf_miny) & (ny <= buf_maxy)
+                        if in_buf.any():
+                            nb_xs.append(nx[in_buf])
+                            nb_ys.append(ny[in_buf])
+                            nb_zs.append(np.array(las.z)[in_buf])
+                except Exception:
+                    continue
+            if nb_xs:
+                gx = np.concatenate([gx] + nb_xs)
+                gy = np.concatenate([gy] + nb_ys)
+                gz = np.concatenate([gz] + nb_zs)
+
+        sub.data = _tin_interpolate(gx, gy, gz, sub)
     else:
         keep = np.isin(cls, list(config.dsm_classes))
         if not keep.any():
             return None
-        sub.data = _bin_max(xs[keep], ys[keep], zs[keep], sub, fill_voids=config.fill_dsm_voids)
+        px = xs[keep]
+        py = ys[keep]
+        pz = zs[keep]
+
+        if nb_paths and config.fill_dsm_voids:
+            buf_minx = raw_bbox[0] - buffer_m
+            buf_miny = raw_bbox[1] - buffer_m
+            buf_maxx = raw_bbox[2] + buffer_m
+            buf_maxy = raw_bbox[3] + buffer_m
+            nb_px, nb_py, nb_pz = [], [], []
+            for nb_path in nb_paths:
+                try:
+                    with laspy.open(nb_path) as reader:
+                        h = reader.header
+                        if (h.x_max < buf_minx or h.x_min > buf_maxx or
+                            h.y_max < buf_miny or h.y_min > buf_maxy):
+                            continue
+                        las = reader.read()
+                        if hasattr(las, "classification"):
+                            nb_cls = np.array(las.classification)
+                            m = np.isin(nb_cls, list(config.dsm_classes))
+                        else:
+                            m = np.ones(len(las.x), dtype=bool)
+                        nx = np.array(las.x)
+                        ny = np.array(las.y)
+                        in_buf = m & (nx >= buf_minx) & (nx <= buf_maxx) & (ny >= buf_miny) & (ny <= buf_maxy)
+                        if in_buf.any():
+                            nb_px.append(nx[in_buf])
+                            nb_py.append(ny[in_buf])
+                            nb_pz.append(np.array(las.z)[in_buf])
+                except Exception:
+                    continue
+            if nb_px:
+                px = np.concatenate([px] + nb_px)
+                py = np.concatenate([py] + nb_py)
+                pz = np.concatenate([pz] + nb_pz)
+
+        sub.data = _bin_max(px, py, pz, sub, fill_voids=config.fill_dsm_voids)
 
     return {
         "tile_id": job["tile_id"],
@@ -666,6 +871,8 @@ def _rasterize_tile_job(job: Dict, global_bbox: tuple, config: ExportConfig) -> 
         "cellsize": sub.cellsize,
         "nodata": sub.nodata,
         "data": sub.data,
+        "bbox": (sub.xllcorner, sub.yllcorner, sub.xllcorner + sub.ncols * sub.cellsize, sub.yllcorner + sub.nrows * sub.cellsize),
+        "las_path": job.get("las_path", ""),
     }
 
 
@@ -704,6 +911,9 @@ def export_dtm_parallel(
     """Parallel, memory-safe per-tile DTM export."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
+    if not config.tile_ids and jobs:
+        config.tile_ids = [j["tile_id"] for j in jobs if "tile_id" in j]
+
     _validate_config(config)
     out = Path(config.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -713,9 +923,19 @@ def export_dtm_parallel(
     if total == 0:
         return written
 
+    enriched = []
+    for j in jobs:
+        jc = dict(j)
+        jc.setdefault("overlap_m", config.overlap_m)
+        jc.setdefault("tile_size_m", config.tile_size_m)
+        jc.setdefault("clip_overlap", config.clip_overlap)
+        enriched.append(jc)
+    jobs = _attach_neighbor_paths(enriched, buffer_m=max(15.0, config.resolution * 10))
+
     master = _master_grid(global_bbox, config.resolution)
     acc = np.full(master.data.shape, np.inf, dtype=np.float64) if config.compute_hillshade else None
     tile_jobs: Dict[str, Tuple[Dict, Dict]] = {}
+    tile_footprint_records: List[Dict] = []
 
     done = 0
     with ProcessPoolExecutor(max_workers=max(1, min(int(workers), total))) as pool:
@@ -739,6 +959,17 @@ def export_dtm_parallel(
                     asc_path = out / f"{stem}_dtm.asc"
                     _write_ascii_grid(grid, asc_path, crs_wkt=config.crs_wkt)
                     written.append(asc_path)
+
+                    tile_footprint_records.append({
+                        "tile_id": result["tile_id"],
+                        "bbox": result.get("bbox", (grid.xllcorner, grid.yllcorner, grid.xllcorner + grid.ncols * grid.cellsize, grid.yllcorner + grid.nrows * grid.cellsize)),
+                        "dtm_file": asc_path.name,
+                        "dsm_file": "",
+                        "hs_file": f"{stem}_dtm_hillshade.tif" if config.compute_hillshade else "",
+                        "las_file": Path(result.get("las_path", job.get("las_path", ""))).name,
+                        "cellsize": config.resolution,
+                        "epsg": config.crs_epsg,
+                    })
 
                     if config.compute_hillshade and acc is not None:
                         tile_jobs[job["tile_id"]] = (job, result)
@@ -788,6 +1019,20 @@ def export_dtm_parallel(
             _write_geotiff(tile_hs, hs_path, crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt)
             written.append(hs_path)
 
+    # Vector footprint layer (Shapefile & GeoPackage)
+    if config.export_footprints and tile_footprint_records:
+        if progress_callback:
+            progress_callback(98.0, "Exporting tile footprint layer (Shapefile & GeoPackage)…")
+        fp_files = export_tile_footprints(
+            tile_footprint_records,
+            output_dir=out,
+            stem="tile_footprints_dtm",
+            formats=config.footprint_format,
+            crs_epsg=config.crs_epsg,
+            crs_wkt=config.crs_wkt,
+        )
+        written.extend(fp_files)
+
     if progress_callback:
         progress_callback(100.0, f"DTM export complete — {len(written)} file(s)")
     return written
@@ -803,6 +1048,9 @@ def export_dsm_parallel(
     """Parallel, memory-safe per-tile DSM export."""
     from concurrent.futures import ProcessPoolExecutor, as_completed
 
+    if not config.tile_ids and jobs:
+        config.tile_ids = [j["tile_id"] for j in jobs if "tile_id" in j]
+
     _validate_config(config)
     out = Path(config.output_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -812,9 +1060,19 @@ def export_dsm_parallel(
     if total == 0:
         return written
 
+    enriched = []
+    for j in jobs:
+        jc = dict(j)
+        jc.setdefault("overlap_m", config.overlap_m)
+        jc.setdefault("tile_size_m", config.tile_size_m)
+        jc.setdefault("clip_overlap", config.clip_overlap)
+        enriched.append(jc)
+    jobs = _attach_neighbor_paths(enriched, buffer_m=max(15.0, config.resolution * 10))
+
     master = _master_grid(global_bbox, config.resolution)
     acc = np.full(master.data.shape, -np.inf, dtype=np.float64) if config.compute_hillshade else None
     tile_jobs: Dict[str, Tuple[Dict, Dict]] = {}
+    tile_footprint_records: List[Dict] = []
 
     done = 0
     with ProcessPoolExecutor(max_workers=max(1, min(int(workers), total))) as pool:
@@ -838,6 +1096,17 @@ def export_dsm_parallel(
                     asc_path = out / f"{stem}_dsm.asc"
                     _write_ascii_grid(grid, asc_path, crs_wkt=config.crs_wkt)
                     written.append(asc_path)
+
+                    tile_footprint_records.append({
+                        "tile_id": result["tile_id"],
+                        "bbox": result.get("bbox", (grid.xllcorner, grid.yllcorner, grid.xllcorner + grid.ncols * grid.cellsize, grid.yllcorner + grid.nrows * grid.cellsize)),
+                        "dtm_file": "",
+                        "dsm_file": asc_path.name,
+                        "hs_file": f"{stem}_dsm_hillshade.tif" if config.compute_hillshade else "",
+                        "las_file": Path(result.get("las_path", job.get("las_path", ""))).name,
+                        "cellsize": config.resolution,
+                        "epsg": config.crs_epsg,
+                    })
 
                     if config.compute_hillshade and acc is not None:
                         tile_jobs[job["tile_id"]] = (job, result)
@@ -887,6 +1156,20 @@ def export_dsm_parallel(
             _write_geotiff(tile_hs, hs_path, crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt)
             written.append(hs_path)
 
+    # Vector footprint layer (Shapefile & GeoPackage)
+    if config.export_footprints and tile_footprint_records:
+        if progress_callback:
+            progress_callback(98.0, "Exporting tile footprint layer (Shapefile & GeoPackage)…")
+        fp_files = export_tile_footprints(
+            tile_footprint_records,
+            output_dir=out,
+            stem="tile_footprints_dsm",
+            formats=config.footprint_format,
+            crs_epsg=config.crs_epsg,
+            crs_wkt=config.crs_wkt,
+        )
+        written.extend(fp_files)
+
     if progress_callback:
         progress_callback(100.0, f"DSM export complete — {len(written)} file(s)")
     return written
@@ -920,6 +1203,8 @@ def export_merged_raster_parallel(
     processed = 0
     if total == 0:
         return []
+
+    jobs = _attach_neighbor_paths(jobs, buffer_m=max(15.0, config.resolution * 10))
 
     with ProcessPoolExecutor(max_workers=max(1, min(int(workers), total))) as pool:
         futures = {
@@ -1228,7 +1513,7 @@ def _tin_interpolate(
     # ── IDW fallback for cells outside convex hull ─────────────────
     outside = result == grid.nodata
     if outside.any() and len(gx) > 0:
-        result = _idw_fill(result, outside, gx, gy, gz, grid, power=2.0, max_dist=grid.cellsize * 5)
+        result = _idw_fill(result, outside, gx, gy, gz, grid, power=2.0, max_dist=max(50.0, grid.cellsize * 50))
 
     # ── nearest-neighbour fallback ──────────────────────────────────
     still_nodata = result == grid.nodata
@@ -1427,23 +1712,29 @@ def compute_hillshade(
         A new :class:`RasterGrid` with hillshade values (0–255).
     """
     az_rad = math.radians(360.0 - azimuth + 90.0)   # convert to math convention
-    alt_rad = math.radians(altitude)
+    zenith_rad = math.radians(90.0 - altitude)
 
     data = grid.data.astype(np.float64)
     nodata_mask = (data == grid.nodata) | np.isnan(data) | np.isinf(data)
-    # Temporarily replace nodata with mean to avoid edge artefacts
-    valid = data[~nodata_mask]
-    fill_val = float(valid.mean()) if len(valid) > 0 else 0.0
-    data_filled = np.where(nodata_mask, fill_val, data)
+    if nodata_mask.any():
+        if (~nodata_mask).any():
+            from scipy.ndimage import distance_transform_edt
+            _, (idx_r, idx_c) = distance_transform_edt(nodata_mask, return_indices=True)
+            data_filled = data[idx_r, idx_c]
+        else:
+            data_filled = np.zeros_like(data)
+    else:
+        data_filled = data
 
     # Pad by 1 pixel on all edges with edge replication so that the 3×3 window
     # covers all boundary pixels naturally without leaving uncalculated 0-gradient borders
     pad_data = np.pad(data_filled, 1, mode="edge")
 
     # Horn (1981) central-difference slope estimator
-    # 3×3 window:  a b c    (row i-1)
-    #              d e f    (row i)
-    #              g h i    (row i+1)
+    # 3×3 window in South-up grid:
+    #              g h i    (row i+1: North)
+    #              d e f    (row i: Center)
+    #              a b c    (row i-1: South)
     # dz/dx = ((c + 2f + i) - (a + 2d + g)) / (8*cellsize)
     # dz/dy = ((g + 2h + i) - (a + 2b + c)) / (8*cellsize)
     a = pad_data[:-2, :-2]
@@ -1459,12 +1750,19 @@ def compute_hillshade(
     dzdy = ((g + 2.0 * h + i) - (a + 2.0 * b + c)) / (8.0 * grid.cellsize)
 
     slope = np.arctan(np.sqrt(dzdx ** 2 + dzdy ** 2))
-    aspect = np.arctan2(dzdy, -dzdx)
+    # In cartographic and Horn (1981) illumination models, the downhill aspect
+    # direction vector is (-dzdx, -dzdy). Because RasterGrid row indices increase
+    # from South to North (+y), the downhill component in y is -dzdy.
+    # Passing -dzdy and -dzdx into arctan2 ensures North-facing and South-facing
+    # slopes receive correct directional illumination matching standard GIS (GDAL/ESRI),
+    # preventing relief inversion where riverbeds and valleys look like ridges.
+    aspect = np.arctan2(-dzdy, -dzdx)
+    aspect = np.where(aspect < 0.0, aspect + 2.0 * np.pi, aspect)
     # aspect = 0 where slope is 0 (flat)
     aspect = np.where(slope > 0, aspect, 0.0)
 
-    hs = (np.cos(alt_rad) * np.cos(slope)
-          + np.sin(alt_rad) * np.sin(slope) * np.cos(az_rad - aspect))
+    hs = (np.cos(zenith_rad) * np.cos(slope)
+          + np.sin(zenith_rad) * np.sin(slope) * np.cos(az_rad - aspect))
 
     # Clamp and scale to 0-255
     hs = np.clip(hs, 0.0, 1.0) * 254.0 + 1.0
@@ -1906,3 +2204,355 @@ def _validate_config(config: ExportConfig) -> None:
         raise ValueError("at least one tile_id is required")
     if config.mode not in ("dtm", "dsm"):
         raise ValueError(f"Unknown export mode: {config.mode}")
+
+
+# ── Vector Tile Footprints Export (Shapefile, GeoPackage, GeoJSON) ───────
+
+def _write_footprints_qml_style(path: Path) -> None:
+    """Write companion QGIS layer style file (.qml) for vector tile footprints."""
+    try:
+        qml_path = path.with_suffix(".qml")
+        content = (
+            '<!DOCTYPE qgis PUBLIC \'http://mrcc.com/qgis.dtd\' \'SYSTEM\'>\n'
+            '<qgis version="3.0.0" styleCategories="AllStyleCategories">\n'
+            '  <renderer-v2 type="singleSymbol" enableorderby="0" symbollevels="0">\n'
+            '    <symbols>\n'
+            '      <symbol type="fill" name="0" clip_to_extent="1" alpha="1" force_rhr="0">\n'
+            '        <layer class="SimpleFill" locked="0" enabled="1" pass="0">\n'
+            '          <prop k="border_width_map_unit_scale" v="3x:0,0,0,0,0,0"/>\n'
+            '          <prop k="color" v="0,0,0,0"/>\n'
+            '          <prop k="outline_color" v="0,102,204,255"/>\n'
+            '          <prop k="outline_style" v="solid"/>\n'
+            '          <prop k="outline_width" v="0.6"/>\n'
+            '          <prop k="outline_width_unit" v="MM"/>\n'
+            '          <prop k="style" v="no"/>\n'
+            '        </layer>\n'
+            '      </symbol>\n'
+            '    </symbols>\n'
+            '  </renderer-v2>\n'
+            '  <labeling type="simple">\n'
+            '    <settings calloutType="simple">\n'
+            '      <text-style fontWordSpacing="0" fieldName="tile_id" fontSize="9" textColor="0,102,204,255" fontLetterSpacing="0" isExpression="0">\n'
+            '        <buffer bufferSize="1" bufferDraw="1" bufferColor="255,255,255,255"/>\n'
+            '      </text-style>\n'
+            '    </settings>\n'
+            '  </labeling>\n'
+            '</qgis>\n'
+        )
+        qml_path.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _write_shapefile_footprints(
+    tile_records: List[Dict],
+    shp_path: Path,
+    crs_wkt: Optional[str] = None,
+) -> List[Path]:
+    """Write tile footprint polygons to an ESRI Shapefile (.shp)."""
+    import shapefile
+
+    written: List[Path] = []
+    shp_str = str(shp_path)
+    with shapefile.Writer(shp_str, shapeType=shapefile.POLYGON) as w:
+        w.field("tile_id", "C", size=50)
+        w.field("dtm_file", "C", size=80)
+        w.field("dsm_file", "C", size=80)
+        w.field("hs_file", "C", size=80)
+        w.field("las_file", "C", size=80)
+        w.field("min_x", "F", decimal=3)
+        w.field("min_y", "F", decimal=3)
+        w.field("max_x", "F", decimal=3)
+        w.field("max_y", "F", decimal=3)
+        w.field("width_m", "F", decimal=2)
+        w.field("height_m", "F", decimal=2)
+        w.field("cellsize", "F", decimal=2)
+        w.field("epsg", "N", decimal=0)
+
+        for t in tile_records:
+            b = t["bbox"]
+            minx, miny, maxx, maxy = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+            ring = [[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy], [minx, miny]]
+            w.poly([ring])
+            w.record(
+                str(t.get("tile_id", "")),
+                str(t.get("dtm_file", "")),
+                str(t.get("dsm_file", "")),
+                str(t.get("hs_file", "")),
+                str(t.get("las_file", "")),
+                minx, miny, maxx, maxy,
+                maxx - minx, maxy - miny,
+                float(t.get("cellsize", 0.0) or 0.0),
+                int(t.get("epsg", 0) or 0),
+            )
+
+    written.append(shp_path)
+    for ext in (".shx", ".dbf"):
+        p = shp_path.with_suffix(ext)
+        if p.is_file():
+            written.append(p)
+
+    if crs_wkt:
+        prj_path = shp_path.with_suffix(".prj")
+        try:
+            prj_path.write_text(crs_wkt, encoding="utf-8")
+            written.append(prj_path)
+        except Exception:
+            pass
+
+    cpg_path = shp_path.with_suffix(".cpg")
+    try:
+        cpg_path.write_text("UTF-8", encoding="utf-8")
+        written.append(cpg_path)
+    except Exception:
+        pass
+
+    _write_footprints_qml_style(shp_path)
+    qml_path = shp_path.with_suffix(".qml")
+    if qml_path.is_file():
+        written.append(qml_path)
+
+    logger.info("Wrote tile footprint Shapefile: %s (%d tiles)", shp_path, len(tile_records))
+    return written
+
+
+def _write_geopackage_footprints(
+    tile_records: List[Dict],
+    gpkg_path: Path,
+    crs_epsg: Optional[int] = None,
+    crs_wkt: Optional[str] = None,
+) -> List[Path]:
+    """Write tile footprint polygons to an OGC GeoPackage (.gpkg)."""
+    import sqlite3
+    import struct
+
+    if gpkg_path.is_file():
+        gpkg_path.unlink()
+
+    conn = sqlite3.connect(str(gpkg_path))
+    cur = conn.cursor()
+    cur.execute("PRAGMA application_id = 0x47504b47;")
+    cur.execute("PRAGMA user_version = 10300;")
+
+    cur.execute("""CREATE TABLE gpkg_spatial_ref_sys (
+        srs_name TEXT NOT NULL,
+        srs_id INTEGER NOT NULL PRIMARY KEY,
+        organization TEXT NOT NULL,
+        organization_coordsys_id INTEGER NOT NULL,
+        definition TEXT NOT NULL,
+        description TEXT
+    );""")
+
+    srs_id = int(crs_epsg) if crs_epsg else 0
+    srs_name = f"EPSG:{srs_id}" if srs_id > 0 else "Undefined"
+    srs_def = crs_wkt if crs_wkt else "undefined"
+
+    cur.execute("INSERT INTO gpkg_spatial_ref_sys VALUES (?, ?, ?, ?, ?, ?)",
+                (srs_name, srs_id, "EPSG" if srs_id > 0 else "NONE", srs_id, srs_def, ""))
+    if srs_id != 0:
+        cur.execute("INSERT OR IGNORE INTO gpkg_spatial_ref_sys VALUES (?, ?, ?, ?, ?, ?)",
+                    ("Undefined Cartesian", 0, "NONE", 0, "undefined", ""))
+    if srs_id != -1:
+        cur.execute("INSERT OR IGNORE INTO gpkg_spatial_ref_sys VALUES (?, ?, ?, ?, ?, ?)",
+                    ("Undefined Geographic", -1, "NONE", -1, "undefined", ""))
+
+    cur.execute("""CREATE TABLE gpkg_contents (
+        table_name TEXT NOT NULL PRIMARY KEY,
+        data_type TEXT NOT NULL,
+        identifier TEXT UNIQUE,
+        description TEXT DEFAULT '',
+        last_change DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+        min_x DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE,
+        srs_id INTEGER,
+        CONSTRAINT fk_gc_r_srs_id FOREIGN KEY (srs_id) REFERENCES gpkg_spatial_ref_sys(srs_id)
+    );""")
+
+    cur.execute("""CREATE TABLE gpkg_geometry_columns (
+        table_name TEXT NOT NULL,
+        column_name TEXT NOT NULL,
+        geometry_type_name TEXT NOT NULL,
+        srs_id INTEGER NOT NULL,
+        z TINYINT NOT NULL,
+        m TINYINT NOT NULL,
+        CONSTRAINT pk_geom_cols PRIMARY KEY (table_name, column_name),
+        CONSTRAINT fk_gc_srs FOREIGN KEY (srs_id) REFERENCES gpkg_spatial_ref_sys(srs_id)
+    );""")
+
+    cur.execute("""CREATE TABLE tile_footprints (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        geom BLOB,
+        tile_id TEXT,
+        dtm_file TEXT,
+        dsm_file TEXT,
+        hs_file TEXT,
+        las_file TEXT,
+        min_x REAL,
+        min_y REAL,
+        max_x REAL,
+        max_y REAL,
+        width_m REAL,
+        height_m REAL,
+        cellsize REAL,
+        epsg INTEGER
+    );""")
+
+    cur.execute("INSERT INTO gpkg_geometry_columns VALUES (?, ?, ?, ?, ?, ?)",
+                ("tile_footprints", "geom", "POLYGON", srs_id, 0, 0))
+
+    all_minx, all_miny, all_maxx, all_maxy = [], [], [], []
+    for t in tile_records:
+        b = t["bbox"]
+        minx, miny, maxx, maxy = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+        all_minx.append(minx)
+        all_miny.append(miny)
+        all_maxx.append(maxx)
+        all_maxy.append(maxy)
+
+        # Build GPB geometry blob: header (flags: little-endian, 2D envelope) + WKB Polygon
+        flags = 0x01 | (1 << 1)
+        header = b"GP\x00" + struct.pack("<Bi", flags, srs_id) + struct.pack("<dddd", minx, maxx, miny, maxy)
+        wkb = struct.pack("<BII", 1, 3, 1) + struct.pack("<I", 5)
+        for px, py in [(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy), (minx, miny)]:
+            wkb += struct.pack("<dd", px, py)
+        blob = header + wkb
+
+        cur.execute("""INSERT INTO tile_footprints 
+            (geom, tile_id, dtm_file, dsm_file, hs_file, las_file, min_x, min_y, max_x, max_y, width_m, height_m, cellsize, epsg)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (blob, str(t.get("tile_id", "")), str(t.get("dtm_file", "")), str(t.get("dsm_file", "")),
+             str(t.get("hs_file", "")), str(t.get("las_file", "")), minx, miny, maxx, maxy,
+             maxx - minx, maxy - miny, float(t.get("cellsize", 0.0) or 0.0), int(t.get("epsg", 0) or 0)))
+
+    g_minx = min(all_minx) if all_minx else 0.0
+    g_miny = min(all_miny) if all_miny else 0.0
+    g_maxx = max(all_maxx) if all_maxx else 0.0
+    g_maxy = max(all_maxy) if all_maxy else 0.0
+
+    cur.execute("""INSERT INTO gpkg_contents 
+        (table_name, data_type, identifier, description, last_change, min_x, min_y, max_x, max_y, srs_id)
+        VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, ?, ?, ?, ?)""",
+        ("tile_footprints", "features", "tile_footprints", "Exported non-overlapping tile footprints",
+         g_minx, g_miny, g_maxx, g_maxy, srs_id))
+
+    conn.commit()
+    conn.close()
+
+    _write_footprints_qml_style(gpkg_path)
+    written = [gpkg_path]
+    qml_path = gpkg_path.with_suffix(".qml")
+    if qml_path.is_file():
+        written.append(qml_path)
+
+    logger.info("Wrote tile footprint GeoPackage: %s (%d tiles)", gpkg_path, len(tile_records))
+    return written
+
+
+def _write_geojson_footprints(
+    tile_records: List[Dict],
+    geojson_path: Path,
+    crs_epsg: Optional[int] = None,
+) -> List[Path]:
+    """Write tile footprint polygons to GeoJSON (.geojson)."""
+    import json
+
+    features = []
+    for t in tile_records:
+        b = t["bbox"]
+        minx, miny, maxx, maxy = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+        ring = [[minx, miny], [maxx, miny], [maxx, maxy], [minx, maxy], [minx, miny]]
+        props = {
+            "tile_id": str(t.get("tile_id", "")),
+            "dtm_file": str(t.get("dtm_file", "")),
+            "dsm_file": str(t.get("dsm_file", "")),
+            "hs_file": str(t.get("hs_file", "")),
+            "las_file": str(t.get("las_file", "")),
+            "min_x": minx,
+            "min_y": miny,
+            "max_x": maxx,
+            "max_y": maxy,
+            "width_m": maxx - minx,
+            "height_m": maxy - miny,
+            "cellsize": float(t.get("cellsize", 0.0) or 0.0),
+            "epsg": int(t.get("epsg", 0) or 0),
+        }
+        features.append({
+            "type": "Feature",
+            "geometry": {
+                "type": "Polygon",
+                "coordinates": [ring],
+            },
+            "properties": props,
+        })
+
+    collection = {
+        "type": "FeatureCollection",
+        "name": geojson_path.stem,
+        "features": features,
+    }
+    if crs_epsg:
+        collection["crs"] = {
+            "type": "name",
+            "properties": {"name": f"urn:ogc:def:crs:EPSG::{crs_epsg}"},
+        }
+
+    geojson_path.write_text(json.dumps(collection, indent=2), encoding="utf-8")
+    logger.info("Wrote tile footprint GeoJSON: %s (%d tiles)", geojson_path, len(tile_records))
+    return [geojson_path]
+
+
+def export_tile_footprints(
+    tile_records: List[Dict],
+    output_dir: Path | str,
+    stem: str = "tile_footprints",
+    formats: str = "both",
+    crs_epsg: Optional[int] = None,
+    crs_wkt: Optional[str] = None,
+) -> List[Path]:
+    """
+    Export non-overlapping tile footprint polygons as ESRI Shapefile (.shp)
+    and/or OGC GeoPackage (.gpkg) / GeoJSON (.geojson) for QGIS and ESRI ArcGIS.
+
+    Args:
+        tile_records: List of dicts with ``tile_id``, ``bbox`` (minx, miny, maxx, maxy),
+                      and optional filenames/metadata.
+        output_dir: Directory where vector files will be created.
+        stem: File name stem without extension (e.g. 'tile_footprints_dtm').
+        formats: 'shp', 'gpkg', 'both', or 'geojson'.
+        crs_epsg: EPSG code (e.g. 25833).
+        crs_wkt: WKT string of the CRS for .prj file.
+
+    Returns:
+        List of generated file paths.
+    """
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    fmt_lower = formats.lower().strip()
+
+    written: List[Path] = []
+
+    # ESRI Shapefile
+    if fmt_lower in ("shp", "shapefile", "both", "all"):
+        try:
+            shp_path = out / f"{stem}.shp"
+            written.extend(_write_shapefile_footprints(tile_records, shp_path, crs_wkt=crs_wkt))
+        except Exception as exc:
+            logger.exception("Failed to write Shapefile footprints: %s", exc)
+
+    # OGC GeoPackage
+    if fmt_lower in ("gpkg", "geopackage", "both", "all"):
+        try:
+            gpkg_path = out / f"{stem}.gpkg"
+            written.extend(_write_geopackage_footprints(tile_records, gpkg_path, crs_epsg=crs_epsg, crs_wkt=crs_wkt))
+        except Exception as exc:
+            logger.exception("Failed to write GeoPackage footprints: %s", exc)
+
+    # GeoJSON
+    if fmt_lower in ("geojson", "json", "all"):
+        try:
+            json_path = out / f"{stem}.geojson"
+            written.extend(_write_geojson_footprints(tile_records, json_path, crs_epsg=crs_epsg))
+        except Exception as exc:
+            logger.exception("Failed to write GeoJSON footprints: %s", exc)
+
+    return written
+

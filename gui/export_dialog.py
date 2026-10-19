@@ -137,6 +137,8 @@ class ExportDialog(QDialog):
         workers: int = 4,
         crs_epsg: Optional[int] = None,
         crs_wkt: Optional[str] = None,
+        overlap_m: float = 0.0,
+        tile_size_m: Optional[float] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -146,6 +148,8 @@ class ExportDialog(QDialog):
         self._workers = max(1, int(workers))
         self._crs_epsg = crs_epsg
         self._crs_wkt = crs_wkt
+        self._overlap_m = float(overlap_m)
+        self._tile_size_m = float(tile_size_m) if tile_size_m is not None else None
         self._worker: Optional[_ExportWorker] = None
         self.written_files: List[str] = []
 
@@ -244,6 +248,41 @@ class ExportDialog(QDialog):
         self._hillshade_check.setChecked(True)
         out_form.addRow(self._hillshade_check)
 
+        # Overlap handling (so tiles fit together with no overlap)
+        self._clip_check = QCheckBox("Clip overlap to non-overlapping tile boundary")
+        self._clip_check.setChecked(True)
+        self._clip_check.setToolTip(
+            "When tiles have overlap (buffer), trims exported rasters to their non-overlapping core boundary "
+            "so adjacent tiles fit together seamlessly without overlapping each other."
+        )
+        out_form.addRow(self._clip_check)
+
+        # Tile footprints vector export
+        self._footprints_check = QCheckBox("Export tile footprints layer (tile index)")
+        self._footprints_check.setChecked(True)
+        self._footprints_check.setToolTip(
+            "Export non-overlapping tile polygon footprints with metadata attributes "
+            "for QGIS and ESRI ArcGIS (ArcMap / ArcGIS Pro)."
+        )
+        out_form.addRow(self._footprints_check)
+
+        fp_format_row = QHBoxLayout()
+        self._footprint_format_combo = QComboBox()
+        self._footprint_format_combo.addItems([
+            "Both Shapefile & GeoPackage",
+            "ESRI Shapefile (.shp)",
+            "GeoPackage (.gpkg)",
+            "GeoJSON (.geojson)",
+        ])
+        self._footprint_format_combo.setCurrentIndex(0)
+        self._footprint_format_combo.setToolTip("Select vector format for QGIS and ESRI ArcGIS / ArcMap / ArcGIS Pro.")
+        fp_format_row.addWidget(QLabel("Vector format:"))
+        fp_format_row.addWidget(self._footprint_format_combo)
+        fp_format_row.addStretch()
+        out_form.addRow("", fp_format_row)
+
+        self._footprints_check.toggled.connect(self._footprint_format_combo.setEnabled)
+
         # Merged vs tiled
         self._merged_check = QCheckBox("Export as single merged raster (instead of per-tile)")
         self._merged_check.setChecked(False)
@@ -301,6 +340,16 @@ class ExportDialog(QDialog):
             QMessageBox.warning(self, "Missing Directory", "Please select an output directory.")
             return
 
+        fmt_text = self._footprint_format_combo.currentText()
+        if "Both" in fmt_text:
+            fp_fmt = "both"
+        elif "Shapefile" in fmt_text:
+            fp_fmt = "shp"
+        elif "GeoPackage" in fmt_text:
+            fp_fmt = "gpkg"
+        else:
+            fp_fmt = "geojson"
+
         # Build config
         config = ExportConfig(
             mode="dtm" if self._dtm_radio.isChecked() else "dsm",
@@ -311,6 +360,11 @@ class ExportDialog(QDialog):
             crs_epsg=self._crs_epsg,
             crs_wkt=self._crs_wkt,
             fill_dsm_voids=self._fill_voids_check.isChecked(),
+            clip_overlap=self._clip_check.isChecked(),
+            overlap_m=self._overlap_m,
+            tile_size_m=self._tile_size_m,
+            export_footprints=self._footprints_check.isChecked(),
+            footprint_format=fp_fmt,
         )
 
         if config.mode == "dsm":
@@ -377,8 +431,155 @@ class ExportDialog(QDialog):
         self._dsm_class_group.setEnabled(enabled and self._dsm_radio.isChecked())
         self._fill_voids_check.setEnabled(enabled and self._dsm_radio.isChecked())
         self._hillshade_check.setEnabled(enabled)
+        self._clip_check.setEnabled(enabled)
+        self._footprints_check.setEnabled(enabled)
+        self._footprint_format_combo.setEnabled(enabled and self._footprints_check.isChecked())
         self._merged_check.setEnabled(enabled)
         self._button_box.button(QDialogButtonBox.Ok).setEnabled(enabled)
+
+
+# ── Standalone Tile Footprints Vector Export Dialog ─────────────────────
+
+class ExportTileFootprintsDialog(QDialog):
+    """
+    Dialog for exporting non-overlapping tile footprint polygons as ESRI Shapefile,
+    GeoPackage, or GeoJSON for QGIS and ESRI ArcGIS.
+    """
+
+    def __init__(
+        self,
+        jobs: List[dict],
+        global_bbox: Tuple[float, float, float, float],
+        default_output_dir: str,
+        overlap_m: float = 0.0,
+        tile_size_m: Optional[float] = None,
+        crs_epsg: Optional[int] = None,
+        crs_wkt: Optional[str] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._jobs = list(jobs)
+        self._global_bbox = global_bbox
+        self._default_output_dir = default_output_dir
+        self._overlap_m = float(overlap_m)
+        self._tile_size_m = float(tile_size_m) if tile_size_m is not None else None
+        self._crs_epsg = crs_epsg
+        self._crs_wkt = crs_wkt
+        self.written_files: List[str] = []
+
+        self.setWindowTitle("Export Tile Footprints (Shapefile / GeoPackage)")
+        self.setMinimumWidth(460)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+
+        # Output directory
+        dir_row = QHBoxLayout()
+        self._out_dir_label = QLabel(self._default_output_dir)
+        self._out_dir_label.setWordWrap(True)
+        dir_row.addWidget(self._out_dir_label, 1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._browse_dir)
+        dir_row.addWidget(browse_btn)
+        form.addRow("Directory:", dir_row)
+
+        # File stem
+        from PySide6.QtWidgets import QLineEdit
+        self._stem_edit = QLineEdit("tile_footprints")
+        form.addRow("Layer name:", self._stem_edit)
+
+        # Format
+        self._format_combo = QComboBox()
+        self._format_combo.addItems([
+            "Both Shapefile & GeoPackage",
+            "ESRI Shapefile (.shp)",
+            "GeoPackage (.gpkg)",
+            "GeoJSON (.geojson)",
+        ])
+        self._format_combo.setCurrentIndex(0)
+        form.addRow("Format:", self._format_combo)
+
+        # Clip overlap
+        self._clip_check = QCheckBox("Clip overlap to non-overlapping tile boundary")
+        self._clip_check.setChecked(True)
+        self._clip_check.setToolTip(
+            "Trims overlapping tile buffers so adjacent tile footprints touch cleanly with zero overlap."
+        )
+        form.addRow(self._clip_check)
+
+        layout.addLayout(form)
+
+        # Buttons
+        self._button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self._button_box.accepted.connect(self._on_export)
+        self._button_box.rejected.connect(self.reject)
+        layout.addWidget(self._button_box)
+
+    def _browse_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Output Directory", self._out_dir_label.text())
+        if d:
+            self._out_dir_label.setText(d)
+
+    def _on_export(self) -> None:
+        from ..export_manager import compute_core_bbox, export_tile_footprints
+
+        out_dir = self._out_dir_label.text()
+        if not out_dir:
+            QMessageBox.warning(self, "Missing Directory", "Please select an output directory.")
+            return
+
+        stem = self._stem_edit.text().strip() or "tile_footprints"
+        fmt_text = self._format_combo.currentText()
+        if "Both" in fmt_text:
+            fp_fmt = "both"
+        elif "Shapefile" in fmt_text:
+            fp_fmt = "shp"
+        elif "GeoPackage" in fmt_text:
+            fp_fmt = "gpkg"
+        else:
+            fp_fmt = "geojson"
+
+        clip_ov = self._clip_check.isChecked()
+
+        # Build tile records
+        records = []
+        for job in self._jobs:
+            raw_b = tuple(job["bbox"])
+            if clip_ov and self._overlap_m > 0:
+                core_b = compute_core_bbox(raw_b, self._global_bbox, self._overlap_m, tile_size_m=self._tile_size_m)
+            else:
+                core_b = raw_b
+            records.append({
+                "tile_id": job["tile_id"],
+                "bbox": core_b,
+                "las_file": Path(job.get("las_path", "")).name,
+                "epsg": self._crs_epsg,
+            })
+
+        try:
+            files = export_tile_footprints(
+                records,
+                output_dir=out_dir,
+                stem=stem,
+                formats=fp_fmt,
+                crs_epsg=self._crs_epsg,
+                crs_wkt=self._crs_wkt,
+            )
+            self.written_files = [str(f) for f in files]
+            QMessageBox.information(
+                self,
+                "Export Complete",
+                f"Exported tile footprint layer to:\n{out_dir}\n\n"
+                + "\n".join(Path(f).name for f in self.written_files)
+            )
+            self.accept()
+        except Exception as exc:
+            logger.exception("Tile footprint export failed")
+            QMessageBox.critical(self, "Export Error", str(exc))
+
 
 
 # ── LAS Export ──────────────────────────────────────────────────────────

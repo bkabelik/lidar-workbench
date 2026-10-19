@@ -94,6 +94,7 @@ class TileListWidget(QWidget):
     classify_requested = Signal(list)
     export_requested = Signal(list)
     export_las_requested = Signal(list)
+    export_footprints_requested = Signal(list)
     delete_requested = Signal(list)
     qc_status_changed = Signal(list, str, str)  # tile_ids, qc_status, qc_comment
 
@@ -466,6 +467,9 @@ class TileListWidget(QWidget):
 
             export_las_action = menu.addAction("Export LAS…")
             export_las_action.triggered.connect(lambda: self.export_las_requested.emit(selected))
+
+            export_footprints_action = menu.addAction("Export Tile Footprints (Shapefile / GeoPackage)…")
+            export_footprints_action.triggered.connect(lambda: self.export_footprints_requested.emit(selected))
 
             menu.addSeparator()
 

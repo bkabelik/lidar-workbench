@@ -17,6 +17,7 @@ if _app_root not in sys.path:
 from export_manager import (
     RasterGrid,
     ExportConfig,
+    compute_hillshade,
     _write_ascii_grid,
     _write_geotiff,
     compute_core_bbox,
@@ -327,6 +328,281 @@ class TestRasterAndLasExport(unittest.TestCase):
                 self.assertEqual(len(d.x), 2)
                 self.assertTrue(np.all(d.classification == 2))
 
+    def test_adjacent_tiles_neighbor_buffering_dtm_seamless(self):
+        """Test that adjacent tiles rasterized with neighbor buffering produce a continuous DTM."""
+        import laspy
+        from export_manager import _attach_neighbor_paths, _rasterize_tile_job, ExportConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p_west = Path(tmpdir) / "tile_0001.las"
+            p_east = Path(tmpdir) / "tile_0002.las"
+
+            # Create synthetic sloping terrain: z = 100.0 + 0.5 * x + 0.2 * y
+            # West tile: bbox [0, 0, 50, 50]. Points stop at x=48.5 (1.5m gap before border at 50)
+            # East tile: bbox [50, 0, 100, 50]. Points start at x=51.5 (1.5m gap after border at 50)
+            def make_las(path, x_range, y_range):
+                xs_grid, ys_grid = np.meshgrid(x_range, y_range)
+                xs = xs_grid.ravel()
+                ys = ys_grid.ravel()
+                zs = 100.0 + 0.5 * xs + 0.2 * ys
+                hdr = laspy.LasHeader(point_format=3, version="1.2")
+                hdr.offsets = [0.0, 0.0, 0.0]
+                hdr.scales = [0.01, 0.01, 0.01]
+                las = laspy.LasData(hdr)
+                las.x = xs
+                las.y = ys
+                las.z = zs
+                las.classification = np.full(len(xs), 2, dtype=np.uint8)
+                las.write(str(path))
+
+            make_las(p_west, np.linspace(1.0, 48.5, 30), np.linspace(1.0, 49.0, 30))
+            make_las(p_east, np.linspace(51.5, 99.0, 30), np.linspace(1.0, 49.0, 30))
+
+            jobs = [
+                {"tile_id": "tile_0001", "las_path": str(p_west), "bbox": (0.0, 0.0, 50.0, 50.0)},
+                {"tile_id": "tile_0002", "las_path": str(p_east), "bbox": (50.0, 0.0, 100.0, 50.0)},
+            ]
+            global_bbox = (0.0, 100.0, 0.0, 50.0)
+            config = ExportConfig(output_dir=tmpdir, resolution=1.0, mode="dtm")
+
+            # Attach neighbor paths
+            buffered_jobs = _attach_neighbor_paths(jobs, buffer_m=15.0)
+            self.assertEqual(len(buffered_jobs[0]["neighbor_las_paths"]), 1)
+            self.assertEqual(len(buffered_jobs[1]["neighbor_las_paths"]), 1)
+
+            # Rasterize both tiles
+            res_west = _rasterize_tile_job(buffered_jobs[0], global_bbox, config)
+            res_east = _rasterize_tile_job(buffered_jobs[1], global_bbox, config)
+
+            west_data = res_west["data"]  # shape (50, 50), row 0 is South, col 0 is West
+            east_data = res_east["data"]
+
+            # Border is between col -1 of west (x = 49.5) and col 0 of east (x = 50.5)
+            # Distance is dx = 1.0 m, slope is dz/dx = 0.5.
+            # Expected step across border = 0.5 * 1.0 = 0.5 m
+            step = east_data[:, 0] - west_data[:, -1]
+            # Verify across middle rows (away from outer boundaries) that elevation step is ~0.5m
+            mid_slice = slice(5, 45)
+            self.assertTrue(np.allclose(step[mid_slice], 0.5, atol=0.05),
+                            f"Elevation step across border should be ~0.5m, got: {step[mid_slice]}")
+
+    def test_export_tile_footprints_shp_and_gpkg(self):
+        """Test that export_tile_footprints produces valid Shapefile and GeoPackage with QGIS style."""
+        import shapefile
+        import sqlite3
+        from export_manager import export_tile_footprints
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            records = [
+                {
+                    "tile_id": "tile_0001",
+                    "bbox": (100.0, 200.0, 300.0, 400.0),
+                    "dtm_file": "tile_0001_dtm.asc",
+                    "dsm_file": "",
+                    "hs_file": "tile_0001_dtm_hillshade.tif",
+                    "las_file": "tile_0001.las",
+                    "cellsize": 1.0,
+                    "epsg": 25833,
+                },
+                {
+                    "tile_id": "tile_0002",
+                    "bbox": (300.0, 200.0, 500.0, 400.0),
+                    "dtm_file": "tile_0002_dtm.asc",
+                    "dsm_file": "",
+                    "hs_file": "tile_0002_dtm_hillshade.tif",
+                    "las_file": "tile_0002.las",
+                    "cellsize": 1.0,
+                    "epsg": 25833,
+                },
+            ]
+            wkt_25833 = 'PROJCS["ETRS89 / UTM zone 33N",GEOGCS["ETRS89"]]'
+            files = export_tile_footprints(
+                records,
+                output_dir=tmpdir,
+                stem="tile_grid",
+                formats="both",
+                crs_epsg=25833,
+                crs_wkt=wkt_25833,
+            )
+            file_names = [Path(f).name for f in files]
+
+            # 1. Shapefile verification
+            self.assertIn("tile_grid.shp", file_names)
+            self.assertIn("tile_grid.dbf", file_names)
+            self.assertIn("tile_grid.shx", file_names)
+            self.assertIn("tile_grid.prj", file_names)
+            self.assertIn("tile_grid.qml", file_names)
+
+            sf = shapefile.Reader(str(Path(tmpdir) / "tile_grid.shp"))
+            self.assertEqual(len(sf.shapes()), 2)
+            self.assertEqual(sf.shapes()[0].shapeType, shapefile.POLYGON)
+            rec0 = sf.record(0)
+            self.assertEqual(rec0["tile_id"], "tile_0001")
+            self.assertAlmostEqual(rec0["width_m"], 200.0)
+
+            # Check that adjacent tiles touch with NO OVERLAP
+            # tile 1 max_x == tile 2 min_x == 300.0
+            self.assertAlmostEqual(rec0["max_x"], 300.0)
+            rec1 = sf.record(1)
+            self.assertEqual(rec1["tile_id"], "tile_0002")
+            self.assertAlmostEqual(rec1["min_x"], 300.0)
+
+            # 2. GeoPackage verification
+            self.assertIn("tile_grid.gpkg", file_names)
+            gpkg_path = Path(tmpdir) / "tile_grid.gpkg"
+            conn = sqlite3.connect(str(gpkg_path))
+            cur = conn.cursor()
+            cur.execute("SELECT tile_id, min_x, max_x FROM tile_footprints ORDER BY tile_id")
+            rows = cur.fetchall()
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0][0], "tile_0001")
+            self.assertAlmostEqual(rows[0][2], 300.0)
+            self.assertEqual(rows[1][0], "tile_0002")
+            self.assertAlmostEqual(rows[1][1], 300.0)
+            conn.close()
+
+    def test_dtm_parallel_export_with_footprints_and_no_overlap(self):
+        """Test that export_dtm_parallel clips overlapping tiles and creates non-overlapping footprints."""
+        import laspy
+        from export_manager import export_dtm_parallel, ExportConfig
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p_west = Path(tmpdir) / "tile_0001.las"
+            p_east = Path(tmpdir) / "tile_0002.las"
+
+            # Create two overlapping tiles: stride=190m, overlap=10m (each tile is 200m wide)
+            # West tile: [0, 0, 200, 200]
+            # East tile: [190, 0, 390, 200]
+            def make_las(path, x_min, x_max):
+                xs_grid, ys_grid = np.meshgrid(np.linspace(x_min + 1, x_max - 1, 20), np.linspace(1, 199, 20))
+                xs = xs_grid.ravel()
+                ys = ys_grid.ravel()
+                zs = 100.0 + 0.1 * xs
+                hdr = laspy.LasHeader(point_format=3, version="1.2")
+                hdr.offsets = [0.0, 0.0, 0.0]
+                hdr.scales = [0.01, 0.01, 0.01]
+                las = laspy.LasData(hdr)
+                las.x = xs
+                las.y = ys
+                las.z = zs
+                las.classification = np.full(len(xs), 2, dtype=np.uint8)
+                las.write(str(path))
+
+            make_las(p_west, 0.0, 200.0)
+            make_las(p_east, 190.0, 390.0)
+
+            jobs = [
+                {"tile_id": "tile_0001", "las_path": str(p_west), "bbox": (0.0, 0.0, 200.0, 200.0)},
+                {"tile_id": "tile_0002", "las_path": str(p_east), "bbox": (190.0, 0.0, 390.0, 200.0)},
+            ]
+            global_bbox = (0.0, 390.0, 0.0, 200.0)
+            config = ExportConfig(
+                output_dir=str(Path(tmpdir) / "out"),
+                resolution=1.0,
+                mode="dtm",
+                compute_hillshade=True,
+                clip_overlap=True,
+                overlap_m=10.0,
+                tile_size_m=200.0,
+                export_footprints=True,
+                footprint_format="both",
+                crs_epsg=25833,
+            )
+
+            written = export_dtm_parallel(jobs, global_bbox, config, workers=1)
+            file_names = [p.name for p in written]
+
+            # Rasters and hillshades created
+            self.assertIn("tile_0001_dtm.asc", file_names)
+            self.assertIn("tile_0002_dtm.asc", file_names)
+            self.assertIn("tile_0001_dtm_hillshade.tif", file_names)
+            self.assertIn("tile_0002_dtm_hillshade.tif", file_names)
+
+            # Footprint vector files created
+            self.assertIn("tile_footprints_dtm.shp", file_names)
+            self.assertIn("tile_footprints_dtm.gpkg", file_names)
+
+            # Read West and East DTM grids and verify NO overlap
+            asc_west = Path(tmpdir) / "out" / "tile_0001_dtm.asc"
+            asc_east = Path(tmpdir) / "out" / "tile_0002_dtm.asc"
+            lines_w = asc_west.read_text().splitlines()[:6]
+            lines_e = asc_east.read_text().splitlines()[:6]
+
+            def parse_header(lines):
+                return {l.split()[0].lower(): float(l.split()[1]) for l in lines}
+
+            hw = parse_header(lines_w)
+            he = parse_header(lines_e)
+
+            # West tile: xllcorner=0, ncols=195 (trimmed 5m on east border: 200 - 5 = 195)
+            # East tile: xllcorner=195, ncols=195 (trimmed 5m on west border: 190 + 5 = 195)
+            self.assertAlmostEqual(hw["xllcorner"], 0.0)
+            self.assertAlmostEqual(hw["ncols"], 195.0)
+            self.assertAlmostEqual(he["xllcorner"], 195.0)
+            self.assertAlmostEqual(he["ncols"], 195.0)
+
+            # They meet EXACTLY at x = 195.0 with ZERO overlap!
+            self.assertAlmostEqual(hw["xllcorner"] + hw["ncols"] * hw["cellsize"], he["xllcorner"])
+
+    def test_hillshade_relief_orientation_and_no_inversion(self):
+        """
+        Verify that compute_hillshade applies correct Horn/GIS illumination so that
+        depressions (such as river beds and valleys) are not inverted into ridges.
+        """
+        # 1. East-West River Trench
+        # South to North (rows 0 to 4):
+        # row 0: 10m (high ground south)
+        # row 1: 8m  (south bank sloping down to north)
+        # row 2: 0m  (river bed)
+        # row 3: 8m  (north bank sloping down to south)
+        # row 4: 10m (high ground north)
+        ew_data = np.array([
+            [10.0, 10.0, 10.0, 10.0, 10.0],
+            [ 8.0,  8.0,  8.0,  8.0,  8.0],
+            [ 0.0,  0.0,  0.0,  0.0,  0.0],
+            [ 8.0,  8.0,  8.0,  8.0,  8.0],
+            [10.0, 10.0, 10.0, 10.0, 10.0],
+        ], dtype=float)
+
+        grid_ew = RasterGrid(data=ew_data, xllcorner=0.0, yllcorner=0.0, cellsize=1.0, nodata=-9999.0)
+        hs_ew = compute_hillshade(grid_ew, azimuth=315.0, altitude=45.0)
+
+        # In standard GeoTIFF image orientation (row 0 = North, row 4 = South):
+        img_ew = np.flipud(hs_ew.data)
+        north_bank_val = img_ew[1, 2]  # Upper bank (facing south into river)
+        south_bank_val = img_ew[3, 2]  # Lower bank (facing north into river)
+
+        # Under NW lighting (azimuth 315):
+        # North bank slopes away from the NW light -> in shadow (dark)
+        # South bank faces toward the NW light -> illuminated (bright)
+        self.assertLess(north_bank_val, south_bank_val,
+                        f"North bank ({north_bank_val}) should be darker than South bank ({south_bank_val})")
+
+        # 2. North-South River Trench
+        # West to East (cols 0 to 4):
+        ns_data = np.array([
+            [10.0, 8.0, 0.0, 8.0, 10.0],
+            [10.0, 8.0, 0.0, 8.0, 10.0],
+            [10.0, 8.0, 0.0, 8.0, 10.0],
+            [10.0, 8.0, 0.0, 8.0, 10.0],
+            [10.0, 8.0, 0.0, 8.0, 10.0],
+        ], dtype=float)
+
+        grid_ns = RasterGrid(data=ns_data, xllcorner=0.0, yllcorner=0.0, cellsize=1.0, nodata=-9999.0)
+        hs_ns = compute_hillshade(grid_ns, azimuth=315.0, altitude=45.0)
+
+        img_ns = np.flipud(hs_ns.data)
+        west_bank_val = img_ns[2, 1]  # West bank (facing east into river)
+        east_bank_val = img_ns[2, 3]  # East bank (facing west into river)
+
+        # Under NW lighting:
+        # West bank faces east (away from light) -> in shadow (dark)
+        # East bank faces west (towards light) -> illuminated (bright)
+        self.assertLess(west_bank_val, east_bank_val,
+                        f"West bank ({west_bank_val}) should be darker than East bank ({east_bank_val})")
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
