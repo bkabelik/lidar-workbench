@@ -46,7 +46,7 @@ from ..manual_edit import ManualEditor
 from ..project_manager import ProjectManager
 from ..tile_manager import TileManager
 from .classification_dialog import ClassificationDialog
-from .export_dialog import ExportDialog
+from .export_dialog import ExportDialog, ExportLasDialog, _ExportLasWorker
 from .filter_dialog import FilterDialog
 from .ground_control_dialog import GroundControlDialog
 from .multi_view_widget import MultiViewWidget
@@ -57,64 +57,6 @@ from .settings_dialog import SettingsDialog, load_shortcuts
 from .tile_list_widget import TileListWidget
 
 logger = logging.getLogger("lidar_workbench.gui.main_window")
-
-
-class _ExportLasWorker(QThread):
-    """Background worker that clips tiles to their core and writes LAS files.
-
-    Tiles are processed in parallel via :class:`ProcessPoolExecutor` so
-    several large LAS files can be read/written concurrently.
-    """
-
-    progress = Signal(int, int)          # done, total
-    tile_done = Signal(str, str)         # tile_id, written path
-    finished_all = Signal(int)           # number of exported tiles
-    error = Signal(str)
-
-    def __init__(self, jobs: list, output_dir: str, global_bbox: tuple,
-                 overlap_m: float, workers: int = 4, parent=None):
-        super().__init__(parent)
-        self._jobs = list(jobs)
-        self._output_dir = output_dir
-        self._global_bbox = tuple(global_bbox)
-        self._overlap_m = float(overlap_m)
-        self._workers = max(1, int(workers))
-
-    def run(self) -> None:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-
-        from ..export_manager import export_las_tile
-
-        total = len(self._jobs)
-        if total == 0:
-            self.finished_all.emit(0)
-            return
-
-        done = 0
-        try:
-            with ProcessPoolExecutor(max_workers=min(self._workers, total)) as pool:
-                futures = {
-                    pool.submit(
-                        export_las_tile,
-                        job, self._output_dir, self._global_bbox, self._overlap_m,
-                    ): job
-                    for job in self._jobs
-                }
-                for fut in as_completed(futures):
-                    job = futures[fut]
-                    try:
-                        path = fut.result()
-                        if path:
-                            self.tile_done.emit(job["tile_id"], path)
-                    except Exception as exc:
-                        logger.exception("LAS export failed for %s", job["tile_id"])
-                        self.error.emit(f"{job['tile_id']}: {exc}")
-                    done += 1
-                    self.progress.emit(done, total)
-            self.finished_all.emit(done)
-        except Exception as exc:
-            logger.exception("LAS export failed")
-            self.error.emit(str(exc))
 
 
 class MainWindow(QMainWindow):
@@ -472,6 +414,7 @@ class MainWindow(QMainWindow):
         self._tile_list_widget.filter_requested.connect(self._on_tiles_filter)
         self._tile_list_widget.classify_requested.connect(self._on_tiles_classify)
         self._tile_list_widget.export_requested.connect(self._on_tiles_export)
+        self._tile_list_widget.export_las_requested.connect(self._on_tiles_export_las)
         self._tile_list_widget.delete_requested.connect(self._on_tiles_delete)
         self._tile_list_widget.qc_status_changed.connect(self._on_qc_status_changed_batch)
         splitter.addWidget(self._tile_list_widget)
@@ -1982,11 +1925,24 @@ class MainWindow(QMainWindow):
 
         output_dir = str(self._pm.dtm_dir) if self._pm.dtm_dir else "."
 
+        crs_info = self._db.get_project_crs() if self._db else None
+        crs_epsg = crs_info.get("epsg") if crs_info else None
+        crs_wkt = crs_info.get("wkt") if crs_info else None
+        if not crs_epsg and self._pm.is_open:
+            meta_cs = self._pm.metadata.get("coordinate_system")
+            if isinstance(meta_cs, dict):
+                crs_epsg = meta_cs.get("epsg")
+                crs_wkt = crs_wkt or meta_cs.get("wkt")
+            elif isinstance(meta_cs, int):
+                crs_epsg = meta_cs
+
         dialog = ExportDialog(
             jobs,
             global_bbox,
             output_dir,
             workers=workers,
+            crs_epsg=crs_epsg,
+            crs_wkt=crs_wkt,
             parent=self,
         )
         if dialog.exec() == QDialog.Accepted:
@@ -1997,9 +1953,16 @@ class MainWindow(QMainWindow):
         else:
             self.set_status("Export cancelled", timeout=3000)
 
-    def _on_export_las(self) -> None:
+    def _on_tiles_export_las(self, tile_ids: List[str]) -> None:
+        """Handler for 'Export LAS…' requested from tile list context menu."""
+        self._on_export_las(tile_ids=tile_ids)
+
+    def _on_export_las(self, tile_ids: Optional[List[str]] = None) -> None:
         """Export selected tiles as LAS files cut to their non-overlapping core."""
-        selected = self._tile_list_widget.get_selected_tile_ids()
+        if tile_ids is not None:
+            selected = list(tile_ids)
+        else:
+            selected = self._tile_list_widget.get_selected_tile_ids()
         if not selected:
             QMessageBox.information(
                 self, "No Tiles Selected",
@@ -2044,58 +2007,27 @@ class MainWindow(QMainWindow):
             max(b[3] for b in tile_bboxes.values()),
         )
         overlap_m = float(self._pm.metadata.get("tile_overlap_m", 0.0) or 0.0)
+        tile_size_m = float(self._pm.metadata.get("tile_size_m", 200.0) or 200.0)
 
         default_dir = str(self._pm.project_root / "tiles_core") if self._pm.project_root else "."
-        output_dir = QFileDialog.getExistingDirectory(
-            self, "Export LAS (Cut Tiles) — Output Directory", default_dir
-        )
-        if not output_dir:
-            return
 
         from .settings_dialog import load_general_settings
         settings = load_general_settings()
         workers = int(settings.get("las_export_workers", settings.get("ground_workers", 4)))
 
-        from PySide6.QtWidgets import QProgressDialog
-        self._las_export_progress = QProgressDialog(
-            f"Exporting {len(jobs)} LAS tile(s) with {workers} worker(s)…",
-            "", 0, len(jobs), self,
+        dialog = ExportLasDialog(
+            jobs,
+            global_bbox,
+            default_dir,
+            overlap_m=overlap_m,
+            tile_size_m=tile_size_m,
+            workers=workers,
+            parent=self,
         )
-        self._las_export_progress.setWindowModality(Qt.WindowModal)
-        self._las_export_progress.setMinimumDuration(400)
-        self._las_export_progress.setValue(0)
-
-        self._las_export_worker = _ExportLasWorker(
-            jobs, output_dir, global_bbox, overlap_m, workers=workers, parent=self,
-        )
-        self._las_export_worker.progress.connect(self._on_las_export_progress)
-        self._las_export_worker.tile_done.connect(self._on_las_export_tile_done)
-        self._las_export_worker.finished_all.connect(self._on_las_export_finished)
-        self._las_export_worker.error.connect(self._on_las_export_error)
-        self._las_export_worker.start()
-
-    def _on_las_export_progress(self, done: int, total: int) -> None:
-        if hasattr(self, "_las_export_progress"):
-            self._las_export_progress.setLabelText(f"Exported {done}/{total} tiles…")
-            self._las_export_progress.setValue(done)
-
-    def _on_las_export_tile_done(self, tile_id: str, path: str) -> None:
-        self.set_status(f"Exported {tile_id} → {Path(path).name}", timeout=5000)
-
-    def _on_las_export_finished(self, n: int) -> None:
-        if hasattr(self, "_las_export_progress"):
-            self._las_export_progress.close()
-        self.set_status(f"LAS export done — {n} tile(s)", timeout=8000)
-        QMessageBox.information(
-            self, "LAS Export Complete",
-            f"Exported {n} tile(s) to the selected output directory."
-        )
-
-    def _on_las_export_error(self, msg: str) -> None:
-        logger.error("LAS export error: %s", msg)
-        QMessageBox.warning(self, "LAS Export Error", msg)
-        if hasattr(self, "_las_export_progress"):
-            self._las_export_progress.close()
+        if dialog.exec() == QDialog.Accepted:
+            self.set_status(f"Exported {dialog.exported_count} LAS tile(s)", timeout=8000)
+        else:
+            self.set_status("LAS export cancelled", timeout=3000)
 
     def _on_settings(self) -> None:
         dialog = SettingsDialog(self)

@@ -43,6 +43,7 @@ logger = logging.getLogger("lidar_workbench.gui.export_dialog")
 
 # ── common ASPRS classes the user is likely to select for DSM ───────────
 DSM_CLASS_OPTIONS: List[Tuple[int, str]] = [
+    (1, "Unassigned"),
     (2, "Ground"),
     (3, "Low Vegetation"),
     (4, "Medium Vegetation"),
@@ -54,6 +55,7 @@ DSM_CLASS_OPTIONS: List[Tuple[int, str]] = [
     (11, "Road Surface"),
     (15, "Transmission Tower"),
     (17, "Bridge Deck"),
+    (20, "Ignored Ground"),
 ]
 
 
@@ -133,6 +135,8 @@ class ExportDialog(QDialog):
         global_bbox: Tuple[float, float, float, float],
         default_output_dir: str,
         workers: int = 4,
+        crs_epsg: Optional[int] = None,
+        crs_wkt: Optional[str] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -140,6 +144,8 @@ class ExportDialog(QDialog):
         self._global_bbox = global_bbox
         self._default_output_dir = default_output_dir
         self._workers = max(1, int(workers))
+        self._crs_epsg = crs_epsg
+        self._crs_wkt = crs_wkt
         self._worker: Optional[_ExportWorker] = None
         self.written_files: List[str] = []
 
@@ -192,8 +198,8 @@ class ExportDialog(QDialog):
         self._dsm_class_checks: Dict[int, QCheckBox] = {}
         for code, name in DSM_CLASS_OPTIONS:
             cb = QCheckBox(f"Class {code} — {name}")
-            # Default: include vegetation & buildings
-            cb.setChecked(code in {2, 3, 4, 5, 6})
+            # Default: include surface points, structures, bridge decks, roads, and water
+            cb.setChecked(code in {1, 2, 3, 4, 5, 6, 9, 10, 11, 17, 20})
             self._dsm_class_checks[code] = cb
             dsm_layout.addWidget(cb)
 
@@ -207,6 +213,15 @@ class ExportDialog(QDialog):
         btn_row.addWidget(none_btn)
         btn_row.addStretch()
         dsm_layout.addLayout(btn_row)
+
+        # Void filling option
+        self._fill_voids_check = QCheckBox("Fill voids / holes (interpolate over water, bridges, and data gaps)")
+        self._fill_voids_check.setChecked(True)
+        self._fill_voids_check.setToolTip(
+            "When checked, missing data areas like unreflected water bodies (lakes, rivers) and "
+            "data gaps are smoothly interpolated at the water surface or surrounding terrain level."
+        )
+        dsm_layout.addWidget(self._fill_voids_check)
 
         layout.addWidget(self._dsm_class_group)
 
@@ -293,6 +308,9 @@ class ExportDialog(QDialog):
             tile_ids=[job["tile_id"] for job in self._jobs],
             output_dir=out_dir,
             compute_hillshade=self._hillshade_check.isChecked(),
+            crs_epsg=self._crs_epsg,
+            crs_wkt=self._crs_wkt,
+            fill_dsm_voids=self._fill_voids_check.isChecked(),
         )
 
         if config.mode == "dsm":
@@ -357,6 +375,249 @@ class ExportDialog(QDialog):
         self._dsm_radio.setEnabled(enabled)
         self._res_spin.setEnabled(enabled)
         self._dsm_class_group.setEnabled(enabled and self._dsm_radio.isChecked())
+        self._fill_voids_check.setEnabled(enabled and self._dsm_radio.isChecked())
         self._hillshade_check.setEnabled(enabled)
         self._merged_check.setEnabled(enabled)
         self._button_box.button(QDialogButtonBox.Ok).setEnabled(enabled)
+
+
+# ── LAS Export ──────────────────────────────────────────────────────────
+
+class _ExportLasWorker(QThread):
+    """Background worker for exporting LAS tiles."""
+
+    progress = Signal(int, int)          # done, total
+    tile_done = Signal(str, str)         # tile_id, written path
+    finished_all = Signal(int)           # number of exported tiles
+    error = Signal(str)
+
+    def __init__(
+        self,
+        jobs: list,
+        output_dir: str,
+        global_bbox: tuple,
+        overlap_m: float,
+        tile_size_m: float = 200.0,
+        classes: Optional[Set[int]] = None,
+        clip_overlap: bool = True,
+        workers: int = 4,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._jobs = list(jobs)
+        self._output_dir = output_dir
+        self._global_bbox = tuple(global_bbox)
+        self._overlap_m = float(overlap_m)
+        self._tile_size_m = float(tile_size_m)
+        self._classes = set(classes) if classes is not None else None
+        self._clip_overlap = bool(clip_overlap)
+        self._workers = max(1, int(workers))
+
+    def run(self) -> None:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from ..export_manager import export_las_tile
+
+        total = len(self._jobs)
+        if total == 0:
+            self.finished_all.emit(0)
+            return
+
+        done = 0
+        try:
+            with ProcessPoolExecutor(max_workers=min(self._workers, total)) as pool:
+                futures = {
+                    pool.submit(
+                        export_las_tile,
+                        job,
+                        self._output_dir,
+                        self._global_bbox,
+                        self._overlap_m,
+                        self._tile_size_m,
+                        classes=self._classes,
+                        clip_overlap=self._clip_overlap,
+                    ): job
+                    for job in self._jobs
+                }
+                for fut in as_completed(futures):
+                    job = futures[fut]
+                    try:
+                        path = fut.result()
+                        if path:
+                            self.tile_done.emit(job["tile_id"], path)
+                    except Exception as exc:
+                        logger.exception("LAS export failed for %s", job["tile_id"])
+                        self.error.emit(f"{job['tile_id']}: {exc}")
+                    done += 1
+                    self.progress.emit(done, total)
+            self.finished_all.emit(done)
+        except Exception as exc:
+            logger.exception("LAS export failed")
+            self.error.emit(str(exc))
+
+
+class ExportLasDialog(QDialog):
+    """
+    Dialog for exporting LAS tiles with user-selected classes, clean naming,
+    and optional overlap trimming.
+    """
+
+    def __init__(
+        self,
+        jobs: List[dict],
+        global_bbox: Tuple[float, float, float, float],
+        default_output_dir: str,
+        overlap_m: float = 0.0,
+        tile_size_m: float = 200.0,
+        workers: int = 4,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._jobs = list(jobs)
+        self._global_bbox = global_bbox
+        self._default_output_dir = default_output_dir
+        self._overlap_m = float(overlap_m)
+        self._tile_size_m = float(tile_size_m)
+        self._workers = max(1, int(workers))
+        self._worker: Optional[_ExportLasWorker] = None
+        self.exported_count: int = 0
+        self.written_files: List[str] = []
+
+        self.setWindowTitle("Export LAS Tiles")
+        self.setMinimumWidth(480)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        layout = QVBoxLayout(self)
+
+        info = QLabel(f"Export <b>{len(self._jobs)}</b> selected tile(s) to LAS format.")
+        layout.addWidget(info)
+
+        # ── Classes to export ─────────────────────────────────────────
+        class_group = QGroupBox("Points to Export")
+        class_layout = QVBoxLayout(class_group)
+
+        self._all_points_radio = QRadioButton("All points (entire point cloud → {tile_id}.las)")
+        self._ground_only_radio = QRadioButton("Ground points only (Class 2 → {tile_id}_ground.las)")
+        self._all_points_radio.setChecked(True)
+        class_layout.addWidget(self._all_points_radio)
+        class_layout.addWidget(self._ground_only_radio)
+        layout.addWidget(class_group)
+
+        # ── Overlap margins ───────────────────────────────────────────
+        ov_group = QGroupBox("Tile Boundaries")
+        ov_layout = QVBoxLayout(ov_group)
+
+        self._clip_overlap_check = QCheckBox("Cut tile overlap margins (non-overlapping core boundaries)")
+        self._clip_overlap_check.setChecked(True)
+        self._clip_overlap_check.setToolTip(
+            "When checked, any overlapping buffer margins between tiles are clipped so adjacent "
+            "exported tiles fit together seamlessly without duplicate points."
+        )
+        ov_layout.addWidget(self._clip_overlap_check)
+        layout.addWidget(ov_group)
+
+        # ── Output directory ──────────────────────────────────────────
+        out_group = QGroupBox("Output")
+        out_form = QFormLayout(out_group)
+
+        dir_row = QHBoxLayout()
+        self._out_dir_label = QLabel(self._default_output_dir)
+        self._out_dir_label.setWordWrap(True)
+        dir_row.addWidget(self._out_dir_label, 1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._browse_output_dir)
+        dir_row.addWidget(browse_btn)
+        out_form.addRow("Directory:", dir_row)
+
+        self._workers_spin = QDoubleSpinBox()
+        self._workers_spin.setRange(1, 32)
+        self._workers_spin.setDecimals(0)
+        self._workers_spin.setValue(self._workers)
+        out_form.addRow("Workers:", self._workers_spin)
+
+        layout.addWidget(out_group)
+
+        # ── Progress bar ────────────────────────────────────────────
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setVisible(False)
+        layout.addWidget(self._progress_bar)
+
+        self._status_label = QLabel("")
+        layout.addWidget(self._status_label)
+
+        # ── Buttons ──────────────────────────────────────────────────
+        self._button_box = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        self._button_box.button(QDialogButtonBox.Ok).setText("Export")
+        self._button_box.accepted.connect(self._on_export)
+        self._button_box.rejected.connect(self.reject)
+        layout.addWidget(self._button_box)
+
+    def _browse_output_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Output Directory", self._out_dir_label.text())
+        if d:
+            self._out_dir_label.setText(d)
+
+    def _on_export(self) -> None:
+        out_dir = self._out_dir_label.text()
+        if not out_dir:
+            QMessageBox.warning(self, "Missing Directory", "Please select an output directory.")
+            return
+
+        classes = {2} if self._ground_only_radio.isChecked() else None
+        clip_overlap = self._clip_overlap_check.isChecked()
+        workers = int(self._workers_spin.value())
+
+        self._all_points_radio.setEnabled(False)
+        self._ground_only_radio.setEnabled(False)
+        self._clip_overlap_check.setEnabled(False)
+        self._button_box.button(QDialogButtonBox.Ok).setEnabled(False)
+        self._progress_bar.setVisible(True)
+        self._progress_bar.setRange(0, len(self._jobs))
+        self._progress_bar.setValue(0)
+        self._status_label.setText("Exporting LAS tiles…")
+
+        self._worker = _ExportLasWorker(
+            self._jobs,
+            out_dir,
+            self._global_bbox,
+            self._overlap_m,
+            tile_size_m=self._tile_size_m,
+            classes=classes,
+            clip_overlap=clip_overlap,
+            workers=workers,
+            parent=self,
+        )
+        self._worker.progress.connect(self._on_progress)
+        self._worker.tile_done.connect(self._on_tile_done)
+        self._worker.finished_all.connect(self._on_finished)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+
+    def _on_progress(self, done: int, total: int) -> None:
+        self._progress_bar.setValue(done)
+        self._status_label.setText(f"Exported {done}/{total} tiles…")
+
+    def _on_tile_done(self, tile_id: str, path: str) -> None:
+        self.written_files.append(path)
+
+    def _on_finished(self, n: int) -> None:
+        self.exported_count = n
+        self._progress_bar.setValue(len(self._jobs))
+        self._status_label.setText(f"Done — {n} tile(s) exported.")
+        QMessageBox.information(
+            self,
+            "LAS Export Complete",
+            f"Successfully exported {n} tile(s) to:\n{self._out_dir_label.text()}",
+        )
+        self.accept()
+
+    def _on_error(self, msg: str) -> None:
+        self._status_label.setText(f"Error: {msg}")
+        QMessageBox.critical(self, "LAS Export Error", msg)
+        self._all_points_radio.setEnabled(True)
+        self._ground_only_radio.setEnabled(True)
+        self._clip_overlap_check.setEnabled(True)
+        self._button_box.button(QDialogButtonBox.Ok).setEnabled(True)
+        self._progress_bar.setVisible(False)

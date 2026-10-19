@@ -93,6 +93,7 @@ class TileListWidget(QWidget):
     filter_requested = Signal(list)
     classify_requested = Signal(list)
     export_requested = Signal(list)
+    export_las_requested = Signal(list)
     delete_requested = Signal(list)
     qc_status_changed = Signal(list, str, str)  # tile_ids, qc_status, qc_comment
 
@@ -462,6 +463,9 @@ class TileListWidget(QWidget):
 
             export_action = menu.addAction("Export Raster…")
             export_action.triggered.connect(lambda: self.export_requested.emit(selected))
+
+            export_las_action = menu.addAction("Export LAS…")
+            export_las_action.triggered.connect(lambda: self.export_las_requested.emit(selected))
 
             menu.addSeparator()
 

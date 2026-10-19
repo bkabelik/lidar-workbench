@@ -53,7 +53,8 @@ class ExportConfig:
     ground_class: int = 2
 
     # For DSM — which ASPRS classes to include (empty = all)
-    dsm_classes: Set[int] = field(default_factory=lambda: {2, 3, 4, 5, 6})
+    dsm_classes: Set[int] = field(default_factory=lambda: {1, 2, 3, 4, 5, 6, 9, 10, 11, 17, 20})
+    fill_dsm_voids: bool = True
 
     # Tiling
     tile_ids: List[str] = field(default_factory=list)
@@ -65,6 +66,10 @@ class ExportConfig:
     # Hillshade parameters
     hillshade_azimuth: float = DEFAULT_HILLSHADE_AZIMUTH
     hillshade_altitude: float = DEFAULT_HILLSHADE_ALTITUDE
+
+    # Coordinate Reference System metadata
+    crs_epsg: Optional[int] = None
+    crs_wkt: Optional[str] = None
 
 
 @dataclass
@@ -116,6 +121,8 @@ def export_dtm(
     # ── 1. compute master grid (seamless tiling) ──────────────────────
     global_bbox = _global_bbox(tile_bboxes)
     master = _master_grid(global_bbox, config.resolution)
+    acc = np.full(master.data.shape, np.inf, dtype=np.float64) if config.compute_hillshade else None
+    tile_subs: Dict[str, Tuple[Tuple[float, float, float, float], RasterGrid]] = {}
 
     written: List[Path] = []
     total = len(config.tile_ids)
@@ -128,7 +135,7 @@ def export_dtm(
             continue
 
         if progress_callback:
-            progress_callback((idx / total) * 90.0, f"DTM tile {tile_id}…")
+            progress_callback((idx / total) * (85.0 if config.compute_hillshade else 90.0), f"DTM tile {tile_id}…")
 
         # ── 2. filter ground points ──────────────────────────────────
         cls = pts["classification"]
@@ -150,12 +157,42 @@ def export_dtm(
         # ── 5. write ─────────────────────────────────────────────────
         stem = tile_id if tile_id.startswith("tile_") else f"tile_{tile_id}"
         asc_path = out / f"{stem}_dtm.asc"
-        _write_ascii_grid(sub, asc_path)
+        _write_ascii_grid(sub, asc_path, crs_wkt=config.crs_wkt)
         written.append(asc_path)
 
-        if config.compute_hillshade:
+        if config.compute_hillshade and acc is not None:
+            tile_subs[tile_id] = (bbox, sub)
+            col_start = int(round((sub.xllcorner - master.xllcorner) / master.cellsize))
+            row_start = int(round((sub.yllcorner - master.yllcorner) / master.cellsize))
+            acc_slice = acc[row_start:row_start + sub.nrows, col_start:col_start + sub.ncols]
+            valid = sub.data != sub.nodata
+            np.fmin(acc_slice, np.where(valid, sub.data, np.inf), out=acc_slice)
+
+    # Seamless cross-tile hillshade
+    if config.compute_hillshade and acc is not None and tile_subs:
+        if progress_callback:
+            progress_callback(90.0, "Computing seamless hillshade across tiles…")
+        unvisited = np.isinf(acc)
+        acc[unvisited] = master.nodata
+        master.data = acc
+        master_hs = compute_hillshade(master, azimuth=config.hillshade_azimuth, altitude=config.hillshade_altitude)
+        del acc
+
+        for tile_id, (bbox, sub) in tile_subs.items():
+            col_start = int(round((sub.xllcorner - master.xllcorner) / master.cellsize))
+            row_start = int(round((sub.yllcorner - master.yllcorner) / master.cellsize))
+            tile_hs_data = master_hs.data[row_start:row_start + sub.nrows, col_start:col_start + sub.ncols].copy()
+            tile_hs_data[sub.data == sub.nodata] = master_hs.nodata
+            tile_hs = RasterGrid(
+                data=tile_hs_data,
+                xllcorner=sub.xllcorner,
+                yllcorner=sub.yllcorner,
+                cellsize=sub.cellsize,
+                nodata=master_hs.nodata,
+            )
+            stem = tile_id if tile_id.startswith("tile_") else f"tile_{tile_id}"
             hs_path = out / f"{stem}_dtm_hillshade.tif"
-            _write_hillshade(sub, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+            _write_geotiff(tile_hs, hs_path, crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt)
             written.append(hs_path)
 
     if progress_callback:
@@ -191,6 +228,8 @@ def export_dsm(
 
     global_bbox = _global_bbox(tile_bboxes)
     master = _master_grid(global_bbox, config.resolution)
+    acc = np.full(master.data.shape, -np.inf, dtype=np.float64) if config.compute_hillshade else None
+    tile_subs: Dict[str, Tuple[Tuple[float, float, float, float], RasterGrid]] = {}
 
     written: List[Path] = []
     total = len(config.tile_ids)
@@ -202,7 +241,7 @@ def export_dsm(
             continue
 
         if progress_callback:
-            progress_callback((idx / total) * 90.0, f"DSM tile {tile_id}…")
+            progress_callback((idx / total) * (85.0 if config.compute_hillshade else 90.0), f"DSM tile {tile_id}…")
 
         # ── filter to selected classes ───────────────────────────────
         cls = pts["classification"]
@@ -219,17 +258,47 @@ def export_dsm(
         sub = _slice_grid(master, bbox)
 
         # ── bin max-Z ────────────────────────────────────────────────
-        sub.data = _bin_max(px, py, pz, sub)
+        sub.data = _bin_max(px, py, pz, sub, fill_voids=config.fill_dsm_voids)
 
         # ── write ────────────────────────────────────────────────────
         stem = tile_id if tile_id.startswith("tile_") else f"tile_{tile_id}"
         asc_path = out / f"{stem}_dsm.asc"
-        _write_ascii_grid(sub, asc_path)
+        _write_ascii_grid(sub, asc_path, crs_wkt=config.crs_wkt)
         written.append(asc_path)
 
-        if config.compute_hillshade:
+        if config.compute_hillshade and acc is not None:
+            tile_subs[tile_id] = (bbox, sub)
+            col_start = int(round((sub.xllcorner - master.xllcorner) / master.cellsize))
+            row_start = int(round((sub.yllcorner - master.yllcorner) / master.cellsize))
+            acc_slice = acc[row_start:row_start + sub.nrows, col_start:col_start + sub.ncols]
+            valid = sub.data != sub.nodata
+            np.maximum(acc_slice, np.where(valid, sub.data, -np.inf), out=acc_slice)
+
+    # Seamless cross-tile hillshade
+    if config.compute_hillshade and acc is not None and tile_subs:
+        if progress_callback:
+            progress_callback(90.0, "Computing seamless hillshade across tiles…")
+        unvisited = np.isneginf(acc)
+        acc[unvisited] = master.nodata
+        master.data = acc
+        master_hs = compute_hillshade(master, azimuth=config.hillshade_azimuth, altitude=config.hillshade_altitude)
+        del acc
+
+        for tile_id, (bbox, sub) in tile_subs.items():
+            col_start = int(round((sub.xllcorner - master.xllcorner) / master.cellsize))
+            row_start = int(round((sub.yllcorner - master.yllcorner) / master.cellsize))
+            tile_hs_data = master_hs.data[row_start:row_start + sub.nrows, col_start:col_start + sub.ncols].copy()
+            tile_hs_data[sub.data == sub.nodata] = master_hs.nodata
+            tile_hs = RasterGrid(
+                data=tile_hs_data,
+                xllcorner=sub.xllcorner,
+                yllcorner=sub.yllcorner,
+                cellsize=sub.cellsize,
+                nodata=master_hs.nodata,
+            )
+            stem = tile_id if tile_id.startswith("tile_") else f"tile_{tile_id}"
             hs_path = out / f"{stem}_dsm_hillshade.tif"
-            _write_hillshade(sub, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+            _write_geotiff(tile_hs, hs_path, crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt)
             written.append(hs_path)
 
     if progress_callback:
@@ -293,12 +362,15 @@ def export_merged_raster(
             return []
         master.data = _tin_interpolate(xs[ground_mask], ys[ground_mask], zs[ground_mask], master)
         asc_path = out / "merged_dtm.asc"
-        _write_ascii_grid(master, asc_path)
+        _write_ascii_grid(master, asc_path, crs_wkt=config.crs_wkt)
         written.append(asc_path)
 
         if config.compute_hillshade:
             hs_path = out / "merged_dtm_hillshade.tif"
-            _write_hillshade(master, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+            _write_hillshade(
+                master, hs_path, config.hillshade_azimuth, config.hillshade_altitude,
+                crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt,
+            )
             written.append(hs_path)
 
     elif config.mode == "dsm":
@@ -306,14 +378,17 @@ def export_merged_raster(
         if not keep.any():
             logger.warning("No points in selected classes for merged DSM")
             return []
-        master.data = _bin_max(xs[keep], ys[keep], zs[keep], master)
+        master.data = _bin_max(xs[keep], ys[keep], zs[keep], master, fill_voids=config.fill_dsm_voids)
         asc_path = out / "merged_dsm.asc"
-        _write_ascii_grid(master, asc_path)
+        _write_ascii_grid(master, asc_path, crs_wkt=config.crs_wkt)
         written.append(asc_path)
 
         if config.compute_hillshade:
             hs_path = out / "merged_dsm_hillshade.tif"
-            _write_hillshade(master, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+            _write_hillshade(
+                master, hs_path, config.hillshade_azimuth, config.hillshade_altitude,
+                crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt,
+            )
             written.append(hs_path)
 
     if progress_callback:
@@ -370,12 +445,15 @@ def export_dtm_streaming(
 
         stem = tile_id if tile_id.startswith("tile_") else f"tile_{tile_id}"
         asc_path = out / f"{stem}_dtm.asc"
-        _write_ascii_grid(sub, asc_path)
+        _write_ascii_grid(sub, asc_path, crs_wkt=config.crs_wkt)
         written.append(asc_path)
 
         if config.compute_hillshade:
             hs_path = out / f"{stem}_dtm_hillshade.tif"
-            _write_hillshade(sub, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+            _write_hillshade(
+                sub, hs_path, config.hillshade_azimuth, config.hillshade_altitude,
+                crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt,
+            )
             written.append(hs_path)
 
     if progress_callback:
@@ -421,17 +499,20 @@ def export_dsm_streaming(
             continue
 
         sub = _slice_grid(master, bbox)
-        sub.data = _bin_max(pts["x"][keep], pts["y"][keep], pts["z"][keep], sub)
+        sub.data = _bin_max(pts["x"][keep], pts["y"][keep], pts["z"][keep], sub, fill_voids=config.fill_dsm_voids)
         del pts
 
         stem = tile_id if tile_id.startswith("tile_") else f"tile_{tile_id}"
         asc_path = out / f"{stem}_dsm.asc"
-        _write_ascii_grid(sub, asc_path)
+        _write_ascii_grid(sub, asc_path, crs_wkt=config.crs_wkt)
         written.append(asc_path)
 
         if config.compute_hillshade:
             hs_path = out / f"{stem}_dsm_hillshade.tif"
-            _write_hillshade(sub, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+            _write_hillshade(
+                sub, hs_path, config.hillshade_azimuth, config.hillshade_altitude,
+                crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt,
+            )
             written.append(hs_path)
 
     if progress_callback:
@@ -496,7 +577,7 @@ def export_merged_raster_streaming(
                 del pts
                 continue
             sub = _slice_grid(master, bbox)
-            sub.data = _bin_max(pts["x"][keep], pts["y"][keep], pts["z"][keep], sub)
+            sub.data = _bin_max(pts["x"][keep], pts["y"][keep], pts["z"][keep], sub, fill_voids=config.fill_dsm_voids)
 
         del pts
 
@@ -521,12 +602,15 @@ def export_merged_raster_streaming(
     written: List[Path] = []
     name = "merged_dtm" if config.mode == "dtm" else "merged_dsm"
     asc_path = out / f"{name}.asc"
-    _write_ascii_grid(master, asc_path)
+    _write_ascii_grid(master, asc_path, crs_wkt=config.crs_wkt)
     written.append(asc_path)
 
     if config.compute_hillshade:
         hs_path = out / f"{name}_hillshade.tif"
-        _write_hillshade(master, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+        _write_hillshade(
+            master, hs_path, config.hillshade_azimuth, config.hillshade_altitude,
+            crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt,
+        )
         written.append(hs_path)
 
     if progress_callback:
@@ -573,7 +657,7 @@ def _rasterize_tile_job(job: Dict, global_bbox: tuple, config: ExportConfig) -> 
         keep = np.isin(cls, list(config.dsm_classes))
         if not keep.any():
             return None
-        sub.data = _bin_max(xs[keep], ys[keep], zs[keep], sub)
+        sub.data = _bin_max(xs[keep], ys[keep], zs[keep], sub, fill_voids=config.fill_dsm_voids)
 
     return {
         "tile_id": job["tile_id"],
@@ -596,12 +680,15 @@ def _write_tile_raster_files(result: dict, config: ExportConfig, out: Path, suff
     )
     stem = result["tile_id"] if result["tile_id"].startswith("tile_") else f"tile_{result['tile_id']}"
     asc_path = out / f"{stem}_{suffix}.asc"
-    _write_ascii_grid(grid, asc_path)
+    _write_ascii_grid(grid, asc_path, crs_wkt=config.crs_wkt)
     written = [asc_path]
 
     if config.compute_hillshade:
         hs_path = out / f"{stem}_{suffix}_hillshade.tif"
-        _write_hillshade(grid, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+        _write_hillshade(
+            grid, hs_path, config.hillshade_azimuth, config.hillshade_altitude,
+            crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt,
+        )
         written.append(hs_path)
 
     return written
@@ -626,6 +713,10 @@ def export_dtm_parallel(
     if total == 0:
         return written
 
+    master = _master_grid(global_bbox, config.resolution)
+    acc = np.full(master.data.shape, np.inf, dtype=np.float64) if config.compute_hillshade else None
+    tile_jobs: Dict[str, Tuple[Dict, Dict]] = {}
+
     done = 0
     with ProcessPoolExecutor(max_workers=max(1, min(int(workers), total))) as pool:
         futures = {
@@ -637,12 +728,65 @@ def export_dtm_parallel(
             try:
                 result = fut.result()
                 if result is not None:
-                    written.extend(_write_tile_raster_files(result, config, out, "dtm"))
+                    grid = RasterGrid(
+                        data=result["data"],
+                        xllcorner=result["xllcorner"],
+                        yllcorner=result["yllcorner"],
+                        cellsize=result["cellsize"],
+                        nodata=result["nodata"],
+                    )
+                    stem = result["tile_id"] if result["tile_id"].startswith("tile_") else f"tile_{result['tile_id']}"
+                    asc_path = out / f"{stem}_dtm.asc"
+                    _write_ascii_grid(grid, asc_path, crs_wkt=config.crs_wkt)
+                    written.append(asc_path)
+
+                    if config.compute_hillshade and acc is not None:
+                        tile_jobs[job["tile_id"]] = (job, result)
+                        data = result["data"]
+                        col_start = int(round((result["xllcorner"] - master.xllcorner) / master.cellsize))
+                        row_start = int(round((result["yllcorner"] - master.yllcorner) / master.cellsize))
+                        acc_slice = acc[row_start:row_start + data.shape[0],
+                                        col_start:col_start + data.shape[1]]
+                        valid = data != result["nodata"]
+                        np.fmin(acc_slice, np.where(valid, data, np.inf), out=acc_slice)
             except Exception as exc:
                 logger.exception("DTM rasterisation failed for %s", job.get("tile_id"))
             done += 1
             if progress_callback:
-                progress_callback(done / total * 90.0, f"DTM {done}/{total} tiles")
+                progress_callback(done / total * (85.0 if config.compute_hillshade else 95.0), f"DTM {done}/{total} tiles")
+
+    # Seamless cross-tile hillshade: computed across joint terrain so neighbor boundaries match
+    if config.compute_hillshade and acc is not None and tile_jobs:
+        if progress_callback:
+            progress_callback(90.0, "Computing seamless hillshade across tiles…")
+        unvisited = np.isinf(acc)
+        acc[unvisited] = master.nodata
+        master.data = acc
+        master_hs = compute_hillshade(
+            master,
+            azimuth=config.hillshade_azimuth,
+            altitude=config.hillshade_altitude,
+        )
+        del acc
+
+        for tid, (job, result) in tile_jobs.items():
+            data = result["data"]
+            col_start = int(round((result["xllcorner"] - master.xllcorner) / master.cellsize))
+            row_start = int(round((result["yllcorner"] - master.yllcorner) / master.cellsize))
+            tile_hs_data = master_hs.data[row_start:row_start + data.shape[0],
+                                          col_start:col_start + data.shape[1]].copy()
+            tile_hs_data[data == result["nodata"]] = master_hs.nodata
+            tile_hs = RasterGrid(
+                data=tile_hs_data,
+                xllcorner=result["xllcorner"],
+                yllcorner=result["yllcorner"],
+                cellsize=result["cellsize"],
+                nodata=master_hs.nodata,
+            )
+            stem = tid if tid.startswith("tile_") else f"tile_{tid}"
+            hs_path = out / f"{stem}_dtm_hillshade.tif"
+            _write_geotiff(tile_hs, hs_path, crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt)
+            written.append(hs_path)
 
     if progress_callback:
         progress_callback(100.0, f"DTM export complete — {len(written)} file(s)")
@@ -668,6 +812,10 @@ def export_dsm_parallel(
     if total == 0:
         return written
 
+    master = _master_grid(global_bbox, config.resolution)
+    acc = np.full(master.data.shape, -np.inf, dtype=np.float64) if config.compute_hillshade else None
+    tile_jobs: Dict[str, Tuple[Dict, Dict]] = {}
+
     done = 0
     with ProcessPoolExecutor(max_workers=max(1, min(int(workers), total))) as pool:
         futures = {
@@ -679,12 +827,65 @@ def export_dsm_parallel(
             try:
                 result = fut.result()
                 if result is not None:
-                    written.extend(_write_tile_raster_files(result, config, out, "dsm"))
+                    grid = RasterGrid(
+                        data=result["data"],
+                        xllcorner=result["xllcorner"],
+                        yllcorner=result["yllcorner"],
+                        cellsize=result["cellsize"],
+                        nodata=result["nodata"],
+                    )
+                    stem = result["tile_id"] if result["tile_id"].startswith("tile_") else f"tile_{result['tile_id']}"
+                    asc_path = out / f"{stem}_dsm.asc"
+                    _write_ascii_grid(grid, asc_path, crs_wkt=config.crs_wkt)
+                    written.append(asc_path)
+
+                    if config.compute_hillshade and acc is not None:
+                        tile_jobs[job["tile_id"]] = (job, result)
+                        data = result["data"]
+                        col_start = int(round((result["xllcorner"] - master.xllcorner) / master.cellsize))
+                        row_start = int(round((result["yllcorner"] - master.yllcorner) / master.cellsize))
+                        acc_slice = acc[row_start:row_start + data.shape[0],
+                                        col_start:col_start + data.shape[1]]
+                        valid = data != result["nodata"]
+                        np.maximum(acc_slice, np.where(valid, data, -np.inf), out=acc_slice)
             except Exception as exc:
                 logger.exception("DSM rasterisation failed for %s", job.get("tile_id"))
             done += 1
             if progress_callback:
-                progress_callback(done / total * 90.0, f"DSM {done}/{total} tiles")
+                progress_callback(done / total * (85.0 if config.compute_hillshade else 95.0), f"DSM {done}/{total} tiles")
+
+    # Seamless cross-tile hillshade: computed across joint terrain so neighbor boundaries match
+    if config.compute_hillshade and acc is not None and tile_jobs:
+        if progress_callback:
+            progress_callback(90.0, "Computing seamless hillshade across tiles…")
+        unvisited = np.isneginf(acc)
+        acc[unvisited] = master.nodata
+        master.data = acc
+        master_hs = compute_hillshade(
+            master,
+            azimuth=config.hillshade_azimuth,
+            altitude=config.hillshade_altitude,
+        )
+        del acc
+
+        for tid, (job, result) in tile_jobs.items():
+            data = result["data"]
+            col_start = int(round((result["xllcorner"] - master.xllcorner) / master.cellsize))
+            row_start = int(round((result["yllcorner"] - master.yllcorner) / master.cellsize))
+            tile_hs_data = master_hs.data[row_start:row_start + data.shape[0],
+                                          col_start:col_start + data.shape[1]].copy()
+            tile_hs_data[data == result["nodata"]] = master_hs.nodata
+            tile_hs = RasterGrid(
+                data=tile_hs_data,
+                xllcorner=result["xllcorner"],
+                yllcorner=result["yllcorner"],
+                cellsize=result["cellsize"],
+                nodata=master_hs.nodata,
+            )
+            stem = tid if tid.startswith("tile_") else f"tile_{tid}"
+            hs_path = out / f"{stem}_dsm_hillshade.tif"
+            _write_geotiff(tile_hs, hs_path, crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt)
+            written.append(hs_path)
 
     if progress_callback:
         progress_callback(100.0, f"DSM export complete — {len(written)} file(s)")
@@ -757,12 +958,15 @@ def export_merged_raster_parallel(
     written: List[Path] = []
     name = "merged_dtm" if config.mode == "dtm" else "merged_dsm"
     asc_path = out / f"{name}.asc"
-    _write_ascii_grid(master, asc_path)
+    _write_ascii_grid(master, asc_path, crs_wkt=config.crs_wkt)
     written.append(asc_path)
 
     if config.compute_hillshade:
         hs_path = out / f"{name}_hillshade.tif"
-        _write_hillshade(master, hs_path, config.hillshade_azimuth, config.hillshade_altitude)
+        _write_hillshade(
+            master, hs_path, config.hillshade_azimuth, config.hillshade_altitude,
+            crs_epsg=config.crs_epsg, crs_wkt=config.crs_wkt,
+        )
         written.append(hs_path)
 
     if progress_callback:
@@ -774,16 +978,30 @@ def compute_core_bbox(
     bbox: Tuple[float, float, float, float],
     global_bbox: Tuple[float, float, float, float],
     overlap_m: float,
+    tile_size_m: Optional[float] = None,
 ) -> Tuple[float, float, float, float]:
     """
     Shrink *bbox* to its non-overlapping core.
 
-    Interior edges are moved inward by ``overlap_m / 2`` so neighbouring
-    tile cores partition the project exactly (left core ``<= x <`` right
-    core, bottom core ``<= y <`` top core).  Outer edges of the project are
-    kept unchanged.
+    Interior edges are moved inward by ``overlap_m / 2`` ONLY IF the tile
+    bounding box represents an overlapping tile (i.e. width > stride).
+    If the bounding box is already a disjoint partition (width <= stride),
+    it is returned as-is to avoid creating artificial data gaps between tiles.
     """
     minx, miny, maxx, maxy = bbox
+    if overlap_m <= 0:
+        return bbox
+
+    w = maxx - minx
+    h = maxy - miny
+    if tile_size_m is not None and tile_size_m > overlap_m:
+        stride = tile_size_m - overlap_m
+        threshold = stride + overlap_m * 0.5
+        if w < threshold and h < threshold:
+            return bbox
+    elif overlap_m > 0 and w < (200.0 - overlap_m * 0.5) and h < (200.0 - overlap_m * 0.5):
+        return bbox
+
     gminx, gminy, gmaxx, gmaxy = global_bbox
     half = overlap_m / 2.0
     eps = 1e-9
@@ -807,6 +1025,9 @@ def export_las_tile(
     output_dir: str,
     global_bbox: Tuple[float, float, float, float],
     overlap_m: float,
+    tile_size_m: Optional[float] = None,
+    classes: Optional[Set[int]] = None,
+    clip_overlap: bool = True,
 ) -> Optional[str]:
     """
     Export one LAS tile clipped to its non-overlapping core.
@@ -817,11 +1038,20 @@ def export_las_tile(
     """
     import laspy
 
-    from .tile_manager import _read_las_header_template, _write_las_file
+    try:
+        from .tile_manager import _read_las_header_template, _write_las_file
+    except (ImportError, ValueError):
+        try:
+            from lidar_workbench.tile_manager import _read_las_header_template, _write_las_file
+        except (ImportError, ValueError):
+            from tile_manager import _read_las_header_template, _write_las_file
 
     las_path = Path(job["las_path"])
     bbox = tuple(job["bbox"])
-    core = compute_core_bbox(bbox, global_bbox, overlap_m)
+    if clip_overlap:
+        core = compute_core_bbox(bbox, global_bbox, overlap_m, tile_size_m=tile_size_m)
+    else:
+        core = bbox
 
     with laspy.open(las_path) as reader:
         las_data = reader.read()
@@ -834,6 +1064,10 @@ def export_las_tile(
             (xs >= core[0]) & (xs < core[2])
             & (ys >= core[1]) & (ys < core[3])
         )
+        if classes is not None and len(classes) > 0:
+            if hasattr(las_data, "classification"):
+                cls_arr = np.array(las_data.classification, dtype=np.uint8)
+                mask = mask & np.isin(cls_arr, list(classes))
         if not mask.any():
             logger.warning("Core of %s is empty — skipping LAS export", las_path.name)
             return None
@@ -890,7 +1124,20 @@ def export_las_tile(
         header_template = None
         logger.warning("Could not read header template from %s — using fallback", las_path)
 
-    out_path = Path(output_dir) / f"{las_path.stem}_core.las"
+    tid = job.get("tile_id", las_path.stem)
+    stem = tid if str(tid).startswith("tile_") else f"tile_{tid}"
+    if stem.endswith("_ground"):
+        stem = stem[:-7]
+
+    if classes is not None and set(classes) == {2}:
+        filename = f"{stem}_ground.las"
+    else:
+        filename = f"{stem}.las"
+
+    out_dir = Path(output_dir)
+    out_path = out_dir / filename
+    if out_path.resolve() == las_path.resolve():
+        out_path = out_dir / f"{stem}_core.las"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _write_las_file(
         out_path,
@@ -1035,18 +1282,97 @@ def _idw_fill(
     return raster
 
 
+def _tin_fill_voids(
+    raster: np.ndarray,
+    empty: np.ndarray,
+    grid: RasterGrid,
+) -> np.ndarray:
+    """
+    Fill void/hole cells in *raster* (where *empty* is True) using boundary-guided
+    Delaunay triangulation from the populated areas (e.g. water shorelines, bridge
+    edges, forest edges), with nearest-neighbour fallback outside the convex hull.
+    Populated cells are strictly preserved.
+    """
+    from scipy.ndimage import binary_dilation
+    from scipy.spatial import Delaunay, KDTree
+
+    nrows, ncols = raster.shape
+    filled = ~empty
+    if not filled.any():
+        return raster
+
+    # 1. Boundary of voids (e.g. shorelines of lakes, edges of missing bridge decks)
+    dilated = binary_dilation(empty, iterations=2)
+    boundary_filled = dilated & filled
+
+    # 2. Subsample of interior filled cells to guide global terrain trends
+    step = max(5, int(min(nrows, ncols) / 50))
+    grid_sample = np.zeros((nrows, ncols), dtype=bool)
+    grid_sample[::step, ::step] = True
+    pts_mask = boundary_filled | (grid_sample & filled)
+
+    row_idx, col_idx = np.where(pts_mask)
+    if len(row_idx) < 3:
+        raster[empty] = float(np.mean(raster[row_idx, col_idx]))
+        return raster
+
+    px = grid.xllcorner + (col_idx + 0.5) * grid.cellsize
+    py = grid.yllcorner + (row_idx + 0.5) * grid.cellsize
+    pz = raster[row_idx, col_idx]
+
+    erow, ecol = np.where(empty)
+    qx = grid.xllcorner + (ecol + 0.5) * grid.cellsize
+    qy = grid.yllcorner + (erow + 0.5) * grid.cellsize
+    query_pts = np.column_stack([qx, qy])
+
+    tri = Delaunay(np.column_stack([px, py]))
+    simplex = tri.find_simplex(query_pts)
+    inside = simplex >= 0
+
+    if inside.any():
+        inside_idx = np.flatnonzero(inside)
+        s = simplex[inside_idx]
+        pts_2d = query_pts[inside_idx]
+        origins = tri.transform[s, 2]
+        b = np.einsum("nij,nj->ni", tri.transform[s, :2, :2], pts_2d - origins)
+        b1, b2 = b[:, 0], b[:, 1]
+        b3 = 1.0 - b1 - b2
+
+        verts = tri.simplices[s]
+        z_verts = pz[verts]
+        interp_z = b1 * z_verts[:, 0] + b2 * z_verts[:, 1] + b3 * z_verts[:, 2]
+        raster[erow[inside_idx], ecol[inside_idx]] = interp_z
+
+    still_empty = raster == grid.nodata
+    if still_empty.any():
+        tree = KDTree(np.column_stack([px, py]))
+        still_row, still_col = np.where(still_empty)
+        sqx = grid.xllcorner + (still_col + 0.5) * grid.cellsize
+        sqy = grid.yllcorner + (still_row + 0.5) * grid.cellsize
+        _, nn = tree.query(np.column_stack([sqx, sqy]))
+        raster[still_row, still_col] = pz[nn]
+
+    return raster
+
+
 def _bin_max(
     px: np.ndarray,
     py: np.ndarray,
     pz: np.ndarray,
     grid: RasterGrid,
+    fill_voids: bool = True,
 ) -> np.ndarray:
     """
     Bin points into *grid*, assigning each cell the maximum Z of points
-    that fall inside it (highest-hit DSM).
+    that fall inside it (highest-hit DSM for forest canopy, buildings, ground, etc.).
+
+    When *fill_voids* is True, data gaps, unreflected water surfaces (lakes, rivers),
+    and missing bridge segments are smoothly interpolated via boundary-guided
+    Delaunay triangulation, ensuring continuous elevation at the water surface level
+    or surrounding terrain.
     """
     nrows, ncols = grid.nrows, grid.ncols
-    result = np.full((nrows, ncols), grid.nodata, dtype=np.float64)
+    result = np.full((nrows, ncols), -np.inf, dtype=np.float64)
 
     # Pixel indices for each point
     col = np.floor((px - grid.xllcorner) / grid.cellsize).astype(np.int32)
@@ -1057,20 +1383,26 @@ def _bin_max(
     row = row[valid]
     z = pz[valid]
 
-    # Use np.maximum.at for efficient binning
-    flat = row * ncols + col
-    np.maximum.at(result.ravel(), flat, z)
+    if len(z) > 0:
+        flat = row * ncols + col
+        # np.maximum.at guarantees highest point in each pixel
+        np.maximum.at(result.ravel(), flat, z)
 
-    # Fill empty cells via IDW from nearby points
-    empty = result == grid.nodata
-    if empty.any() and len(z) > 0:
-        # Build a sparse set of representatives (one per non-empty cell)
-        unique_flat, unique_idx = np.unique(flat, return_index=True)
-        rep_x = px[valid][unique_idx]
-        rep_y = py[valid][unique_idx]
-        rep_z = z[unique_idx]
-        result = _idw_fill(result, empty, rep_x, rep_y, rep_z, grid,
-                           power=2.0, max_dist=grid.cellsize * 3)
+    empty = ~np.isfinite(result)
+    result[empty] = grid.nodata
+
+    if empty.any() and (~empty).any():
+        if fill_voids:
+            result = _tin_fill_voids(result, empty, grid)
+        else:
+            # When void filling is disabled, only fill immediate local gaps (<= 3 cells)
+            flat = row * ncols + col
+            unique_flat, unique_idx = np.unique(flat, return_index=True)
+            rep_x = px[valid][unique_idx]
+            rep_y = py[valid][unique_idx]
+            rep_z = result.ravel()[unique_flat]
+            result = _idw_fill(result, empty, rep_x, rep_y, rep_z, grid,
+                               power=2.0, max_dist=grid.cellsize * 3)
 
     return result
 
@@ -1098,15 +1430,15 @@ def compute_hillshade(
     alt_rad = math.radians(altitude)
 
     data = grid.data.astype(np.float64)
-    nodata_mask = data == grid.nodata
+    nodata_mask = (data == grid.nodata) | np.isnan(data) | np.isinf(data)
     # Temporarily replace nodata with mean to avoid edge artefacts
     valid = data[~nodata_mask]
     fill_val = float(valid.mean()) if len(valid) > 0 else 0.0
     data_filled = np.where(nodata_mask, fill_val, data)
 
-    # Slope and aspect via central differences
-    dzdx = np.zeros_like(data_filled)
-    dzdy = np.zeros_like(data_filled)
+    # Pad by 1 pixel on all edges with edge replication so that the 3×3 window
+    # covers all boundary pixels naturally without leaving uncalculated 0-gradient borders
+    pad_data = np.pad(data_filled, 1, mode="edge")
 
     # Horn (1981) central-difference slope estimator
     # 3×3 window:  a b c    (row i-1)
@@ -1114,17 +1446,17 @@ def compute_hillshade(
     #              g h i    (row i+1)
     # dz/dx = ((c + 2f + i) - (a + 2d + g)) / (8*cellsize)
     # dz/dy = ((g + 2h + i) - (a + 2b + c)) / (8*cellsize)
-    a = data_filled[:-2, :-2]
-    b = data_filled[:-2, 1:-1]
-    c = data_filled[:-2, 2:]
-    d = data_filled[1:-1, :-2]
-    f = data_filled[1:-1, 2:]
-    g = data_filled[2:, :-2]
-    h = data_filled[2:, 1:-1]
-    i = data_filled[2:, 2:]
+    a = pad_data[:-2, :-2]
+    b = pad_data[:-2, 1:-1]
+    c = pad_data[:-2, 2:]
+    d = pad_data[1:-1, :-2]
+    f = pad_data[1:-1, 2:]
+    g = pad_data[2:, :-2]
+    h = pad_data[2:, 1:-1]
+    i = pad_data[2:, 2:]
 
-    dzdx[1:-1, 1:-1] = ((c + 2.0 * f + i) - (a + 2.0 * d + g)) / (8.0 * grid.cellsize)
-    dzdy[1:-1, 1:-1] = ((g + 2.0 * h + i) - (a + 2.0 * b + c)) / (8.0 * grid.cellsize)
+    dzdx = ((c + 2.0 * f + i) - (a + 2.0 * d + g)) / (8.0 * grid.cellsize)
+    dzdy = ((g + 2.0 * h + i) - (a + 2.0 * b + c)) / (8.0 * grid.cellsize)
 
     slope = np.arctan(np.sqrt(dzdx ** 2 + dzdy ** 2))
     aspect = np.arctan2(dzdy, -dzdx)
@@ -1233,7 +1565,7 @@ def _global_bbox(
 
 # ── ASCII Grid I/O ──────────────────────────────────────────────────────
 
-def _write_ascii_grid(grid: RasterGrid, path: Path) -> None:
+def _write_ascii_grid(grid: RasterGrid, path: Path, crs_wkt: Optional[str] = None) -> None:
     """
     Write *grid* as an ESRI ASCII Grid file.
 
@@ -1255,13 +1587,20 @@ def _write_ascii_grid(grid: RasterGrid, path: Path) -> None:
     lines.append(f"cellsize      {grid.cellsize:.6f}")
     lines.append(f"NODATA_value  {grid.nodata:.1f}")
 
-    # Data: one row per line, space-separated, %.3f precision
+    # ESRI ASCII Grid convention: Row 0 in the file is the NORTHERNMOST row.
+    # RasterGrid.data is indexed from South (row 0) to North (row nrows-1).
+    # Therefore, write from row (nrows-1) down to 0:
     with np.printoptions(threshold=np.inf, linewidth=np.inf, suppress=True,
                          formatter={"float_kind": lambda v: f"{v:.3f}"}):
-        for row in range(grid.nrows):
+        for row in range(grid.nrows - 1, -1, -1):
             lines.append(" ".join(f"{v:.3f}" for v in grid.data[row, :]))
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if crs_wkt:
+        try:
+            path.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
+        except Exception:
+            pass
     logger.info("Wrote %s (%d × %d)", path, grid.ncols, grid.nrows)
 
 
@@ -1270,25 +1609,161 @@ def _write_hillshade(
     path: Path,
     azimuth: float,
     altitude: float,
+    crs_epsg: Optional[int] = None,
+    crs_wkt: Optional[str] = None,
 ) -> None:
     """Compute hillshade and write as GeoTIFF (.tif)."""
     hs = compute_hillshade(grid, azimuth, altitude)
-    _write_geotiff(hs, path)
+    _write_geotiff(hs, path, crs_epsg=crs_epsg, crs_wkt=crs_wkt)
     logger.info("Wrote hillshade %s", path)
 
 
-def _write_geotiff(grid: RasterGrid, path: Path) -> None:
+def _write_aux_pam_stats(path: Path, min_val: str = "0", max_val: str = "255") -> None:
+    """Write companion .aux.xml file with explicit band statistics.
+
+    This ensures GIS viewers (QGIS, ArcGIS, etc.) display all tiles on the exact
+    same 0–255 scale rather than computing dynamic per-tile min/max contrast stretches.
+    """
+    try:
+        aux_path = Path(str(path) + ".aux.xml")
+        content = (
+            '<PAMDataset>\n'
+            '  <PAMRasterBand band="1">\n'
+            '    <Metadata>\n'
+            f'      <MDI key="STATISTICS_MINIMUM">{min_val}</MDI>\n'
+            f'      <MDI key="STATISTICS_MAXIMUM">{max_val}</MDI>\n'
+            '    </Metadata>\n'
+            '  </PAMRasterBand>\n'
+            '</PAMDataset>\n'
+        )
+        aux_path.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _write_qml_style(path: Path) -> None:
+    """Write a companion QGIS layer style file (.qml) locking 0–255 min/max.
+
+    When QGIS opens a raster that has a same-named .qml in the same directory,
+    it automatically applies this style. Setting limits=None with min=0, max=255
+    and StretchToMinimumMaximum ensures QGIS renders every tile on the exact
+    same fixed 0–255 scale without dynamic per-tile percentile contrast cuts.
+    """
+    try:
+        qml_path = path.with_suffix(".qml")
+        content = (
+            '<!DOCTYPE qgis PUBLIC \'http://mrcc.com/qgis.dtd\' \'SYSTEM\'>\n'
+            '<qgis version="3.0.0" styleCategories="AllStyleCategories">\n'
+            '  <pipe>\n'
+            '    <rasterrenderer type="singlebandgray" opacity="1" alphaBand="-1" grayBand="1" gradient="BlackToWhite">\n'
+            '      <rasterTransparency>\n'
+            '        <singleValuePixelList>\n'
+            '          <pixelListEntry min="0" max="0" percentTransparent="100"/>\n'
+            '        </singleValuePixelList>\n'
+            '      </rasterTransparency>\n'
+            '      <minMaxOrigin>\n'
+            '        <limits>None</limits>\n'
+            '        <extent>WholeRaster</extent>\n'
+            '        <statAccuracy>Exact</statAccuracy>\n'
+            '        <cumulativeCutLower>0</cumulativeCutLower>\n'
+            '        <cumulativeCutUpper>1</cumulativeCutUpper>\n'
+            '        <stdDevFactor>2</stdDevFactor>\n'
+            '      </minMaxOrigin>\n'
+            '      <contrastEnhancement>\n'
+            '        <minValue>0</minValue>\n'
+            '        <maxValue>255</maxValue>\n'
+            '        <algorithm>StretchToMinimumMaximum</algorithm>\n'
+            '      </contrastEnhancement>\n'
+            '    </rasterrenderer>\n'
+            '    <brightnesscontrast brightness="0" contrast="0"/>\n'
+            '    <huesaturation colorizeGreen="128" colorizeOn="0" colorizeRed="255" colorizeBlue="128" grayscaleMode="0" saturation="0" colorizeStrength="100"/>\n'
+            '    <rasterresampler maxOversampling="2"/>\n'
+            '  </pipe>\n'
+            '  <blendMode>0</blendMode>\n'
+            '</qgis>\n'
+        )
+        qml_path.write_text(content, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _write_geotiff(
+    grid: RasterGrid,
+    path: Path,
+    crs_epsg: Optional[int] = None,
+    crs_wkt: Optional[str] = None,
+) -> None:
     """
     Write *grid* as a georeferenced GeoTIFF (.tif).
 
-    Produces a valid GeoTIFF with ModelTiepointTag and ModelPixelScaleTag
-    so that QGIS, ArcGIS, GDAL, and Global Mapper can place the raster
-    correctly.  Pure Python — no external library required.
+    Produces a valid GeoTIFF with ModelTiepointTag, ModelPixelScaleTag,
+    and CRS metadata so that QGIS, ArcGIS, GDAL, and Global Mapper can place
+    the raster correctly with coordinate reference system.
     """
+    # 1. Primary: Use rasterio when available for full CRS and deflate compression
+    try:
+        import rasterio
+        from rasterio.transform import from_origin
+
+        # Note: image row 0 must be North (flip vertical from South-up internal grid)
+        data = np.flipud(grid.data).copy()
+        nodata_mask = data == grid.nodata
+        valid_mask = ~nodata_mask
+        data[valid_mask] = np.clip(np.round(data[valid_mask]), 0, 255)
+        data[nodata_mask] = 0
+        img = data.astype(np.uint8)
+
+        crs = None
+        if crs_epsg:
+            crs = f"EPSG:{crs_epsg}"
+        elif crs_wkt:
+            crs = crs_wkt
+
+        transform = from_origin(
+            west=grid.xllcorner,
+            north=grid.yllcorner + grid.nrows * grid.cellsize,
+            xsize=grid.cellsize,
+            ysize=grid.cellsize,
+        )
+
+        with rasterio.open(
+            str(path),
+            "w",
+            driver="GTiff",
+            height=grid.nrows,
+            width=grid.ncols,
+            count=1,
+            dtype=rasterio.uint8,
+            crs=crs,
+            transform=transform,
+            nodata=0,
+            compress="deflate",
+        ) as dst:
+            dst.write(img, 1)
+            try:
+                dst.update_tags(1, STATISTICS_MINIMUM="0", STATISTICS_MAXIMUM="255")
+            except Exception:
+                pass
+
+        if crs_wkt:
+            try:
+                path.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
+            except Exception:
+                pass
+
+        _write_aux_pam_stats(path, "0", "255")
+        _write_qml_style(path)
+
+        logger.info("Wrote GeoTIFF %s (%d × %d, crs=%s)", path, grid.ncols, grid.nrows, crs)
+        return
+    except Exception as exc:
+        logger.debug("rasterio write unavailable or failed (%s), using pure Python GeoTIFF", exc)
+
     import struct
 
-    # Convert hillshade float → uint8: nodata → 0, valid → 1..255
-    data = grid.data.copy()
+    # Fallback: pure Python GeoTIFF
+    # Note: image row 0 must be North (flip vertical from South-up internal grid)
+    data = np.flipud(grid.data).copy()
     nodata_mask = data == grid.nodata
     valid_mask = ~nodata_mask
     data[valid_mask] = np.clip(np.round(data[valid_mask]), 0, 255)
@@ -1298,9 +1773,6 @@ def _write_geotiff(grid: RasterGrid, path: Path) -> None:
     img_bytes = img.tobytes()
 
     # ── Build IFD entry descriptors ─────────────────────────────────
-    # Each entry: (tag, type, count, value)
-    #   type 1=BYTE, 2=ASCII, 3=SHORT, 4=LONG, 5=RATIONAL, 12=DOUBLE
-    #   value is either an int, a list, a tuple, or a string.
     entries = [
         (256,  3, 1, ncols),                                        # ImageWidth
         (257,  3, 1, nrows),                                        # ImageLength
@@ -1315,7 +1787,7 @@ def _write_geotiff(grid: RasterGrid, path: Path) -> None:
         (283,  5, 1, [(1, 1)]),                                     # YResolution
         (296,  3, 1, 1),                                            # ResolutionUnit (none)
         (339,  3, 1, 1),                                            # SampleFormat (uint)
-        (33550, 12, 3, [grid.cellsize, -grid.cellsize, 0.0]),        # ModelPixelScaleTag (Y negative: row↓ = Y↓)
+        (33550, 12, 3, [grid.cellsize, grid.cellsize, 0.0]),        # ModelPixelScaleTag
         (33922, 12, 6, [0.0, 0.0, 0.0,
                          grid.xllcorner,
                          grid.yllcorner + grid.nrows * grid.cellsize,
@@ -1323,23 +1795,29 @@ def _write_geotiff(grid: RasterGrid, path: Path) -> None:
         (42113, 2, 2, "0"),                                         # GDAL_NODATA
     ]
 
+    if crs_epsg:
+        geokeys = [
+            1, 1, 0, 3,
+            1024, 0, 1, 1,
+            1025, 0, 1, 1,
+            3072, 0, 1, int(crs_epsg),
+        ]
+        entries.append((34735, 3, len(geokeys), geokeys))
+
+    # Sort entries by tag number (TIFF standard requires ascending tag order)
+    entries.sort(key=lambda e: e[0])
+
     # ── Encode entries → raw bytes + overflow ──────────────────────
     ifd_entries_raw = bytearray()
     overflow = bytearray()      # values > 4 bytes stored here
     over_pos = 0                # current offset within overflow area
 
-    # Layout (known ahead):
-    #   header:    8 bytes  (offset 0)
-    #   IFD:       2 + N*12 + 4 bytes  (offset 8)
-    #   overflow:  starts at 8 + 2 + N*12 + 4
-    #   image:     starts after overflow, word-aligned
     ifd_start = 8
     num_entries = len(entries)
     ifd_body_size = 2 + num_entries * 12 + 4
     overflow_start = ifd_start + ifd_body_size
 
     for tag, typ, count, value in entries:
-        # Encode the 4-byte value/offset slot
         if typ == 3:  # SHORT
             if count == 1:
                 slot = struct.pack("<HH", value, 0)
@@ -1385,7 +1863,6 @@ def _write_geotiff(grid: RasterGrid, path: Path) -> None:
         img_offset += 1
 
     # ── Patch StripOffsets (tag 273) ───────────────────────────────
-    # Find the entry and replace the 4-byte value at offset +8 within the entry
     for i in range(num_entries):
         e_off = i * 12
         raw_tag = struct.unpack_from("<H", ifd_entries_raw, e_off)[0]
@@ -1394,13 +1871,8 @@ def _write_geotiff(grid: RasterGrid, path: Path) -> None:
             break
 
     # ── Assemble and write ─────────────────────────────────────────
-    # Header: "II" (little-endian) + magic 42 + offset to first IFD
     header = struct.pack("<HHI", 0x4949, 42, ifd_start)
-
-    # IFD: count + entries + next_ifd_offset (0 = last)
     ifd = struct.pack("<H", num_entries) + bytes(ifd_entries_raw) + struct.pack("<I", 0)
-
-    # Padding to word-align the image data
     pad_len = img_offset - (overflow_start + len(overflow))
     pad = b"\x00" * pad_len
 
@@ -1411,8 +1883,18 @@ def _write_geotiff(grid: RasterGrid, path: Path) -> None:
         fh.write(pad)
         fh.write(img_bytes)
 
+    if crs_wkt:
+        try:
+            path.with_suffix(".prj").write_text(crs_wkt, encoding="utf-8")
+        except Exception:
+            pass
+
+    _write_aux_pam_stats(path, "0", "255")
+    _write_qml_style(path)
+
     logger.info("Wrote %s (%d × %d, %.1f KB)", path, ncols, nrows,
                 os.path.getsize(path) / 1024)
+
 
 def _validate_config(config: ExportConfig) -> None:
     """Raise ``ValueError`` if *config* is unusable."""
