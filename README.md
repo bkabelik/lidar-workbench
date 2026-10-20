@@ -15,6 +15,9 @@ Merbotogasse 58D, 2700 Wiener Neustadt, Austria · [office@kabelik.at](mailto:of
 
 Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.com/bkabelik/PointceptALS.git).
 
+##Full HOWTO Playlist:  
+[![Watch on YouTube](https://img.shields.io/badge/YouTube-Course_Playlist-red?style=for-the-badge&logo=youtube)](https://www.youtube.com/playlist?list=PLG8LnhTJkPGI)
+
 ---
 
 > [!WARNING]
@@ -26,8 +29,6 @@ Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.c
 
 ---
 
-**Full HOWTO Playlist:**  
-[![Watch on YouTube](https://img.shields.io/badge/YouTube-Course_Playlist-red?style=for-the-badge&logo=youtube)](https://www.youtube.com/playlist?list=PLG8LnhTJkPGI)
 
 
 ## Features
