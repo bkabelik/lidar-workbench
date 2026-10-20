@@ -1,11 +1,3 @@
-
-
-https://github.com/user-attachments/assets/a24c937b-cadb-4a6d-a4bc-d83682c2284c
-
-
-
-
-
 <p align="left">
   <img src="gui/assets/logo.png" alt="Kabelik" height="70">
 </p>
@@ -13,6 +5,10 @@ https://github.com/user-attachments/assets/a24c937b-cadb-4a6d-a4bc-d83682c2284c
 # LiDAR Workbench
 
 **Interactive airborne LiDAR point cloud analysis, classification, and raster export tool.**
+
+
+
+https://github.com/user-attachments/assets/a24c937b-cadb-4a6d-a4bc-d83682c2284c
 
 Developed by **[Kabelik GmbH](https://kabelik.at)** — Remote Sensing, Geomatics &amp; IT Services  
 Merbotogasse 58D, 2700 Wiener Neustadt, Austria · [office@kabelik.at](mailto:office@kabelik.at)
