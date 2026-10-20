@@ -26,6 +26,10 @@ Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.c
 
 ---
 
+**Full HOWTO Playlist:**  
+[![Watch on YouTube](https://img.shields.io/badge/YouTube-Course_Playlist-red?style=for-the-badge&logo=youtube)](https://www.youtube.com/playlist?list=PLG8LnhTJkPGI)
+
+
 ## Features
 
 ### Point Cloud Processing & AI
