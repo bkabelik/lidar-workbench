@@ -1,5 +1,11 @@
 
 
+https://github.com/user-attachments/assets/a24c937b-cadb-4a6d-a4bc-d83682c2284c
+
+
+
+
+
 <p align="left">
   <img src="gui/assets/logo.png" alt="Kabelik" height="70">
 </p>
