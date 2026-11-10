@@ -147,6 +147,11 @@ class MainWindow(QMainWindow):
         self._node_worker = CompanyNodeWorker(parent=self)
         self._node_worker.start()
 
+        # Background Project Cloud Sync timer (every 45s)
+        self._project_sync_timer = QTimer(self)
+        self._project_sync_timer.timeout.connect(lambda: self._sync_project_cloud(silent=True))
+        self._project_sync_timer.start(45000)
+
         QTimer.singleShot(1500, self._send_node_heartbeat)
 
         logger.info("MainWindow initialised")
@@ -161,6 +166,13 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_node_worker") and self._node_worker.isRunning():
             self._node_worker.stop()
             self._node_worker.wait(1000)
+        if hasattr(self, "_editor") and self._editor.tile_id and self._pm.is_open:
+            try:
+                lic = get_license_manager()
+                if lic.is_logged_in:
+                    lic.unlock_tile(self._pm.name or "LiDAR_Project", self._editor.tile_id)
+            except Exception:
+                pass
         if not self._confirm_save_if_needed():
             event.ignore()
             return
@@ -361,6 +373,12 @@ class MainWindow(QMainWindow):
         nodes_action.triggered.connect(self._on_company_nodes)
         tools_menu.addAction(nodes_action)
 
+        sync_action = QAction("&Sync Project with Cloud…", self)
+        sync_action.setObjectName("sync_project_cloud")
+        sync_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        sync_action.triggered.connect(lambda: self._sync_project_cloud(silent=False))
+        tools_menu.addAction(sync_action)
+
         tools_menu.addSeparator()
 
         settings_action = QAction("&Settings…", self)
@@ -449,6 +467,10 @@ class MainWindow(QMainWindow):
         nodes_btn = toolbar.addAction("Nodes 💻")
         nodes_btn.setToolTip("View Company Compute Nodes & Distributed GPU Cluster")
         nodes_btn.triggered.connect(self._on_company_nodes)
+
+        sync_btn = toolbar.addAction("Sync 🔄")
+        sync_btn.setToolTip("Sync project tile pipeline, QC reviews & colleague edits with company cloud (Ctrl+Shift+S)")
+        sync_btn.triggered.connect(lambda: self._sync_project_cloud(silent=False))
 
     def _setup_central_widget(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
@@ -1681,6 +1703,16 @@ class MainWindow(QMainWindow):
         label = QCStatus.LABELS.get(qc_status, "Cleared") if qc_status else "Cleared"
         self.set_status(f"QC: {label} → {len(tile_ids)} tile(s)", timeout=5000)
 
+        # Broadcast QC review to company cloud in background
+        if self._pm.is_open:
+            try:
+                lic = get_license_manager()
+                if lic.is_logged_in:
+                    proj_name = self._pm.name or "LiDAR_Project"
+                    lic.update_qc_status_online(proj_name, tile_ids, qc_status, qc_comment)
+            except Exception as e:
+                logger.debug("Failed online QC broadcast: %s", e)
+
     def _prompt_qc_comment(self, tile_ids: list) -> tuple:
         """Show a dialog asking for rework comment. Returns (comment, ok)."""
         tiles_str = ", ".join(tile_ids[:3])
@@ -2220,6 +2252,95 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logger.debug("Failed sending heartbeat: %s", e)
 
+    def _sync_project_cloud(self, silent: bool = False) -> None:
+        """Synchronize tile states, processing pipeline steps, and QC reviews with company cloud."""
+        if not self._pm.is_open:
+            if not silent:
+                QMessageBox.warning(self, "No Project", "Please open a project first before syncing.")
+            return
+
+        lic = get_license_manager()
+        if not lic.is_logged_in:
+            if not silent:
+                QMessageBox.information(
+                    self,
+                    "Sign In Required",
+                    "Please sign into your company account under Help → License & Plan to sync projects with your team.",
+                )
+            return
+
+        proj_name = self._pm.name or "LiDAR_Project"
+
+        # Gather all tiles from local database
+        tiles_data = []
+        try:
+            with self._db.connect() as conn:
+                tiles = self._db.get_all_tiles(conn)
+                for t in tiles:
+                    tid = t["id"]
+                    status = t.get("status", "IMPORTED")
+                    point_count = t.get("point_count", 0)
+                    qc_status = t.get("qc_status")
+                    qc_comment = t.get("qc_comment")
+
+                    # Deduce processing steps applied
+                    steps = ["import"]
+                    if status in ("FILTERED", "GROUND", "CLASSIFIED", "EDITED"):
+                        steps.append("filter")
+                    if status in ("GROUND", "CLASSIFIED", "EDITED"):
+                        steps.append("ground")
+                    if status in ("CLASSIFIED", "EDITED"):
+                        steps.append("pointcept")
+                    if status == "EDITED":
+                        steps.append("edited")
+
+                    tiles_data.append({
+                        "tile_id": tid,
+                        "status": status,
+                        "point_count": point_count or 0,
+                        "qc_status": qc_status,
+                        "qc_comment": qc_comment,
+                        "processing_steps": steps,
+                    })
+        except Exception as exc:
+            logger.warning("Failed gathering tiles for sync: %s", exc)
+            return
+
+        res = lic.sync_project(
+            project_name=proj_name,
+            tiles_data=tiles_data,
+            activity_action="SYNC",
+            activity_details=f"Synchronized {len(tiles_data)} tiles from workstation [{platform.node()}].",
+        )
+        if not res.get("success"):
+            if not silent:
+                QMessageBox.warning(self, "Sync Failed", res.get("error", "Could not sync with cloud."))
+            return
+
+        # Apply any remote colleague QC updates
+        remote_qc = res.get("remote_qc", {})
+        updated_remote = 0
+        if remote_qc:
+            try:
+                with self._db.connect() as conn:
+                    for tid, qdata in remote_qc.items():
+                        remote_status = qdata.get("qc_status")
+                        remote_comment = qdata.get("qc_comment")
+                        local_tile = self._db.get_tile(tid)
+                        if local_tile and local_tile.get("qc_status") != remote_status:
+                            self._db.set_qc_status(conn, tid, remote_status, remote_comment)
+                            self._tile_list_widget.update_tile_qc_status(tid, remote_status, remote_comment)
+                            updated_remote += 1
+            except Exception as e:
+                logger.debug("Failed applying remote QC updates: %s", e)
+
+        msg = f"Project synchronized with cloud ({len(tiles_data)} tiles)"
+        if updated_remote > 0:
+            msg += f" — updated {updated_remote} remote review(s)"
+        self.set_status(msg, timeout=5000)
+        if not silent:
+            QMessageBox.information(self, "Cloud Sync Complete", msg)
+
     def _on_license(self) -> None:
         from .license_dialog import LicenseDialog
         dlg = LicenseDialog(self)
@@ -2620,9 +2741,36 @@ importing.  Shows point count, extent, CRS, and attribute summary.</p>
 
     def _on_tile_open(self, tile_id: str) -> None:
         """Open a tile in the multi-view for inspection and editing."""
+        prev_tile = getattr(self, "_editor", None).tile_id if hasattr(self, "_editor") else None
         if hasattr(self, "_editor") and self._editor.tile_id and self._editor.tile_id != tile_id and self._editor.is_dirty:
             self.set_status(f"Saving changes to tile {self._editor.tile_id}…", timeout=0)
             self._editor.save_tile()
+
+        # Release lock on previous tile
+        if prev_tile and prev_tile != tile_id and self._pm.is_open:
+            try:
+                lic = get_license_manager()
+                if lic.is_logged_in:
+                    lic.unlock_tile(self._pm.name or "LiDAR_Project", prev_tile)
+            except Exception:
+                pass
+
+        # Collaborative Lock check for multi-user editing
+        if self._pm.is_open:
+            try:
+                lic = get_license_manager()
+                if lic.is_logged_in:
+                    lock_res = lic.lock_tile(self._pm.name or "LiDAR_Project", tile_id)
+                    if lock_res.get("locked") and not lock_res.get("acquired"):
+                        locked_by = lock_res.get("locked_by", "another team member")
+                        QMessageBox.warning(
+                            self,
+                            "Tile Locked by Colleague",
+                            f"⚠️ Notice: Tile '{tile_id}' is currently being edited by {locked_by}.\n\n"
+                            "You can inspect points and profile, but please coordinate with your colleague before saving edits.",
+                        )
+            except Exception as exc:
+                logger.debug("Tile lock check failed: %s", exc)
 
         self.set_status(f"Opening {tile_id}…", timeout=0)
         logger.info("Open requested for tile: %s", tile_id)

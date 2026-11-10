@@ -368,6 +368,138 @@ class LicenseManager:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def sync_project(
+        self,
+        project_name: str,
+        tiles_data: List[Dict[str, Any]],
+        activity_action: Optional[str] = None,
+        activity_details: Optional[str] = None,
+        server_url: str = DEFAULT_SERVER_URL,
+    ) -> Dict[str, Any]:
+        """Sync local tile states, processing steps, and QC reviews with company cloud."""
+        if not self.is_logged_in:
+            return {"success": False, "error": "Not signed in"}
+
+        url = server_url.rstrip("/") + "/api/v1/projects/sync"
+        payload = {
+            "project_name": project_name,
+            "user_email": self.user_email,
+            "node_name": platform.node(),
+            "tiles": tiles_data,
+            "activity_action": activity_action,
+            "activity_details": activity_details,
+        }
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.access_token}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def lock_tile(
+        self,
+        project_name: str,
+        tile_id: str,
+        server_url: str = DEFAULT_SERVER_URL,
+    ) -> Dict[str, Any]:
+        """Acquire collaborative editing lock on a tile."""
+        if not self.is_logged_in:
+            return {"acquired": True, "locked": False}
+
+        url = f"{server_url.rstrip('/')}/api/v1/projects/{urllib.parse.quote(project_name)}/lock-tile"
+        payload = {
+            "tile_id": tile_id,
+            "user_email": self.user_email,
+            "node_name": platform.node(),
+        }
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.access_token}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            return {"acquired": True, "error": str(e)}
+
+    def unlock_tile(
+        self,
+        project_name: str,
+        tile_id: str,
+        server_url: str = DEFAULT_SERVER_URL,
+    ) -> Dict[str, Any]:
+        """Release collaborative editing lock on a tile."""
+        if not self.is_logged_in:
+            return {"unlocked": True}
+
+        url = f"{server_url.rstrip('/')}/api/v1/projects/{urllib.parse.quote(project_name)}/unlock-tile"
+        payload = {
+            "tile_id": tile_id,
+            "user_email": self.user_email,
+            "node_name": platform.node(),
+        }
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.access_token}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            return {"unlocked": True, "error": str(e)}
+
+    def update_qc_status_online(
+        self,
+        project_name: str,
+        tile_ids: List[str],
+        qc_status: Optional[str],
+        qc_comment: Optional[str] = None,
+        server_url: str = DEFAULT_SERVER_URL,
+    ) -> Dict[str, Any]:
+        """Broadcast QC review changes to company cloud."""
+        if not self.is_logged_in:
+            return {"success": False}
+
+        url = f"{server_url.rstrip('/')}/api/v1/projects/{urllib.parse.quote(project_name)}/qc-status"
+        payload = {
+            "tile_ids": tile_ids,
+            "user_email": self.user_email,
+            "qc_status": qc_status,
+            "qc_comment": qc_comment,
+        }
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.access_token}",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def can_create_project(self) -> Tuple[bool, int, int]:
         """
         Check if the user is allowed to create another project under their plan.

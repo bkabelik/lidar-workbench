@@ -74,3 +74,43 @@ def test_company_node_worker_lifecycle():
     assert worker._stop_requested is False
     worker.stop()
     assert worker._stop_requested is True
+
+
+def test_license_manager_sync_and_locking(tmp_path):
+    cache = tmp_path / "lic.json"
+    mgr = LicenseManager(cache_file=cache)
+    mgr._data["user_email"] = "analyst@geoteam.com"
+    mgr._data["access_token"] = "fake-jwt-token"
+
+    # Test sync_project
+    with patch("urllib.request.urlopen") as mock_url:
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"success": true, "project_id": 1, "remote_locks": {}, "remote_qc": {}}'
+        mock_resp.__enter__.return_value = mock_resp
+        mock_url.return_value = mock_resp
+
+        res = mgr.sync_project("Demo_Project", [{"tile_id": "tile_001", "status": "CLASSIFIED"}])
+        assert res["success"] is True
+        assert res["project_id"] == 1
+
+    # Test lock_tile
+    with patch("urllib.request.urlopen") as mock_url:
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"acquired": true, "locked": true, "locked_by": "analyst@geoteam.com"}'
+        mock_resp.__enter__.return_value = mock_resp
+        mock_url.return_value = mock_resp
+
+        res = mgr.lock_tile("Demo_Project", "tile_001")
+        assert res["acquired"] is True
+        assert res["locked_by"] == "analyst@geoteam.com"
+
+    # Test unlock_tile
+    with patch("urllib.request.urlopen") as mock_url:
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b'{"success": true, "unlocked": true}'
+        mock_resp.__enter__.return_value = mock_resp
+        mock_url.return_value = mock_resp
+
+        res = mgr.unlock_tile("Demo_Project", "tile_001")
+        assert res["unlocked"] is True
+
