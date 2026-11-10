@@ -221,10 +221,13 @@ class PropertiesPanel(QWidget):
                 f"QPushButton {{"
                 f"  text-align: left;"
                 f"  padding: 4px 8px;"
-                f"  border-left: 4px solid {hex_color};"
-                f"  background: #f9f9f9;"
+                f"  border: 1px solid palette(mid);"
+                f"  border-left: 5px solid {hex_color};"
+                f"  background: palette(button);"
+                f"  color: palette(button-text);"
+                f"  border-radius: 3px;"
                 f"}}"
-                f"QPushButton:hover {{ background: #e8e8e8; }}"
+                f"QPushButton:hover {{ background: palette(midlight); }}"
             )
             btn.clicked.connect(lambda checked, c=code: self.classify_requested.emit(c))
             classify_layout.addWidget(btn)

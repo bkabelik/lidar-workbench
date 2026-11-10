@@ -266,8 +266,16 @@ class PointceptWorker(QThread):
         if not las_path.is_file():
             raise FileNotFoundError(f"LAS file not found: {las_path}")
 
-        # Resolve config path (may be relative to Pointcept root)
-        config_full = self._pointcept_path / self._config_path_rel
+        # Resolve config path (may be absolute or relative to Pointcept root)
+        config_p = Path(self._config_path_rel)
+        if config_p.is_file():
+            config_full = config_p.resolve()
+        elif (self._pointcept_path / config_p).is_file():
+            config_full = (self._pointcept_path / config_p).resolve()
+        elif (self._pointcept_path / "configs" / config_p).is_file():
+            config_full = (self._pointcept_path / "configs" / config_p).resolve()
+        else:
+            config_full = (self._pointcept_path / self._config_path_rel).resolve()
         if not config_full.is_file():
             raise FileNotFoundError(f"Config file not found: {config_full}")
 
@@ -283,14 +291,20 @@ class PointceptWorker(QThread):
             work_path = Path(work_dir)
             # Symlink the LAS file into the work dir
             dest = work_path / las_path.name
-            dest.symlink_to(las_path.resolve())
+            try:
+                dest.symlink_to(las_path.resolve())
+            except OSError:
+                try:
+                    os.link(str(las_path.resolve()), str(dest))
+                except OSError:
+                    shutil.copyfile(str(las_path.resolve()), str(dest))
 
             cmd = [
                 self._python_exe,
                 str(self._pointcept_path / "prediction.py"),
                 "--folder", str(work_path),
                 "--model_path", str(self._model_path),
-                "--config_file", str(self._config_path_rel),
+                "--config_file", str(config_full),
                 "--noise_filter", "no",
                 "--smoothing", self._smoothing,
                 "--voxel_size", str(self._voxel_size),
@@ -304,7 +318,7 @@ class PointceptWorker(QThread):
                     cmd,
                     capture_output=True,
                     text=True,
-                    cwd=str(self._pointcept_path),
+                    cwd=str(work_path),
                     env=env,
                     timeout=7200,  # 2 hours max per tile
                 )

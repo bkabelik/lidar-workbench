@@ -9,7 +9,10 @@ import numpy as np
 import wandb
 import torch
 import torch.distributed as dist
-import pointops
+try:
+    import pointops
+except ImportError:
+    pointops = None
 from uuid import uuid4
 
 import pointcept.utils.comm as comm

@@ -73,6 +73,8 @@ class SerializedAttention(PointModule):
         self.upcast_attention = upcast_attention
         self.upcast_softmax = upcast_softmax
         self.enable_rpe = enable_rpe
+        if enable_flash and flash_attn is None:
+            enable_flash = False
         self.enable_flash = enable_flash
         if enable_flash:
             assert (

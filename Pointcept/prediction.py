@@ -337,7 +337,7 @@ def main():
     
     print("=> Building model ...")
     model = build_model(cfg.model).cuda()
-    checkpoint = torch.load(args.model_path)
+    checkpoint = torch.load(args.model_path, weights_only=False)
     weight = OrderedDict()
     for key, value in checkpoint["state_dict"].items():
         if key.startswith("module."): key = key[7:]

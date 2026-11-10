@@ -55,6 +55,9 @@ from .processing_analysis_dialog import ProcessingAnalysisDialog
 from .properties_panel import PropertiesPanel
 from .settings_dialog import SettingsDialog, load_shortcuts
 from .tile_list_widget import TileListWidget
+from .company_nodes_dialog import CompanyNodesDialog
+from ..node_worker import CompanyNodeWorker
+from ..licensing import get_license_manager
 
 logger = logging.getLogger("lidar_workbench.gui.main_window")
 
@@ -136,6 +139,16 @@ class MainWindow(QMainWindow):
         # Register global shortcuts (selection modes, tile nav)
         self._register_shortcuts()
 
+        # Company Node heartbeat & background worker
+        self._node_heartbeat_timer = QTimer(self)
+        self._node_heartbeat_timer.timeout.connect(self._send_node_heartbeat)
+        self._node_heartbeat_timer.start(20000)
+
+        self._node_worker = CompanyNodeWorker(parent=self)
+        self._node_worker.start()
+
+        QTimer.singleShot(1500, self._send_node_heartbeat)
+
         logger.info("MainWindow initialised")
 
     def closeEvent(self, event) -> None:
@@ -145,6 +158,9 @@ class MainWindow(QMainWindow):
         so the only thing that can remain unsaved is the project metadata
         (project.json).  We track that with :attr:`_project_dirty`.
         """
+        if hasattr(self, "_node_worker") and self._node_worker.isRunning():
+            self._node_worker.stop()
+            self._node_worker.wait(1000)
         if not self._confirm_save_if_needed():
             event.ignore()
             return
@@ -249,6 +265,12 @@ class MainWindow(QMainWindow):
         import_action.triggered.connect(self._on_import)
         file_menu.addAction(import_action)
 
+        publish_action = QAction("&Publish to Cloud…", self)
+        publish_action.setShortcut(QKeySequence("Ctrl+Shift+U"))
+        publish_action.setObjectName("publish_cloud")
+        publish_action.triggered.connect(self._on_cloud_publish)
+        file_menu.addAction(publish_action)
+
         file_menu.addSeparator()
 
         exit_action = QAction("E&xit", self)
@@ -334,6 +356,11 @@ class MainWindow(QMainWindow):
         analysis_action.triggered.connect(self._on_processing_analysis)
         tools_menu.addAction(analysis_action)
 
+        nodes_action = QAction("&Company Compute Nodes (Cluster)…", self)
+        nodes_action.setObjectName("company_nodes")
+        nodes_action.triggered.connect(self._on_company_nodes)
+        tools_menu.addAction(nodes_action)
+
         tools_menu.addSeparator()
 
         settings_action = QAction("&Settings…", self)
@@ -353,6 +380,10 @@ class MainWindow(QMainWindow):
         website_action = QAction("Kabelik &Website", self)
         website_action.triggered.connect(self._on_website)
         help_menu.addAction(website_action)
+
+        license_action = QAction("&License & Plan…", self)
+        license_action.triggered.connect(self._on_license)
+        help_menu.addAction(license_action)
 
         about_action = QAction("&About", self)
         about_action.triggered.connect(self._on_about)
@@ -408,6 +439,16 @@ class MainWindow(QMainWindow):
         point_qc_btn = toolbar.addAction("PointQC")
         point_qc_btn.setToolTip("Point QC & Map Viewer (raster/vector viewer, strip differences, density, spacing)")
         point_qc_btn.triggered.connect(self._on_point_qc)
+
+        toolbar.addSeparator()
+
+        publish_btn = toolbar.addAction("Publish 🚀")
+        publish_btn.setToolTip("Publish project deliverables to cloud & get shareable client link")
+        publish_btn.triggered.connect(self._on_cloud_publish)
+
+        nodes_btn = toolbar.addAction("Nodes 💻")
+        nodes_btn.setToolTip("View Company Compute Nodes & Distributed GPU Cluster")
+        nodes_btn.triggered.connect(self._on_company_nodes)
 
     def _setup_central_widget(self) -> None:
         splitter = QSplitter(Qt.Horizontal)
@@ -562,6 +603,22 @@ class MainWindow(QMainWindow):
     def _on_new_project(self) -> None:
         if not self._confirm_save_if_needed():
             return
+
+        from ..licensing import get_license_manager
+        from .license_dialog import LicenseDialog
+        lm = get_license_manager()
+        allowed, current, limit = lm.can_create_project()
+        if not allowed:
+            QMessageBox.warning(
+                self,
+                "Project Limit Reached",
+                f"You have reached your current plan limit of {limit} project(s) ({current} created).\n\n"
+                "To create additional projects, please upgrade or enter your License Key.",
+            )
+            dlg = LicenseDialog(self)
+            dlg.exec()
+            return
+
         directory = QFileDialog.getExistingDirectory(
             self, "Select Project Location"
         )
@@ -587,6 +644,7 @@ class MainWindow(QMainWindow):
             self._clear_project_dirty()
             self._refresh_tile_list()
             self._add_recent_project(str(proj_dir))
+            lm.register_created_project(str(proj_dir))
             self.set_status(f"Created project '{name}' in {directory}")
         except Exception as exc:
             logger.error("Failed to create project: %s", exc, exc_info=True)
@@ -2141,6 +2199,31 @@ class MainWindow(QMainWindow):
         from PySide6.QtGui import QDesktopServices
         from PySide6.QtCore import QUrl
         QDesktopServices.openUrl(QUrl(APP_WEBSITE))
+
+    def _on_cloud_publish(self) -> None:
+        if not self._pm.is_open:
+            QMessageBox.warning(self, "No Project", "Please open or create a project before publishing to cloud.")
+            return
+        from .cloud_publish_dialog import CloudPublishDialog
+        dlg = CloudPublishDialog(self._pm, self)
+        dlg.exec()
+
+    def _on_company_nodes(self) -> None:
+        dlg = CompanyNodesDialog(self)
+        dlg.exec()
+
+    def _send_node_heartbeat(self) -> None:
+        try:
+            lic = get_license_manager()
+            if lic.is_logged_in:
+                lic.send_node_heartbeat()
+        except Exception as e:
+            logger.debug("Failed sending heartbeat: %s", e)
+
+    def _on_license(self) -> None:
+        from .license_dialog import LicenseDialog
+        dlg = LicenseDialog(self)
+        dlg.exec()
 
     def _on_about(self) -> None:
         from pathlib import Path

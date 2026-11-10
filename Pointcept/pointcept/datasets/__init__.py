@@ -7,35 +7,37 @@ from .defaults import (
 from .builder import build_dataset
 from .utils import point_collate_fn, collate_fn
 
+def _safe_import(module_name, symbols):
+    import importlib
+    try:
+        mod = importlib.import_module(f".{module_name}", package=__name__)
+        for s in symbols:
+            globals()[s] = getattr(mod, s, None)
+    except Exception:
+        pass
+
 # indoor scene
-from .s3dis import S3DISDataset
-from .scannet import (
-    ScanNetDataset,
-    ScanNet200Dataset,
-)
-from .scannetpp import ScanNetPPDataset
-from .scannet_pair import ScanNetPairDataset
-from .hm3d import HM3DDataset
-from .structure3d import Structured3DDataset
-from .aeo import AEODataset
+_safe_import("s3dis", ["S3DISDataset"])
+_safe_import("scannet", ["ScanNetDataset", "ScanNet200Dataset"])
+_safe_import("scannetpp", ["ScanNetPPDataset"])
+_safe_import("scannet_pair", ["ScanNetPairDataset"])
+_safe_import("hm3d", ["HM3DDataset"])
+_safe_import("structure3d", ["Structured3DDataset"])
+_safe_import("aeo", ["AEODataset"])
 
 # outdoor scene
-from .semantic_kitti import SemanticKITTIDataset, SemanticKITTIImagePointDataset
-from .nuscenes import NuScenesDataset, NuScenesImagePointDataset
-from .waymo import WaymoDataset
-from .hk import HKDataset
+_safe_import("semantic_kitti", ["SemanticKITTIDataset", "SemanticKITTIImagePointDataset"])
+_safe_import("nuscenes", ["NuScenesDataset", "NuScenesImagePointDataset"])
+_safe_import("waymo", ["WaymoDataset"])
+_safe_import("hk", ["HKDataset"])
 
 # object
-from .modelnet import ModelNetDataset
-from .shapenet_part import ShapeNetPartDataset
-from .cap3d import Cap3DDataset, Cap3DImagePointDataset
-from .scanobjectnn import (
-    ScanObjectNNDataset,
-    ScanObjectNNHardestDataset,
-    ScanObjectNNRawDataset,
-)
-from .partnet import PartNetDataDataset
-from .partnete import PartNetEDataset
+_safe_import("modelnet", ["ModelNetDataset"])
+_safe_import("shapenet_part", ["ShapeNetPartDataset"])
+_safe_import("cap3d", ["Cap3DDataset", "Cap3DImagePointDataset"])
+_safe_import("scanobjectnn", ["ScanObjectNNDataset", "ScanObjectNNHardestDataset", "ScanObjectNNRawDataset"])
+_safe_import("partnet", ["PartNetDataDataset"])
+_safe_import("partnete", ["PartNetEDataset"])
 
 # dataloader
-from .dataloader import MultiDatasetDataloader
+_safe_import("dataloader", ["MultiDatasetDataloader"])

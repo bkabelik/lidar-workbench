@@ -656,8 +656,9 @@ class TestPointQC(unittest.TestCase):
         self.assertEqual(overlay_legend.width(), 600)
         self.assertEqual(overlay_legend.height(), 140)
         pm_4k = overlay_legend.grab()
-        self.assertEqual(pm_4k.width(), 600)
-        self.assertEqual(pm_4k.height(), 140)
+        dpr = pm_4k.devicePixelRatio() if hasattr(pm_4k, "devicePixelRatio") else 1.0
+        self.assertEqual(pm_4k.width(), int(600 * dpr))
+        self.assertEqual(pm_4k.height(), int(140 * dpr))
 
     def test_point_qc_window_filter_combo_and_unit_adaptation(self):
         """Test PointQCWindow return filter options, toolbar legend toggle, and style adaptation."""

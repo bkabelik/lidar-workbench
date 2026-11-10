@@ -433,19 +433,19 @@ class TestRasterAndLasExport(unittest.TestCase):
             self.assertIn("tile_grid.prj", file_names)
             self.assertIn("tile_grid.qml", file_names)
 
-            sf = shapefile.Reader(str(Path(tmpdir) / "tile_grid.shp"))
-            self.assertEqual(len(sf.shapes()), 2)
-            self.assertEqual(sf.shapes()[0].shapeType, shapefile.POLYGON)
-            rec0 = sf.record(0)
-            self.assertEqual(rec0["tile_id"], "tile_0001")
-            self.assertAlmostEqual(rec0["width_m"], 200.0)
+            with shapefile.Reader(str(Path(tmpdir) / "tile_grid.shp")) as sf:
+                self.assertEqual(len(sf.shapes()), 2)
+                self.assertEqual(sf.shapes()[0].shapeType, shapefile.POLYGON)
+                rec0 = sf.record(0)
+                self.assertEqual(rec0["tile_id"], "tile_0001")
+                self.assertAlmostEqual(rec0["width_m"], 200.0)
 
-            # Check that adjacent tiles touch with NO OVERLAP
-            # tile 1 max_x == tile 2 min_x == 300.0
-            self.assertAlmostEqual(rec0["max_x"], 300.0)
-            rec1 = sf.record(1)
-            self.assertEqual(rec1["tile_id"], "tile_0002")
-            self.assertAlmostEqual(rec1["min_x"], 300.0)
+                # Check that adjacent tiles touch with NO OVERLAP
+                # tile 1 max_x == tile 2 min_x == 300.0
+                self.assertAlmostEqual(rec0["max_x"], 300.0)
+                rec1 = sf.record(1)
+                self.assertEqual(rec1["tile_id"], "tile_0002")
+                self.assertAlmostEqual(rec1["min_x"], 300.0)
 
             # 2. GeoPackage verification
             self.assertIn("tile_grid.gpkg", file_names)

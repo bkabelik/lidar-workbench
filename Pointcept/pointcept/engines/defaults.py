@@ -121,9 +121,12 @@ def default_config_parser(file_path, options):
 
     cfg.data.train.loop = cfg.epoch // cfg.eval_epoch
 
-    os.makedirs(os.path.join(cfg.save_path, "model"), exist_ok=True)
-    if not cfg.resume:
-        cfg.dump(os.path.join(cfg.save_path, "config.py"))
+    try:
+        os.makedirs(os.path.join(cfg.save_path, "model"), exist_ok=True)
+        if not cfg.resume:
+            cfg.dump(os.path.join(cfg.save_path, "config.py"))
+    except OSError:
+        pass
     return cfg
 
 

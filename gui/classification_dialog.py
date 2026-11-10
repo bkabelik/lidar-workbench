@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -23,12 +23,17 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
 from ..config import (
@@ -39,6 +44,7 @@ from ..config import (
 from ..database import Database
 from ..pointcept_worker import PointceptWorker
 from ..tile_manager import TileManager
+from ..licensing import get_license_manager, get_local_gpu_name
 
 logger = logging.getLogger("lidar_workbench.gui.classification_dialog")
 
@@ -59,6 +65,50 @@ def _save_settings(settings: dict) -> None:
             json.dump(settings, f, indent=2)
     except Exception as exc:
         logger.warning("Could not save Pointcept settings: %s", exc)
+
+
+class DistributedJobMonitor(QThread):
+    progress = Signal(str, float)      # status_text, percent
+    completed = Signal(dict)           # final_result
+    error = Signal(str)
+
+    def __init__(self, job_id: int, total_tiles: int, licensing_mgr, parent=None):
+        super().__init__(parent)
+        self.job_id = job_id
+        self.total_tiles = total_tiles
+        self.lic = licensing_mgr
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        import time
+        while not self._cancelled:
+            res = self.lic.get_job_status(self.job_id)
+            if res.get("status") == "error":
+                self.error.emit(res.get("message", "Network error while polling job status"))
+                return
+            
+            status = res.get("status", "processing")
+            done = res.get("processed_tiles", 0)
+            total = res.get("total_tiles", self.total_tiles)
+            pct = (done / total * 100.0) if total > 0 else 0.0
+            workers = res.get("active_workers", [])
+            worker_str = f" across {len(workers)} node(s)" if workers else ""
+
+            self.progress.emit(f"Processing distributed batch: {done}/{total} tiles completed{worker_str}…", pct)
+
+            if status == "completed" or (total > 0 and done >= total):
+                self.progress.emit(f"✅ All {done} tiles processed successfully across company nodes!", 100.0)
+                self.completed.emit(res)
+                return
+
+            if status == "failed":
+                self.error.emit("Distributed compute job failed on remote nodes.")
+                return
+
+            time.sleep(1.5)
 
 
 class ClassificationDialog(QDialog):
@@ -83,9 +133,12 @@ class ClassificationDialog(QDialog):
         self._db = database
         self._tile_ids = tile_ids
         self._worker: Optional[PointceptWorker] = None
+        self._lic = get_license_manager()
+        self._cluster_monitor: Optional[DistributedJobMonitor] = None
+        self._node_rows: List[tuple[int, QCheckBox]] = []
 
         self.setWindowTitle("Pointcept Classification")
-        self.setMinimumSize(550, 400)
+        self.setMinimumSize(600, 520)
         self._setup_ui()
         self._restore_settings()
 
@@ -142,6 +195,57 @@ class ClassificationDialog(QDialog):
         infer_form.addRow(self._smoothing_check)
 
         layout.addWidget(infer_group)
+
+        # ── Compute Execution (Local vs Company Cluster) ───────────
+        compute_group = QGroupBox("Compute Execution")
+        compute_layout = QVBoxLayout(compute_group)
+
+        local_gpu_label = f"Local GPU Only ({get_local_gpu_name()})"
+        self._radio_local = QRadioButton(local_gpu_label)
+        self._radio_local.setChecked(True)
+        self._radio_local.toggled.connect(self._on_compute_mode_changed)
+
+        cluster_label = "Distribute Across Company Nodes (Peer-to-Peer Cluster)"
+        self._radio_cluster = QRadioButton(cluster_label)
+        self._radio_cluster.toggled.connect(self._on_compute_mode_changed)
+
+        compute_layout.addWidget(self._radio_local)
+        compute_layout.addWidget(self._radio_cluster)
+
+        # Cluster selection container
+        self._cluster_widget = QWidget()
+        cluster_vbox = QVBoxLayout(self._cluster_widget)
+        cluster_vbox.setContentsMargins(0, 4, 0, 0)
+
+        self._nodes_table = QTableWidget()
+        self._nodes_table.setColumnCount(5)
+        self._nodes_table.setHorizontalHeaderLabels(["Select", "Node Name", "Team Member", "GPU Model", "Status"])
+        h = self._nodes_table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(3, QHeaderView.Stretch)
+        h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        self._nodes_table.setMaximumHeight(140)
+        self._nodes_table.setAlternatingRowColors(True)
+        cluster_vbox.addWidget(self._nodes_table)
+
+        btn_row = QHBoxLayout()
+        self._select_all_btn = QPushButton("Select All")
+        self._select_all_btn.clicked.connect(self._select_all_nodes)
+        self._refresh_nodes_btn = QPushButton("🔄 Refresh Nodes")
+        self._refresh_nodes_btn.clicked.connect(self._load_cluster_nodes)
+        self._cluster_summary_label = QLabel("0 nodes selected")
+        btn_row.addWidget(self._select_all_btn)
+        btn_row.addWidget(self._refresh_nodes_btn)
+        btn_row.addWidget(self._cluster_summary_label)
+        btn_row.addStretch()
+        cluster_vbox.addLayout(btn_row)
+
+        compute_layout.addWidget(self._cluster_widget)
+        self._cluster_widget.setVisible(False)
+
+        layout.addWidget(compute_group)
 
         # ── Info ───────────────────────────────────────────────────
         info_label = QLabel(
@@ -205,6 +309,86 @@ class ClassificationDialog(QDialog):
             "smoothing": self._smoothing_check.isChecked(),
         })
 
+    # ── compute mode & cluster handling ────────────────────────────
+
+    def _on_compute_mode_changed(self) -> None:
+        is_cluster = self._radio_cluster.isChecked()
+        self._cluster_widget.setVisible(is_cluster)
+        if is_cluster:
+            self._load_cluster_nodes()
+
+    def _select_all_nodes(self) -> None:
+        for _, chk in self._node_rows:
+            chk.setChecked(True)
+        self._update_selected_summary()
+
+    def _update_selected_summary(self) -> None:
+        count = sum(1 for _, chk in self._node_rows if chk.isChecked())
+        self._cluster_summary_label.setText(f"{count}/{len(self._node_rows)} nodes selected")
+
+    def _load_cluster_nodes(self) -> None:
+        if not self._lic.is_logged_in:
+            QMessageBox.information(
+                self,
+                "Sign In Required",
+                "You must be signed into your company account to distribute jobs across company nodes.\n\n"
+                "Please go to Help → License & Plan to sign in.",
+            )
+            self._radio_local.setChecked(True)
+            return
+
+        # Send heartbeat so our own workstation is also listed
+        self._lic.send_node_heartbeat()
+        nodes = self._lic.fetch_company_nodes()
+
+        self._node_rows.clear()
+        self._nodes_table.setRowCount(len(nodes))
+
+        import platform
+        this_pc = platform.node()
+
+        for row, n in enumerate(nodes):
+            nid = n.get("id")
+            name = n.get("node_name", "")
+            is_this = (name == this_pc)
+            is_online = n.get("is_online", False)
+
+            # Checkbox
+            chk = QCheckBox()
+            # Default check all online nodes
+            chk.setChecked(is_online)
+            chk.setEnabled(is_online)
+            chk.toggled.connect(self._update_selected_summary)
+            self._node_rows.append((nid, chk))
+
+            chk_widget = QWidget()
+            chk_layout = QHBoxLayout(chk_widget)
+            chk_layout.setContentsMargins(8, 0, 0, 0)
+            chk_layout.addWidget(chk)
+            chk_layout.setAlignment(Qt.AlignCenter)
+            self._nodes_table.setCellWidget(row, 0, chk_widget)
+
+            # Node Name
+            disp_name = f"{name} (This PC)" if is_this else name
+            self._nodes_table.setItem(row, 1, QTableWidgetItem(disp_name))
+
+            # Member
+            member = n.get("user_email", "")
+            if n.get("user_name"):
+                member = f"{n['user_name']} ({member})"
+            self._nodes_table.setItem(row, 2, QTableWidgetItem(member))
+
+            # GPU
+            self._nodes_table.setItem(row, 3, QTableWidgetItem(n.get("gpu_name", "NVIDIA GPU")))
+
+            # Status
+            stat = "🟢 Online" if is_online else "⚪ Offline"
+            if is_online and n.get("status") == "busy":
+                stat = "🟡 Busy"
+            self._nodes_table.setItem(row, 4, QTableWidgetItem(stat))
+
+        self._update_selected_summary()
+
     # ── browse ─────────────────────────────────────────────────────
 
     def _make_path_row(
@@ -241,6 +425,44 @@ class ClassificationDialog(QDialog):
     # ── start / cancel ─────────────────────────────────────────────
 
     def _on_start(self) -> None:
+        if self._radio_cluster.isChecked():
+            # Distributed Mode across selected Company Nodes
+            selected_node_ids = [nid for nid, chk in self._node_rows if chk.isChecked()]
+            if not selected_node_ids:
+                QMessageBox.warning(
+                    self,
+                    "No Nodes Selected",
+                    "Please select at least one online company node from the table to process the batch.",
+                )
+                return
+
+            self._start_btn.setEnabled(False)
+            self._cancel_btn.setEnabled(True)
+            self._progress_bar.setValue(0)
+            self._status_label.setText(
+                f"Dispatching {len(self._tile_ids)} tiles across {len(selected_node_ids)} company nodes…"
+            )
+
+            res = self._lic.dispatch_job(self._tile_ids, selected_node_ids)
+            if not res.get("success"):
+                self._start_btn.setEnabled(True)
+                self._cancel_btn.setEnabled(False)
+                QMessageBox.critical(
+                    self,
+                    "Dispatch Failed",
+                    res.get("error", "Failed to dispatch distributed job to company nodes."),
+                )
+                return
+
+            job_id = res["job_id"]
+            self._cluster_monitor = DistributedJobMonitor(job_id, len(self._tile_ids), self._lic, self)
+            self._cluster_monitor.progress.connect(self._on_cluster_progress)
+            self._cluster_monitor.completed.connect(self._on_cluster_completed)
+            self._cluster_monitor.error.connect(self._on_cluster_error)
+            self._cluster_monitor.start()
+            return
+
+        # Local Mode
         pointcept_path = self._pointcept_edit.text().strip()
         model_path = self._model_edit.text().strip()
         config_path = self._config_edit.text().strip()
@@ -287,9 +509,39 @@ class ClassificationDialog(QDialog):
         self._worker.start()
 
     def _on_cancel(self) -> None:
+        if self._cluster_monitor is not None and self._cluster_monitor.isRunning():
+            self._cluster_monitor.cancel()
+            self._status_label.setText("Cancelling distributed job…")
+            self._start_btn.setEnabled(True)
+            self._cancel_btn.setEnabled(False)
+
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._status_label.setText("Cancelling…")
+
+    # ── cluster monitor handlers ───────────────────────────────────
+
+    def _on_cluster_progress(self, msg: str, pct: float) -> None:
+        self._status_label.setText(msg)
+        self._progress_bar.setValue(int(pct))
+
+    def _on_cluster_completed(self, data: dict) -> None:
+        self._start_btn.setEnabled(True)
+        self._cancel_btn.setEnabled(False)
+        self._progress_bar.setValue(100)
+        processed = data.get("processed_tiles", len(self._tile_ids))
+        self._status_label.setText(f"Done — {processed}/{len(self._tile_ids)} tiles classified across company nodes.")
+        QMessageBox.information(
+            self,
+            "Distributed Classification Complete",
+            f"Successfully processed {processed} tiles using the company compute pool!",
+        )
+
+    def _on_cluster_error(self, error: str) -> None:
+        self._start_btn.setEnabled(True)
+        self._cancel_btn.setEnabled(False)
+        self._status_label.setText("Error in distributed execution.")
+        QMessageBox.critical(self, "Cluster Error", error)
 
     # ── worker signal handlers ─────────────────────────────────────
 
@@ -317,6 +569,9 @@ class ClassificationDialog(QDialog):
         )
 
     def closeEvent(self, event) -> None:
+        if self._cluster_monitor is not None and self._cluster_monitor.isRunning():
+            self._cluster_monitor.cancel()
+            self._cluster_monitor.wait(2000)
         if self._worker is not None and self._worker.isRunning():
             self._worker.cancel()
             self._worker.wait(3000)

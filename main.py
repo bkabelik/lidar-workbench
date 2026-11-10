@@ -26,12 +26,15 @@ if "__EGL_VENDOR_LIBRARY_DIRS" not in os.environ and "EGL_VENDOR_LIBRARY_DIRS" n
 
 from PySide6.QtWidgets import QApplication
 
-# Allow running directly (python main.py) as well as via -m
+# Allow running directly (python main.py) as well as via -m or frozen PyInstaller
 if __name__ == "__main__" and not __package__:
     import os as _os
     import types as _types
 
-    _pkg_dir = _os.path.dirname(_os.path.abspath(__file__))
+    _base = getattr(sys, "_MEIPASS", _os.path.dirname(_os.path.abspath(__file__)))
+    _pkg_dir = _base
+    if _base not in sys.path:
+        sys.path.insert(0, _base)
     if "lidar_workbench" not in sys.modules:
         _mod = _types.ModuleType("lidar_workbench")
         _mod.__path__ = [_pkg_dir]
@@ -40,7 +43,7 @@ if __name__ == "__main__" and not __package__:
         sys.modules["lidar_workbench"] = _mod
     __package__ = "lidar_workbench"
 
-from .config import APP_NAME, APP_ORG, APP_VERSION, setup_logging
+from .config import APP_NAME, APP_ORG, APP_VERSION, setup_logging, _resolve_bundled_path
 from .database import Database
 from .project_manager import ProjectManager
 from .tile_manager import TileManager
@@ -71,6 +74,21 @@ def main() -> int:
     Returns:
         Exit code (0 on success).
     """
+    import multiprocessing
+    multiprocessing.freeze_support()
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--exec":
+        exec(sys.argv[2])
+        return 0
+    # Check if invoked for background Pointcept prediction (e.g. from frozen exe)
+    if len(sys.argv) > 1 and ("prediction.py" in sys.argv[1] or sys.argv[1] == "--prediction"):
+        pointcept_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Pointcept")
+        if pointcept_dir not in sys.path:
+            sys.path.insert(0, pointcept_dir)
+        from Pointcept.prediction import main as pred_main
+        sys.argv.pop(1)
+        pred_main()
+        return 0
     args = _parse_args(sys.argv)
 
     # Logging
@@ -81,6 +99,10 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_ORG)
+    icon_path = _resolve_bundled_path("gui/assets/app_icon.png")
+    if os.path.isfile(icon_path):
+        from PySide6.QtGui import QIcon
+        app.setWindowIcon(QIcon(icon_path))
 
     # ── Initialize Open3D GUI (must happen once after QApplication exists) ──
     try:
@@ -154,7 +176,6 @@ def main() -> int:
     logger.info("LiDAR Workbench shutting down (code %d)", exit_code)
 
     # Use os._exit to prevent C++ static destructor race conditions in shared libraries
-    import os
     os._exit(exit_code)
 
 

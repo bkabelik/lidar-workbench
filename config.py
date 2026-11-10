@@ -22,11 +22,28 @@ APP_DESCRIPTION: Final[str] = (
     "classification tool for bathymetric and topographic data."
 )
 
+def _resolve_bundled_path(rel_path: str) -> str:
+    """Resolve a relative asset path in both development and frozen PyInstaller environments."""
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            p = Path(meipass) / rel_path
+            if p.exists():
+                return str(p.resolve())
+        exe_dir = Path(sys.executable).parent
+        p2 = exe_dir / rel_path
+        if p2.exists():
+            return str(p2.resolve())
+    dev_path = Path(__file__).resolve().parent / rel_path
+    if dev_path.exists():
+        return str(dev_path.resolve())
+    return str(Path(rel_path).resolve())
+
 # ── Default paths ─────────────────────────────────────────────────────
 # Pointcept is bundled inside the project (see Pointcept/prediction.py)
-DEFAULT_POINTCEPT_PATH: Final[str] = "./Pointcept"
-DEFAULT_MODEL_PATH: Final[str] = "./models/model_best.pth"
-DEFAULT_CONFIG_PATH: Final[str] = "./configs/dales/ptv3_dales.py"
+DEFAULT_POINTCEPT_PATH: Final[str] = _resolve_bundled_path("Pointcept")
+DEFAULT_MODEL_PATH: Final[str] = _resolve_bundled_path("models/model_best.pth")
+DEFAULT_CONFIG_PATH: Final[str] = _resolve_bundled_path("Pointcept/configs/dales/ptv3_dales.py")
 
 # ── Tiling defaults ───────────────────────────────────────────────────
 DEFAULT_TILE_SIZE_M: Final[float] = 200.0       # meters

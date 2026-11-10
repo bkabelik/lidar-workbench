@@ -3,28 +3,77 @@ from .default import DefaultSegmentor, DefaultClassifier
 from .modules import PointModule, PointModel
 
 # Backbones
-from .sparse_unet import *
-from .point_transformer import *
-from .point_transformer_v2 import *
-from .point_transformer_v3 import *
-from .stratified_transformer import *
-from .spvcnn import *
-from .octformer import *
-from .oacnns import *
-from .litept import *
-
-# from .swin3d import *
+try:
+    from .sparse_unet import *
+except ImportError:
+    pass
+try:
+    from .point_transformer import *
+except ImportError:
+    pass
+try:
+    from .point_transformer_v2 import *
+except ImportError:
+    pass
+try:
+    from .point_transformer_v3 import *
+except ImportError:
+    pass
+try:
+    from .stratified_transformer import *
+except ImportError:
+    pass
+try:
+    from .spvcnn import *
+except ImportError:
+    pass
+try:
+    from .octformer import *
+except ImportError:
+    pass
+try:
+    from .oacnns import *
+except ImportError:
+    pass
+try:
+    from .litept import *
+except ImportError:
+    pass
 
 # Semantic Segmentation
-from .context_aware_classifier import *
+try:
+    from .context_aware_classifier import *
+except ImportError:
+    pass
 
 # Instance Segmentation
-from .point_group import *
-from .sgiformer import *
+try:
+    from .point_group import *
+except ImportError:
+    pass
+try:
+    from .sgiformer import *
+except ImportError:
+    pass
 
 # Pretraining
-from .masked_scene_contrast import *
-from .point_prompt_training import *
-from .sonata import *
-from .concerto import *
-from .utonia import *
+try:
+    from .masked_scene_contrast import *
+except ImportError:
+    pass
+try:
+    from .point_prompt_training import *
+except ImportError:
+    pass
+try:
+    from .sonata import *
+except ImportError:
+    pass
+try:
+    from .concerto import *
+except ImportError:
+    pass
+try:
+    from .utonia import *
+except ImportError:
+    pass
