@@ -2313,7 +2313,13 @@ class MainWindow(QMainWindow):
                 )
             return
 
-        proj_name = self._pm.name or "LiDAR_Project"
+        proj_name = getattr(self._pm, "name", None)
+        if not proj_name and hasattr(self._pm, "metadata") and self._pm.metadata:
+            proj_name = self._pm.metadata.get("name")
+        if not proj_name and getattr(self._pm, "project_root", None):
+            proj_name = self._pm.project_root.name
+        if not proj_name:
+            proj_name = "LiDAR_Project"
 
         # Gather all tiles from local database
         tiles_data = []
@@ -2350,12 +2356,17 @@ class MainWindow(QMainWindow):
             logger.warning("Failed gathering tiles for sync: %s", exc)
             return
 
-        res = lic.sync_project(
-            project_name=proj_name,
-            tiles_data=tiles_data,
-            activity_action="SYNC",
-            activity_details=f"Synchronized {len(tiles_data)} tiles from workstation [{platform.node()}].",
-        )
+        try:
+            res = lic.sync_project(
+                project_name=proj_name,
+                tiles_data=tiles_data,
+                activity_action="SYNC",
+                activity_details=f"Synchronized {len(tiles_data)} tiles from workstation [{platform.node()}].",
+            )
+        except Exception as e:
+            if not silent:
+                QMessageBox.warning(self, "Sync Failed", f"Network connection error: {e}")
+            return
         if not res.get("success"):
             if not silent:
                 QMessageBox.warning(self, "Sync Failed", res.get("error", "Could not sync with cloud."))

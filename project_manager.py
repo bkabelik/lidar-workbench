@@ -57,6 +57,11 @@ class ProjectManager:
         return self._project_root
 
     @property
+    def project_dir(self) -> Optional[Path]:
+        """Alias for project_root."""
+        return self._project_root
+
+    @property
     def metadata(self) -> Dict[str, Any]:
         """In-memory project metadata dictionary (mutable)."""
         return self._metadata
@@ -84,6 +89,17 @@ class ProjectManager:
     def is_open(self) -> bool:
         """``True`` when a project is loaded and ready."""
         return self._project_root is not None
+
+    @property
+    def name(self) -> Optional[str]:
+        """Human-readable project name, or directory name, or None."""
+        if not self.is_open:
+            return None
+        return self._metadata.get("name") or (self._project_root.name if self._project_root else None)
+
+    @property
+    def project_name(self) -> Optional[str]:
+        return self.name
 
     # ── project lifecycle ──────────────────────────────────────────
 

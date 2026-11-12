@@ -126,7 +126,18 @@ class CloudPublishDialog(QDialog):
         self._chk_qc.setChecked(True)
         opts_layout.addWidget(self._chk_qc)
 
-        self._chk_las = QCheckBox("Upload Classified LAS / LAZ Deliverable (if < 500 MB)")
+        self._lic = get_license_manager()
+        is_ent = (self._lic.plan in ("enterprise", "pro")) or getattr(self._lic, "is_admin", False)
+
+        if is_ent:
+            self._chk_las = QCheckBox("Upload Classified LAS / LAZ Deliverable (Full Resolution)")
+            quota_text = f"Company Cloud Storage: {self._lic.plan.upper()} Tier ({self._lic.company_name or 'Enterprise'}) — Multi-VPS Storage Active."
+            quota_color = "#10b981"
+        else:
+            self._chk_las = QCheckBox("Upload Classified LAS / LAZ Deliverable (Free Tier: < 500 MB)")
+            quota_text = "Cloud Limit: Maximum 1.0 GB total per project deliverable for Free tier."
+            quota_color = "#94a3b8"
+
         self._chk_las.setChecked(True)
         opts_layout.addWidget(self._chk_las)
 
@@ -134,8 +145,8 @@ class CloudPublishDialog(QDialog):
         self._chk_public.setChecked(True)
         opts_layout.addWidget(self._chk_public)
 
-        quota_notice = QLabel("Cloud Limit: Maximum 1.0 GB total per project deliverable to preserve server resources.")
-        quota_notice.setStyleSheet("color: #94a3b8; font-size: 11px;")
+        quota_notice = QLabel(quota_text)
+        quota_notice.setStyleSheet(f"color: {quota_color}; font-size: 11px; font-weight: 500;")
         opts_layout.addWidget(quota_notice)
 
         layout.addWidget(opts_group)
@@ -525,10 +536,15 @@ class CloudPublishDialog(QDialog):
             "status": "completed" if processed_tiles >= total_tiles and total_tiles > 0 else "processing",
             "qc_summary_json": json.dumps(qc_summary),
             "make_public": self._chk_public.isChecked(),
+            "user_email": self._lic.user_email or "",
         }
 
+        headers = {}
+        if self._lic.access_token:
+            headers["Authorization"] = f"Bearer {self._lic.access_token}"
+
         try:
-            resp = requests.post(publish_url, data=form_data, timeout=15)
+            resp = requests.post(publish_url, data=form_data, headers=headers, timeout=20)
             resp.raise_for_status()
             res_body = resp.json()
 
@@ -654,13 +670,15 @@ class CloudPublishDialog(QDialog):
                             )
                         break
 
-            # 5h. Upload primary LAS / LAZ file if checked (< 500 MB)
+            # 5h. Upload primary LAS / LAZ file if checked
             if self._chk_las.isChecked() and tiles:
                 first_tile = tiles[0]
                 las_path = Path(first_tile.get("file_path", ""))
                 if not las_path.is_absolute() and self._pm.project_dir:
                     las_path = self._pm.project_dir / las_path
-                if las_path.exists() and las_path.stat().st_size < 500 * 1024 * 1024:
+                is_ent = (self._lic.plan in ("enterprise", "pro")) or getattr(self._lic, "is_admin", False)
+                max_allowed_bytes = (50 * 1024 * 1024 * 1024) if is_ent else (500 * 1024 * 1024)
+                if las_path.exists() and las_path.stat().st_size <= max_allowed_bytes:
                     self._prog_bar.setValue(97)
                     self._status_lbl.setText(f"Uploading Deliverable LAS: {las_path.name}...")
                     QApplication.processEvents()
@@ -669,7 +687,7 @@ class CloudPublishDialog(QDialog):
                             upload_url,
                             data={"asset_type": "pointcloud"},
                             files={"file": (las_path.name, f, "application/octet-stream")},
-                            timeout=120,
+                            timeout=600,
                         )
 
             self._prog_bar.setValue(100)
