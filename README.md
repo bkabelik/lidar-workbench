@@ -18,6 +18,13 @@ Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.c
 ## Video Tutorials:  
 [![Watch on YouTube](https://img.shields.io/badge/YouTube-Course_Playlist-red?style=for-the-badge&logo=youtube)](https://www.youtube.com/playlist?list=PLG8LnhTJkPGI)
 
+## Download (Windows Standalone)
+[![Download Windows Installer](https://img.shields.io/badge/Download-Windows_Installer_(64--bit)-0284c7?style=for-the-badge&logo=windows&logoColor=white)](https://drive.google.com/file/d/1KPt9g8LIhKXXc73eEA8hojD6x6Qfgkhr/view?usp=sharing)
+
+Pre-built standalone Windows setup supporting NVIDIA RTX 30, RTX 40, and RTX 50 (Blackwell) Series GPUs:
+- **Direct Download:** [LiDAR Workbench Setup (Google Drive Mirror)](https://drive.google.com/file/d/1KPt9g8LIhKXXc73eEA8hojD6x6Qfgkhr/view?usp=sharing)
+- **Features included:** Self-contained executable, Pointcept deep-learning classification, 2D/3D profile editors, Water Surface Modeler (WSM), QGIS project parser, and automatic peer-to-peer compute worker. No prior Python or manual CUDA compilation required.
+
 ---
 
 > [!WARNING]
@@ -73,13 +80,19 @@ Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.c
 
 ## Installation
 
-### Prerequisites
+### Option 1: Standalone Windows Setup (Recommended for Windows)
+If you are on Windows, simply download and run the installer:
+- **[Download LiDAR Workbench Windows Installer](https://drive.google.com/file/d/1KPt9g8LIhKXXc73eEA8hojD6x6Qfgkhr/view?usp=sharing)**
+
+### Option 2: Linux & Development Source Installation
+
+#### Prerequisites
 - **Conda / Mamba** (Miniforge, Mambaforge, or Anaconda)
 - **NVIDIA GPU** with CUDA 12.8+ driver capability (e.g. RTX 30xx, 40xx, or 50xx series)
 - **CUDA Toolkit 12.8 or 12.9** installed on host (`nvcc` in PATH)
 - **Git**
 
-### Environment Setup
+#### Environment Setup
 
 Create and activate the unified environment supporting RTX 30xx (sm_86), RTX 40xx (sm_89), and RTX 50xx (sm_120):
 
