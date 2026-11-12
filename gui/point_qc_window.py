@@ -626,7 +626,7 @@ class PointQCWindow(QMainWindow):
         zoom_all_action.triggered.connect(self._on_zoom_to_extent)
         tb.addAction(zoom_all_action)
 
-        refresh_action = QAction("🔄 Refresh View", self)
+        refresh_action = QAction("Refresh View", self)
         refresh_action.setToolTip("Reload and refresh visible layers")
         refresh_action.triggered.connect(self._render_all_layers)
         tb.addAction(refresh_action)
@@ -648,7 +648,7 @@ class PointQCWindow(QMainWindow):
 
         tb.addSeparator()
 
-        self._legend_action = QAction("📊 Color Legend", self)
+        self._legend_action = QAction("Color Legend", self)
         self._legend_action.setCheckable(True)
         self._legend_action.setChecked(True)
         self._legend_action.setToolTip("Toggle on-canvas color legend bar")
@@ -955,12 +955,12 @@ class PointQCWindow(QMainWindow):
         self._sel_summary_lbl.setWordWrap(True)
         sel_form.addRow(self._sel_summary_lbl)
 
-        self._jump_btn = QPushButton("🚀 Open Tile in 3D View")
+        self._jump_btn = QPushButton("Open Tile in 3D View")
         self._jump_btn.setEnabled(False)
         self._jump_btn.clicked.connect(self._on_jump_to_first_selected)
         sel_form.addRow(self._jump_btn)
 
-        self._bulk_btn = QPushButton("📦 Bulk Load Selected Tiles in 3D")
+        self._bulk_btn = QPushButton("Bulk Load Selected Tiles in 3D")
         self._bulk_btn.setEnabled(False)
         self._bulk_btn.clicked.connect(self._on_bulk_load_selected)
         sel_form.addRow(self._bulk_btn)

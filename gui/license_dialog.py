@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import logging
 from typing import Optional
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
@@ -105,6 +106,15 @@ class LicenseDialog(QDialog):
         self._sign_in_btn.clicked.connect(self._on_sign_in)
         sign_in_layout.addWidget(self._sign_in_btn)
 
+        portal_links = QHBoxLayout()
+        reg_btn = QPushButton("Create New Account")
+        reg_btn.clicked.connect(self._open_register_portal)
+        buy_btn = QPushButton("Buy License / Pricing")
+        buy_btn.clicked.connect(self._open_pricing_portal)
+        portal_links.addWidget(reg_btn)
+        portal_links.addWidget(buy_btn)
+        sign_in_layout.addLayout(portal_links)
+
         self._tabs.addTab(sign_in_tab, "Account Sign In")
 
         # Tab 2: License Key
@@ -156,6 +166,14 @@ class LicenseDialog(QDialog):
         allowed, current, limit = self._lm.can_create_project()
         limit_str = "Unlimited" if limit == -1 else str(limit)
         self._usage_label.setText(f"Projects: {current} / {limit_str} used")
+
+    def _open_register_portal(self):
+        url = self._server_input.text().strip().rstrip("/") + "/register"
+        QDesktopServices.openUrl(QUrl(url))
+
+    def _open_pricing_portal(self):
+        url = self._server_input.text().strip().rstrip("/") + "/pricing"
+        QDesktopServices.openUrl(QUrl(url))
 
     def _copy_hwid(self):
         clipboard = QApplication.clipboard()

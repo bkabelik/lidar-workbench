@@ -2,7 +2,7 @@
 LiDAR Workbench — Company Compute Nodes & Distributed P2P Pool Dialog.
 
 Displays active company nodes (e.g. Alice's PC, Bob's Workstation, Office GPU Server),
-their GPU hardware, current load status, and allows configuring the local node worker.
+their GPU hardware, current load status, and allows controlling the local worker.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QCheckBox,
     QMessageBox,
+    QListWidget,
+    QWidget,
 )
 
 from ..licensing import get_license_manager, get_local_gpu_name
@@ -35,18 +37,20 @@ logger = logging.getLogger("lidar_workbench.gui.company_nodes")
 class CompanyNodesDialog(QDialog):
     """Dialog displaying company cluster nodes and hardware compute status."""
 
-    def __init__(self, parent: Optional[QDialog] = None) -> None:
+    def __init__(self, parent: Optional[QWidget] = None, worker: Optional[Any] = None) -> None:
         super().__init__(parent)
         self._lic = get_license_manager()
-        self.setWindowTitle("🏢 Company Compute Nodes — Distributed Pool")
-        self.setMinimumSize(780, 520)
+        self._worker = worker
+        self.setWindowTitle("Company Compute Nodes — Distributed Pool")
+        self.setMinimumSize(820, 580)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_nodes_silent)
 
         self._setup_ui()
+        self._connect_worker_signals()
         self._refresh_nodes()
-        self._timer.start(8000)  # Auto-refresh every 8 seconds
+        self._timer.start(6000)  # Auto-refresh every 6 seconds
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -63,28 +67,61 @@ class CompanyNodesDialog(QDialog):
         comp_layout.addWidget(self._comp_name_label)
         comp_layout.addWidget(self._user_label)
         comp_layout.addWidget(self._plan_label)
+
+        if not self._lic.is_logged_in:
+            self._login_btn = QPushButton("Sign In to Company Cloud…")
+            self._login_btn.clicked.connect(self._open_login)
+            comp_layout.addWidget(self._login_btn)
+
         layout.addWidget(company_group)
 
         # ── This Machine Card ──────────────────────────────────────
-        this_pc_group = QGroupBox("This Machine (Local Node)")
-        pc_layout = QHBoxLayout(this_pc_group)
+        this_pc_group = QGroupBox("This Machine (Local Node & Cluster Worker)")
+        pc_vbox = QVBoxLayout(this_pc_group)
 
+        # Top row: Hardware info
+        hw_row = QHBoxLayout()
         self._local_node_label = QLabel(
-            f"<b>Node:</b> {platform.node()}  |  "
+            f"<b>Node Name:</b> {platform.node()}  |  "
             f"<b>GPU:</b> {get_local_gpu_name()}  |  "
             f"<b>HWID:</b> <code>{self._lic.hwid[:12]}…</code>"
         )
-        self._share_gpu_check = QCheckBox("Share GPU in Company Pool (Accept batch tasks)")
-        self._share_gpu_check.setChecked(True)
-        self._share_gpu_check.toggled.connect(self._on_share_toggled)
+        hw_row.addWidget(self._local_node_label)
+        hw_row.addStretch()
+        pc_vbox.addLayout(hw_row)
 
-        pc_layout.addWidget(self._local_node_label)
-        pc_layout.addStretch()
-        pc_layout.addWidget(self._share_gpu_check)
+        # Middle row: Worker status & Control buttons
+        ctrl_row = QHBoxLayout()
+        self._worker_status_badge = QLabel("<b>Worker Status:</b> Initializing…")
+        self._worker_status_badge.setStyleSheet("font-size: 13px;")
+
+        self._worker_toggle_btn = QPushButton("Pause Worker")
+        self._worker_toggle_btn.setFixedWidth(130)
+        self._worker_toggle_btn.clicked.connect(self._on_toggle_worker)
+
+        self._stats_label = QLabel("Tiles Completed: 0")
+        self._stats_label.setStyleSheet("color: #64748b; font-size: 12px;")
+
+        ctrl_row.addWidget(self._worker_status_badge)
+        ctrl_row.addSpacing(16)
+        ctrl_row.addWidget(self._stats_label)
+        ctrl_row.addStretch()
+        ctrl_row.addWidget(self._worker_toggle_btn)
+        pc_vbox.addLayout(ctrl_row)
+
+        # Activity list
+        self._activity_list = QListWidget()
+        self._activity_list.setMaximumHeight(85)
+        self._activity_list.setStyleSheet(
+            "background: #0f172a; color: #94a3b8; font-family: monospace; font-size: 11px; border-radius: 4px;"
+        )
+        self._add_log_entry(f"Worker node initialized for {platform.node()}")
+        pc_vbox.addWidget(self._activity_list)
+
         layout.addWidget(this_pc_group)
 
         # ── Company Nodes Table ────────────────────────────────────
-        table_group = QGroupBox("Active Company Nodes")
+        table_group = QGroupBox("Active Company Nodes (Peer-to-Peer Cluster)")
         table_layout = QVBoxLayout(table_group)
 
         self._table = QTableWidget()
@@ -108,7 +145,7 @@ class CompanyNodesDialog(QDialog):
         # ── Action bar under table ─────────────────────────────────
         action_row = QHBoxLayout()
         self._node_summary_label = QLabel("Loading company cluster…")
-        self._refresh_btn = QPushButton("🔄 Refresh Now")
+        self._refresh_btn = QPushButton("Refresh Now")
         self._refresh_btn.clicked.connect(self._refresh_nodes)
         
         action_row.addWidget(self._node_summary_label)
@@ -127,10 +164,81 @@ class CompanyNodesDialog(QDialog):
         bottom_row.addWidget(close_btn)
         layout.addLayout(bottom_row)
 
-    def _on_share_toggled(self, checked: bool) -> None:
-        status = "idle" if checked else "offline"
-        self._lic.send_node_heartbeat(status=status)
+        self._update_worker_ui()
+
+    def _connect_worker_signals(self) -> None:
+        if self._worker:
+            try:
+                self._worker.worker_status_changed.connect(self._on_worker_status_changed)
+                self._worker.task_started.connect(self._on_worker_task_started)
+                self._worker.task_finished.connect(self._on_worker_task_finished)
+            except Exception as e:
+                logger.debug("Failed connecting worker signals: %s", e)
+
+    def _add_log_entry(self, msg: str) -> None:
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        self._activity_list.addItem(f"[{ts}] {msg}")
+        self._activity_list.scrollToBottom()
+
+    def _on_worker_status_changed(self, status: str) -> None:
+        self._update_worker_ui()
+        self._add_log_entry(f"Status update: {status}")
+
+    def _on_worker_task_started(self, tile_id: str, job_id: int) -> None:
+        self._worker_status_badge.setText(
+            f"<b>Worker Status:</b> <span style='color: #eab308;'>🟡 Processing Tile '{tile_id}' (Job #{job_id})</span>"
+        )
+        self._add_log_entry(f"⚡ Claimed cluster task: Tile '{tile_id}' (Job #{job_id})")
+
+    def _on_worker_task_finished(self, tile_id: str, job_id: int) -> None:
+        self._add_log_entry(f"✅ Finished cluster task: Tile '{tile_id}' (Job #{job_id})")
+        if self._worker and hasattr(self._worker, "processed_count"):
+            self._stats_label.setText(f"Tiles Completed: {self._worker.processed_count}")
+        self._update_worker_ui()
+
+    def _update_worker_ui(self) -> None:
+        if not self._lic.is_logged_in:
+            self._worker_status_badge.setText(
+                "<b>Worker Status:</b> <span style='color: #94a3b8;'>⚪ Offline (Sign in required)</span>"
+            )
+            self._worker_toggle_btn.setEnabled(False)
+            return
+
+        self._worker_toggle_btn.setEnabled(True)
+        is_paused = getattr(self._worker, "is_paused", False) if self._worker else False
+
+        if is_paused:
+            self._worker_status_badge.setText(
+                "<b>Worker Status:</b> <span style='color: #94a3b8;'>⚪ Paused (Not accepting cluster tasks)</span>"
+            )
+            self._worker_toggle_btn.setText("Resume Worker")
+        else:
+            self._worker_status_badge.setText(
+                "<b>Worker Status:</b> <span style='color: #22c55e;'>🟢 Active (Idle — Listening for tasks)</span>"
+            )
+            self._worker_toggle_btn.setText("Pause Worker")
+
+        if self._worker and hasattr(self._worker, "processed_count"):
+            self._stats_label.setText(f"Tiles Completed: {self._worker.processed_count}")
+
+    def _on_toggle_worker(self) -> None:
+        if not self._worker:
+            return
+        if getattr(self._worker, "is_paused", False):
+            self._worker.resume()
+            self._add_log_entry("Worker resumed — listening for company cluster tasks")
+        else:
+            self._worker.pause()
+            self._add_log_entry("Worker paused by user")
+        self._update_worker_ui()
         self._refresh_nodes()
+
+    def _open_login(self) -> None:
+        from .license_dialog import LicenseDialog
+        dlg = LicenseDialog(self)
+        dlg.exec()
+        self._refresh_nodes()
+        self._update_worker_ui()
 
     def _refresh_nodes_silent(self) -> None:
         if self.isVisible():
@@ -139,13 +247,14 @@ class CompanyNodesDialog(QDialog):
     def _refresh_nodes(self) -> None:
         if not self._lic.is_logged_in:
             self._node_summary_label.setText(
-                "⚠️ Not signed in to Company SSO. Sign in under Help → License & Plan to join company pool."
+                "Not signed in to Company SSO. Sign in to automatically participate in the compute pool."
             )
             self._table.setRowCount(0)
             return
 
-        # Send heartbeat first to ensure this node is current
-        self._lic.send_node_heartbeat(status="idle" if self._share_gpu_check.isChecked() else "offline")
+        # Send heartbeat to keep this node alive in the pool
+        status = "offline" if (self._worker and getattr(self._worker, "is_paused", False)) else "idle"
+        self._lic.send_node_heartbeat(status=status)
 
         nodes = self._lic.fetch_company_nodes()
         self._table.setRowCount(len(nodes))

@@ -233,7 +233,7 @@ class ClassificationDialog(QDialog):
         btn_row = QHBoxLayout()
         self._select_all_btn = QPushButton("Select All")
         self._select_all_btn.clicked.connect(self._select_all_nodes)
-        self._refresh_nodes_btn = QPushButton("🔄 Refresh Nodes")
+        self._refresh_nodes_btn = QPushButton("Refresh Nodes")
         self._refresh_nodes_btn.clicked.connect(self._load_cluster_nodes)
         self._cluster_summary_label = QLabel("0 nodes selected")
         btn_row.addWidget(self._select_all_btn)

@@ -223,6 +223,7 @@ class LicenseManager:
     def send_node_heartbeat(
         self,
         status: str = "idle",
+        node_name: Optional[str] = None,
         server_url: str = DEFAULT_SERVER_URL
     ) -> Dict[str, Any]:
         """Send machine heartbeat to server so it shows up in company cluster."""
@@ -233,7 +234,7 @@ class LicenseManager:
         payload = {
             "user_email": self.user_email,
             "hwid": self._hwid,
-            "node_name": platform.node(),
+            "node_name": node_name or platform.node(),
             "gpu_name": get_local_gpu_name(),
             "os_name": f"{platform.system()} {platform.release()}",
             "status": status,

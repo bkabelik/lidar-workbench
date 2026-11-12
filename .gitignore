@@ -1,4 +1,5 @@
 *.pth
+models/*.pth
 __pycache__/
 *.py[cod]
 build/
@@ -8,3 +9,9 @@ dist/
 .ninja_*
 *.o
 .pytest_cache/
+*.log
+*.db
+*.sqlite
+.env
+.vscode/
+.idea/

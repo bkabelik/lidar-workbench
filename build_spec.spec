@@ -29,6 +29,8 @@ root_modules = [
     "strip_adjustment",
     "tile_manager",
     "licensing",
+    "node_worker",
+    "qgis_parser",
 ]
 
 hidden_imports = [
@@ -47,6 +49,8 @@ hidden_imports = [
     "laspy",
     "lazrs",
     "rasterio",
+    "requests",
+    "pyproj",
     "rasterio.sample",
     "rasterio._features",
     "rasterio.control",
@@ -66,10 +70,10 @@ for m in root_modules:
     hidden_imports.append(m)
     hidden_imports.append(f"lidar_workbench.{m}")
 
+hidden_imports += ["matplotlib", "matplotlib.pyplot", "matplotlib.cm"]
 hidden_imports += collect_submodules("torch")
 hidden_imports += collect_submodules("torchvision")
 hidden_imports += collect_submodules("pointcept")
-hidden_imports += collect_submodules("gui")
 hidden_imports += collect_submodules("rasterio")
 hidden_imports += collect_submodules("pyproj")
 hidden_imports += collect_submodules("shapely")

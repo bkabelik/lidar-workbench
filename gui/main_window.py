@@ -145,6 +145,9 @@ class MainWindow(QMainWindow):
         self._node_heartbeat_timer.start(20000)
 
         self._node_worker = CompanyNodeWorker(parent=self)
+        self._node_worker.worker_status_changed.connect(self._on_worker_status_changed)
+        self._node_worker.task_started.connect(self._on_worker_task_started)
+        self._node_worker.task_finished.connect(self._on_worker_task_finished)
         self._node_worker.start()
 
         # Background Project Cloud Sync timer (every 45s)
@@ -460,15 +463,15 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        publish_btn = toolbar.addAction("Publish 🚀")
+        publish_btn = toolbar.addAction("Publish")
         publish_btn.setToolTip("Publish project deliverables to cloud & get shareable client link")
         publish_btn.triggered.connect(self._on_cloud_publish)
 
-        nodes_btn = toolbar.addAction("Nodes 💻")
+        nodes_btn = toolbar.addAction("Nodes")
         nodes_btn.setToolTip("View Company Compute Nodes & Distributed GPU Cluster")
         nodes_btn.triggered.connect(self._on_company_nodes)
 
-        sync_btn = toolbar.addAction("Sync 🔄")
+        sync_btn = toolbar.addAction("Sync")
         sync_btn.setToolTip("Sync project tile pipeline, QC reviews & colleague edits with company cloud (Ctrl+Shift+S)")
         sync_btn.triggered.connect(lambda: self._sync_project_cloud(silent=False))
 
@@ -534,6 +537,47 @@ class MainWindow(QMainWindow):
         self._status_bar = self.statusBar()
         self._status_label = QLabel("Ready")
         self._status_bar.addWidget(self._status_label)
+
+        self._worker_status_btn = QPushButton("Worker: Initializing…")
+        self._worker_status_btn.setFlat(True)
+        self._worker_status_btn.setCursor(Qt.PointingHandCursor)
+        self._worker_status_btn.setToolTip("Company Distributed Compute Worker (Click to open Cluster dialog)")
+        self._worker_status_btn.clicked.connect(self._on_company_nodes)
+        self._status_bar.addPermanentWidget(self._worker_status_btn)
+
+    def _on_worker_status_changed(self, status: str) -> None:
+        if not hasattr(self, "_worker_status_btn"):
+            return
+        lic = get_license_manager()
+        if not lic.is_logged_in:
+            self._worker_status_btn.setText("Worker: Offline (Not Signed In)")
+            self._worker_status_btn.setStyleSheet("color: #64748b; font-weight: normal;")
+            return
+
+        if "Processing" in status or "Busy" in status:
+            self._worker_status_btn.setText(f"🟡 Worker: {status}")
+            self._worker_status_btn.setStyleSheet("color: #eab308; font-weight: bold;")
+        elif "Idle" in status:
+            self._worker_status_btn.setText("🟢 Worker: Active (Idle)")
+            self._worker_status_btn.setStyleSheet("color: #22c55e; font-weight: bold;")
+        elif "Paused" in status:
+            self._worker_status_btn.setText("⚪ Worker: Paused")
+            self._worker_status_btn.setStyleSheet("color: #94a3b8; font-weight: normal;")
+        else:
+            self._worker_status_btn.setText(f"Worker: {status}")
+            self._worker_status_btn.setStyleSheet("color: #0284c7; font-weight: normal;")
+
+    def _on_worker_task_started(self, tile_id: str, job_id: int) -> None:
+        self.set_status(f"⚡ Company Worker processing tile '{tile_id}' (Job #{job_id})…", timeout=10000)
+        if hasattr(self, "_worker_status_btn"):
+            self._worker_status_btn.setText(f"🟡 Worker: Processing '{tile_id}'")
+            self._worker_status_btn.setStyleSheet("color: #eab308; font-weight: bold;")
+
+    def _on_worker_task_finished(self, tile_id: str, job_id: int) -> None:
+        self.set_status(f"✅ Company Worker completed tile '{tile_id}' (Job #{job_id})", timeout=10000)
+        if hasattr(self, "_worker_status_btn"):
+            self._worker_status_btn.setText("🟢 Worker: Active (Idle)")
+            self._worker_status_btn.setStyleSheet("color: #22c55e; font-weight: bold;")
 
     def set_status(self, message: str, timeout: int = 0) -> None:
         """
@@ -2241,7 +2285,7 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _on_company_nodes(self) -> None:
-        dlg = CompanyNodesDialog(self)
+        dlg = CompanyNodesDialog(self, worker=getattr(self, "_node_worker", None))
         dlg.exec()
 
     def _send_node_heartbeat(self) -> None:
@@ -2345,6 +2389,14 @@ class MainWindow(QMainWindow):
         from .license_dialog import LicenseDialog
         dlg = LicenseDialog(self)
         dlg.exec()
+        lic = get_license_manager()
+        if lic.is_logged_in:
+            self._send_node_heartbeat()
+            if hasattr(self, "_node_worker"):
+                if getattr(self._node_worker, "is_paused", False):
+                    self._node_worker.resume()
+                elif not self._node_worker.isRunning():
+                    self._node_worker.start()
 
     def _on_about(self) -> None:
         from pathlib import Path

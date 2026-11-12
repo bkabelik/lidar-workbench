@@ -575,7 +575,7 @@ class StripAdjustmentDialog(QDialog):
 
         steps_hint = QLabel(
             "<span style='color: #555; font-size: 11px;'>"
-            "💡 <b>Pipeline Tip:</b> Steps 1, 2, and 3 work cumulatively. "
+            "<b>Pipeline Tip:</b> Steps 1, 2, and 3 work cumulatively. "
             "When enabling Step 3 (Drift), keep Step 1 and Step 2 checked so XYZ lever-arm shifts and boresight angles are solved alongside trajectory drift."
             "</span>"
         )
