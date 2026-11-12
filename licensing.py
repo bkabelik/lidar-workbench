@@ -31,7 +31,7 @@ else:
 _APP_DATA.mkdir(parents=True, exist_ok=True)
 _LICENSE_CACHE_FILE = _APP_DATA / "license.json"
 
-DEFAULT_SERVER_URL = "http://127.0.0.1:8000"
+DEFAULT_SERVER_URL = "https://lidar.kabelik.at"
 
 
 def get_machine_hwid() -> str:
@@ -161,6 +161,15 @@ class LicenseManager:
         return self._data.get("access_token")
 
     @property
+    def server_url(self) -> str:
+        return self._data.get("server_url") or DEFAULT_SERVER_URL
+
+    @server_url.setter
+    def server_url(self, value: str) -> None:
+        self._data["server_url"] = value.strip().rstrip("/")
+        self._save()
+
+    @property
     def is_logged_in(self) -> bool:
         return bool(self.user_email and self.access_token)
 
@@ -176,11 +185,12 @@ class LicenseManager:
         self._data["signed_token"] = None
         self._save()
 
-    def login_online(self, email: str, password: str, server_url: str = DEFAULT_SERVER_URL) -> Tuple[bool, str]:
+    def login_online(self, email: str, password: str, server_url: Optional[str] = None) -> Tuple[bool, str]:
         """
         Authenticate with company user account and automatically bind machine seat.
         """
-        clean_url = server_url.rstrip("/") + "/api/v1/auth/login-machine"
+        target_url = (server_url or self.server_url).rstrip("/")
+        clean_url = target_url + "/api/v1/auth/login-machine"
         payload = {
             "email": email.strip(),
             "password": password,
@@ -200,6 +210,7 @@ class LicenseManager:
             with urllib.request.urlopen(req, timeout=12) as resp:
                 res = json.loads(resp.read().decode("utf-8"))
                 if res.get("success"):
+                    self._data["server_url"] = target_url
                     self._data["user_email"] = res.get("user_email")
                     self._data["company_name"] = res.get("company_name", "Company Team")
                     self._data["company_id"] = res.get("company_id")
@@ -224,13 +235,14 @@ class LicenseManager:
         self,
         status: str = "idle",
         node_name: Optional[str] = None,
-        server_url: str = DEFAULT_SERVER_URL
+        server_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Send machine heartbeat to server so it shows up in company cluster."""
         if not self.is_logged_in:
             return {"success": False, "message": "Not logged in"}
 
-        url = server_url.rstrip("/") + "/api/v1/nodes/heartbeat"
+        target_url = (server_url or self.server_url).rstrip("/")
+        url = target_url + "/api/v1/nodes/heartbeat"
         payload = {
             "user_email": self.user_email,
             "hwid": self._hwid,
@@ -256,13 +268,14 @@ class LicenseManager:
 
     def fetch_company_nodes(
         self,
-        server_url: str = DEFAULT_SERVER_URL
+        server_url: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch list of all active online nodes belonging to user's company."""
         if not self.is_logged_in:
             return []
 
-        url = f"{server_url.rstrip('/')}/api/v1/nodes/company?user_email={urllib.parse.quote(self.user_email or '')}"
+        target_url = (server_url or self.server_url).rstrip("/")
+        url = f"{target_url}/api/v1/nodes/company?user_email={urllib.parse.quote(self.user_email or '')}"
         try:
             req = urllib.request.Request(
                 url,
@@ -281,13 +294,14 @@ class LicenseManager:
         target_node_ids: List[int],
         project_id: Optional[int] = None,
         job_type: str = "pointcept_classification",
-        server_url: str = DEFAULT_SERVER_URL
+        server_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Dispatch a batch of tiles across the selected company nodes."""
         if not self.is_logged_in:
             return {"success": False, "error": "User not authenticated"}
 
-        url = server_url.rstrip("/") + "/api/v1/nodes/dispatch-job"
+        target_url = (server_url or self.server_url).rstrip("/")
+        url = target_url + "/api/v1/nodes/dispatch-job"
         payload = {
             "user_email": self.user_email,
             "project_id": project_id,
@@ -313,10 +327,11 @@ class LicenseManager:
     def get_job_status(
         self,
         job_id: int,
-        server_url: str = DEFAULT_SERVER_URL
+        server_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Poll distributed job progress."""
-        url = f"{server_url.rstrip('/')}/api/v1/compute/jobs/{job_id}/status"
+        target_url = (server_url or self.server_url).rstrip("/")
+        url = f"{target_url}/api/v1/compute/jobs/{job_id}/status"
         try:
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=6) as resp:
@@ -327,11 +342,12 @@ class LicenseManager:
     def claim_node_task(
         self,
         node_name: Optional[str] = None,
-        server_url: str = DEFAULT_SERVER_URL
+        server_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Claim next pending tile assigned to this node."""
         name = node_name or platform.node()
-        url = f"{server_url.rstrip('/')}/api/v1/nodes/claim-task/{urllib.parse.quote(name)}"
+        target_url = (server_url or self.server_url).rstrip("/")
+        url = f"{target_url}/api/v1/nodes/claim-task/{urllib.parse.quote(name)}"
         try:
             req = urllib.request.Request(url, method="GET")
             with urllib.request.urlopen(req, timeout=6) as resp:
@@ -345,11 +361,12 @@ class LicenseManager:
         tile_id: str,
         node_name: Optional[str] = None,
         point_count: int = 500000,
-        server_url: str = DEFAULT_SERVER_URL
+        server_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Report completion of a tile."""
         name = node_name or platform.node()
-        url = f"{server_url.rstrip('/')}/api/v1/compute/workers/complete-tile"
+        target_url = (server_url or self.server_url).rstrip("/")
+        url = f"{target_url}/api/v1/compute/workers/complete-tile"
         payload = {
             "job_id": job_id,
             "tile_id": tile_id,
@@ -375,13 +392,14 @@ class LicenseManager:
         tiles_data: List[Dict[str, Any]],
         activity_action: Optional[str] = None,
         activity_details: Optional[str] = None,
-        server_url: str = DEFAULT_SERVER_URL,
+        server_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Sync local tile states, processing steps, and QC reviews with company cloud."""
         if not self.is_logged_in:
             return {"success": False, "error": "Not signed in"}
 
-        url = server_url.rstrip("/") + "/api/v1/projects/sync"
+        target_url = (server_url or self.server_url).rstrip("/")
+        url = target_url + "/api/v1/projects/sync"
         payload = {
             "project_name": project_name,
             "user_email": self.user_email,
@@ -409,13 +427,14 @@ class LicenseManager:
         self,
         project_name: str,
         tile_id: str,
-        server_url: str = DEFAULT_SERVER_URL,
+        server_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Acquire collaborative editing lock on a tile."""
         if not self.is_logged_in:
             return {"acquired": True, "locked": False}
 
-        url = f"{server_url.rstrip('/')}/api/v1/projects/{urllib.parse.quote(project_name)}/lock-tile"
+        target_url = (server_url or self.server_url).rstrip("/")
+        url = f"{target_url}/api/v1/projects/{urllib.parse.quote(project_name)}/lock-tile"
         payload = {
             "tile_id": tile_id,
             "user_email": self.user_email,
@@ -440,13 +459,14 @@ class LicenseManager:
         self,
         project_name: str,
         tile_id: str,
-        server_url: str = DEFAULT_SERVER_URL,
+        server_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Release collaborative editing lock on a tile."""
         if not self.is_logged_in:
             return {"unlocked": True}
 
-        url = f"{server_url.rstrip('/')}/api/v1/projects/{urllib.parse.quote(project_name)}/unlock-tile"
+        target_url = (server_url or self.server_url).rstrip("/")
+        url = f"{target_url}/api/v1/projects/{urllib.parse.quote(project_name)}/unlock-tile"
         payload = {
             "tile_id": tile_id,
             "user_email": self.user_email,
@@ -473,13 +493,14 @@ class LicenseManager:
         tile_ids: List[str],
         qc_status: Optional[str],
         qc_comment: Optional[str] = None,
-        server_url: str = DEFAULT_SERVER_URL,
+        server_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Broadcast QC review changes to company cloud."""
         if not self.is_logged_in:
             return {"success": False}
 
-        url = f"{server_url.rstrip('/')}/api/v1/projects/{urllib.parse.quote(project_name)}/qc-status"
+        target_url = (server_url or self.server_url).rstrip("/")
+        url = f"{target_url}/api/v1/projects/{urllib.parse.quote(project_name)}/qc-status"
         payload = {
             "tile_ids": tile_ids,
             "user_email": self.user_email,
@@ -526,12 +547,13 @@ class LicenseManager:
 
         return (count < limit), count, limit
 
-    def activate_online(self, license_key: str, server_url: str = DEFAULT_SERVER_URL) -> Tuple[bool, str]:
+    def activate_online(self, license_key: str, server_url: Optional[str] = None) -> Tuple[bool, str]:
         """
         Contact the server to bind this machine HWID and activate the license.
         """
         clean_key = license_key.strip().upper()
-        clean_url = server_url.rstrip("/") + "/api/v1/licenses/activate"
+        target_url = (server_url or self.server_url).rstrip("/")
+        clean_url = target_url + "/api/v1/licenses/activate"
 
         payload = {
             "license_key": clean_key,
@@ -551,6 +573,7 @@ class LicenseManager:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 res_body = json.loads(resp.read().decode("utf-8"))
                 if res_body.get("success"):
+                    self._data["server_url"] = target_url
                     self._data["license_key"] = clean_key
                     self._data["plan"] = res_body.get("plan", "pro")
                     self._data["max_projects"] = res_body.get("max_projects", 5)

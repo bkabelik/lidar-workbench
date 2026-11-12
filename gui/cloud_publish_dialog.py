@@ -106,7 +106,7 @@ class CloudPublishDialog(QDialog):
 
         server_layout = QHBoxLayout()
         server_layout.addWidget(QLabel("Server URL:"))
-        self._server_input = QLineEdit(DEFAULT_SERVER_URL)
+        self._server_input = QLineEdit(getattr(self._lic, "server_url", DEFAULT_SERVER_URL))
         server_layout.addWidget(self._server_input)
         opts_layout.addLayout(server_layout)
 

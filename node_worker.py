@@ -160,16 +160,15 @@ class CompanyNodeWorker(QThread):
 
 
 def main() -> None:
+    mgr = get_license_manager()
     parser = argparse.ArgumentParser(description="LiDAR Workbench Distributed Cluster Worker")
     parser.add_argument("--name", type=str, default=None, help="Custom node name (defaults to hostname)")
-    parser.add_argument("--server", type=str, default="http://127.0.0.1:8000", help="Server URL")
+    parser.add_argument("--server", type=str, default=mgr.server_url, help=f"Server URL (default: {mgr.server_url})")
     parser.add_argument("--email", type=str, default=None, help="User email")
     parser.add_argument("--password", type=str, default=None, help="User password")
     parser.add_argument("--interval", type=float, default=2.0, help="Polling interval in seconds")
     args = parser.parse_args()
-
     node_name = args.name or f"Worker-{platform.node()}"
-    mgr = get_license_manager()
 
     if args.email and args.password:
         print(f"[-] Logging in as {args.email} to {args.server}...")

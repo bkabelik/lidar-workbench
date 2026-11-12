@@ -97,7 +97,7 @@ class LicenseDialog(QDialog):
 
         server_row = QHBoxLayout()
         server_row.addWidget(QLabel("Server URL:"))
-        self._server_input = QLineEdit(DEFAULT_SERVER_URL)
+        self._server_input = QLineEdit(self._lm.server_url)
         server_row.addWidget(self._server_input)
         sign_in_layout.addLayout(server_row)
 
@@ -132,7 +132,7 @@ class LicenseDialog(QDialog):
 
         server_row2 = QHBoxLayout()
         server_row2.addWidget(QLabel("Server URL:"))
-        self._server_input2 = QLineEdit(DEFAULT_SERVER_URL)
+        self._server_input2 = QLineEdit(self._lm.server_url)
         server_row2.addWidget(self._server_input2)
         key_layout.addLayout(server_row2)
 
