@@ -25,18 +25,20 @@ except ImportError:
 from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QApplication,
+    QButtonGroup,
+    QCheckBox,
     QDialog,
-    QVBoxLayout,
+    QFileDialog,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPushButton,
-    QCheckBox,
-    QProgressBar,
-    QGroupBox,
     QMessageBox,
-    QApplication,
-    QFileDialog,
+    QProgressBar,
+    QPushButton,
+    QRadioButton,
+    QVBoxLayout,
 )
 
 from ..licensing import DEFAULT_SERVER_URL, get_license_manager
@@ -69,13 +71,16 @@ logger = logging.getLogger("lidar_workbench.gui.cloud_publish")
 class CloudPublishDialog(QDialog):
     """Dialog allowing users to publish project deliverables and generate client share links."""
 
-    def __init__(self, pm: ProjectManager, parent=None):
+    def __init__(self, pm: ProjectManager, parent=None, selected_tile_ids: Optional[List[str]] = None):
         super().__init__(parent)
         self.setWindowTitle("Publish Deliverables to Cloud")
-        self.setMinimumWidth(580)
+        self.setMinimumWidth(600)
         self._pm = pm
         self._lic = get_license_manager()
+        self._selected_tile_ids = list(selected_tile_ids or [])
         self._share_url: Optional[str] = None
+        self._radio_scope_selected: Optional[QRadioButton] = None
+        self._radio_scope_all: Optional[QRadioButton] = None
         self._build_ui()
 
     def _build_ui(self):
@@ -98,8 +103,34 @@ class CloudPublishDialog(QDialog):
         all_tiles = self._pm.db.get_all_tiles() if self._pm.db else []
         tiles = [t for t in all_tiles if "_noise" not in t.get("id", "") and t.get("status") != "NOISE"]
         tiles_count = len(tiles)
-        classified_count = sum(1 for t in tiles if t.get("status") in ("CLASSIFIED", "EDITED") or t.get("classified"))
-        info_layout.addWidget(QLabel(f"<b>Tiles:</b> {classified_count} / {tiles_count} classified"))
+        processed_count = sum(
+            1 for t in tiles
+            if t.get("status") in ("CLASSIFIED", "GROUND", "BATHY", "EDITED") or t.get("classified")
+        )
+        info_layout.addWidget(QLabel(f"<b>Project Tiles:</b> {processed_count} / {tiles_count} processed"))
+
+        if self._selected_tile_ids:
+            sel_set = set(self._selected_tile_ids)
+            sel_tiles = [t for t in tiles if t.get("id") in sel_set]
+            sel_processed = sum(
+                1 for t in sel_tiles
+                if t.get("status") in ("CLASSIFIED", "GROUND", "BATHY", "EDITED") or t.get("classified")
+            )
+            sel_lbl = QLabel(
+                f"<b>Workspace Selection:</b> <span style='color: #0284c7; font-weight: bold;'>{len(self._selected_tile_ids)} of {tiles_count} tiles selected</span> ({sel_processed} processed)"
+            )
+            info_layout.addWidget(sel_lbl)
+
+            scope_row = QHBoxLayout()
+            scope_row.addWidget(QLabel("<b>Publish Scope:</b>"))
+            self._radio_scope_selected = QRadioButton(f"Selected Tiles only ({len(self._selected_tile_ids)})")
+            self._radio_scope_all = QRadioButton(f"All Project Tiles ({tiles_count})")
+            self._radio_scope_selected.setChecked(True)
+            scope_row.addWidget(self._radio_scope_selected)
+            scope_row.addWidget(self._radio_scope_all)
+            scope_row.addStretch()
+            info_layout.addLayout(scope_row)
+
         layout.addWidget(info_group)
 
         # ── Publish Settings Group ────────────────────────────────────
@@ -336,10 +367,57 @@ class CloudPublishDialog(QDialog):
         if self._share_url:
             QDesktopServices.openUrl(QUrl(self._share_url))
 
-    def _generate_web_pointcloud_preview(self) -> tuple[bytes, dict]:
+    def _resolve_tile_path(self, tile: dict) -> Optional[Path]:
+        """Resolve the LAS file path for a tile dictionary, guaranteeing it is an existing file."""
+        candidates = []
+        fn = tile.get("filename") or tile.get("file_path") or ""
+        tid = tile.get("id") or ""
+
+        if fn:
+            p = Path(fn)
+            if p.is_file():
+                return p.resolve()
+            candidates.append(p)
+
+        if tid:
+            candidates.append(Path(f"{tid}.las"))
+            candidates.append(Path(f"{tid}.laz"))
+            candidates.append(Path("ground") / f"{tid}_ground.las")
+            candidates.append(Path("bathy") / f"{tid}_bathy.las")
+
+        tiles_dir = getattr(self._pm, "tiles_dir", None)
+        if tiles_dir:
+            for c in candidates:
+                cand = tiles_dir / c
+                if cand.is_file():
+                    return cand.resolve()
+
+        proj_dir = getattr(self._pm, "project_dir", None)
+        if proj_dir:
+            for c in candidates:
+                cand = proj_dir / c
+                if cand.is_file():
+                    return cand.resolve()
+                cand = proj_dir / "tiles" / c
+                if cand.is_file():
+                    return cand.resolve()
+
+        return None
+
+    def _get_target_tiles(self) -> List[dict]:
+        all_tiles = self._pm.db.get_all_tiles() if self._pm.db else []
+        tiles = [t for t in all_tiles if "_noise" not in t.get("id", "") and t.get("status") != "NOISE"]
+        if self._radio_scope_selected and self._radio_scope_selected.isChecked() and self._selected_tile_ids:
+            sel_set = set(self._selected_tile_ids)
+            filtered = [t for t in tiles if t.get("id") in sel_set]
+            if filtered:
+                return filtered
+        return tiles
+
+    def _generate_web_pointcloud_preview(self, tiles: Optional[List[dict]] = None) -> tuple[bytes, dict]:
         """Sample points across project tiles, convert coordinates to WGS84, and pack into binary float32."""
-        tiles = self._pm.db.get_all_tiles() if self._pm.db else []
-        tiles = [t for t in tiles if "_noise" not in t.get("id", "") and t.get("status") != "NOISE"]
+        if tiles is None:
+            tiles = self._get_target_tiles()
         if not tiles or laspy is None:
             return b"", {}
 
@@ -358,11 +436,9 @@ class CloudPublishDialog(QDialog):
                 logger.warning("Could not build CRS transformer for %s: %s", crs_str, e)
 
         points_per_tile = max(5000, 200000 // max(1, len(tiles)))
-        for t in tiles[:15]:
-            fpath = Path(t.get("file_path", ""))
-            if not fpath.is_absolute() and self._pm.project_dir:
-                fpath = self._pm.project_dir / fpath
-            if not fpath.exists():
+        for t in tiles[:25]:
+            fpath = self._resolve_tile_path(t)
+            if not fpath or not fpath.is_file():
                 continue
             try:
                 with laspy.open(str(fpath)) as f:
@@ -425,15 +501,17 @@ class CloudPublishDialog(QDialog):
 
         proj_meta = self._pm.metadata
         proj_name = proj_meta.get("name", "Untitled Project")
-        tiles = self._pm.db.get_all_tiles() if self._pm.db else []
-        tiles = [t for t in tiles if "_noise" not in t.get("id", "") and t.get("status") != "NOISE"]
+        tiles = self._get_target_tiles()
         total_tiles = len(tiles)
-        processed_tiles = sum(1 for t in tiles if t.get("status") in ("CLASSIFIED", "EDITED") or t.get("classified"))
+        processed_tiles = sum(
+            1 for t in tiles
+            if t.get("status") in ("CLASSIFIED", "GROUND", "BATHY", "EDITED") or t.get("classified")
+        )
 
         # 1. Generate Web Point Cloud Preview
         preview_bytes, geo_stats = b"", {}
         if self._chk_globe.isChecked():
-            preview_bytes, geo_stats = self._generate_web_pointcloud_preview()
+            preview_bytes, geo_stats = self._generate_web_pointcloud_preview(tiles)
 
         # 2. Inspect QGIS Project & External GIS Layers
         qgis_parser = None
@@ -627,35 +705,43 @@ class CloudPublishDialog(QDialog):
             if self._chk_dtm.isChecked() and self._pm.project_dir:
                 dtm_dir = self._pm.project_dir / "dtm"
                 if dtm_dir.is_dir():
-                    for dtmf in dtm_dir.glob("*.tif"):
+                    target_tids = {t.get("id") for t in tiles if t.get("id")}
+                    dtm_files = [f for f in dtm_dir.glob("*.tif") if any(tid in f.name for tid in target_tids)] or list(dtm_dir.glob("*.tif"))
+                    for dtmf in dtm_files[:5]:
                         self._prog_bar.setValue(80)
                         self._status_lbl.setText(f"Uploading DTM: {dtmf.name}...")
                         QApplication.processEvents()
-                        with open(dtmf, "rb") as f:
-                            requests.post(
-                                upload_url,
-                                data={"asset_type": "dtm"},
-                                files={"file": (dtmf.name, f, "image/tiff")},
-                                timeout=60,
-                            )
-                        break
+                        try:
+                            with open(dtmf, "rb") as f:
+                                requests.post(
+                                    upload_url,
+                                    data={"asset_type": "dtm"},
+                                    files={"file": (dtmf.name, f, "image/tiff")},
+                                    timeout=60,
+                                )
+                        except Exception as e:
+                            logger.warning("Failed uploading DTM raster %s: %s", dtmf.name, e)
 
             # 5f. Upload DSM Rasters if available
             if self._chk_dsm.isChecked() and self._pm.project_dir:
                 dsm_dir = self._pm.project_dir / "dsm"
                 if dsm_dir.is_dir():
-                    for dsmf in dsm_dir.glob("*.tif"):
+                    target_tids = {t.get("id") for t in tiles if t.get("id")}
+                    dsm_files = [f for f in dsm_dir.glob("*.tif") if any(tid in f.name for tid in target_tids)] or list(dsm_dir.glob("*.tif"))
+                    for dsmf in dsm_files[:5]:
                         self._prog_bar.setValue(88)
                         self._status_lbl.setText(f"Uploading DSM: {dsmf.name}...")
                         QApplication.processEvents()
-                        with open(dsmf, "rb") as f:
-                            requests.post(
-                                upload_url,
-                                data={"asset_type": "dsm"},
-                                files={"file": (dsmf.name, f, "image/tiff")},
-                                timeout=60,
-                            )
-                        break
+                        try:
+                            with open(dsmf, "rb") as f:
+                                requests.post(
+                                    upload_url,
+                                    data={"asset_type": "dsm"},
+                                    files={"file": (dsmf.name, f, "image/tiff")},
+                                    timeout=60,
+                                )
+                        except Exception as e:
+                            logger.warning("Failed uploading DSM raster %s: %s", dsmf.name, e)
 
             # 5g. Upload QC Report if available
             if self._chk_qc.isChecked() and self._pm.project_dir:
@@ -665,34 +751,44 @@ class CloudPublishDialog(QDialog):
                         self._prog_bar.setValue(93)
                         self._status_lbl.setText(f"Uploading QC Report: {qcf.name}...")
                         QApplication.processEvents()
-                        with open(qcf, "rb") as f:
-                            requests.post(
-                                upload_url,
-                                data={"asset_type": "qc_report"},
-                                files={"file": (qcf.name, f, "application/json")},
-                                timeout=20,
-                            )
+                        try:
+                            with open(qcf, "rb") as f:
+                                requests.post(
+                                    upload_url,
+                                    data={"asset_type": "qc_report"},
+                                    files={"file": (qcf.name, f, "application/json")},
+                                    timeout=20,
+                                )
+                        except Exception as e:
+                            logger.warning("Failed uploading QC report %s: %s", qcf.name, e)
                         break
 
             # 5h. Upload primary LAS / LAZ file if checked
             if self._chk_las.isChecked() and tiles:
-                first_tile = tiles[0]
-                las_path = Path(first_tile.get("file_path", ""))
-                if not las_path.is_absolute() and self._pm.project_dir:
-                    las_path = self._pm.project_dir / las_path
-                is_ent = (self._lic.plan in ("enterprise", "pro")) or getattr(self._lic, "is_admin", False)
-                max_allowed_bytes = (50 * 1024 * 1024 * 1024) if is_ent else (500 * 1024 * 1024)
-                if las_path.exists() and las_path.stat().st_size <= max_allowed_bytes:
-                    self._prog_bar.setValue(97)
-                    self._status_lbl.setText(f"Uploading Deliverable LAS: {las_path.name}...")
-                    QApplication.processEvents()
-                    with open(las_path, "rb") as f:
-                        requests.post(
-                            upload_url,
-                            data={"asset_type": "pointcloud"},
-                            files={"file": (las_path.name, f, "application/octet-stream")},
-                            timeout=600,
-                        )
+                las_path = None
+                for t in tiles:
+                    p = self._resolve_tile_path(t)
+                    if p and p.is_file():
+                        las_path = p
+                        break
+
+                if las_path and las_path.is_file():
+                    is_ent = (self._lic.plan in ("enterprise", "pro")) or getattr(self._lic, "is_admin", False)
+                    max_allowed_bytes = (50 * 1024 * 1024 * 1024) if is_ent else (500 * 1024 * 1024)
+                    if las_path.stat().st_size <= max_allowed_bytes:
+                        self._prog_bar.setValue(97)
+                        self._status_lbl.setText(f"Uploading Deliverable LAS: {las_path.name}...")
+                        QApplication.processEvents()
+                        try:
+                            with open(las_path, "rb") as f:
+                                requests.post(
+                                    upload_url,
+                                    data={"asset_type": "pointcloud"},
+                                    files={"file": (las_path.name, f, "application/octet-stream")},
+                                    timeout=600,
+                                )
+                        except Exception as e:
+                            logger.warning("Failed uploading deliverable LAS %s: %s", las_path.name, e)
 
             self._prog_bar.setValue(100)
             self._status_lbl.setText("Successfully published to Cloud!")

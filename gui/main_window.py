@@ -2287,8 +2287,9 @@ class MainWindow(QMainWindow):
         if not self._pm.is_open:
             QMessageBox.warning(self, "No Project", "Please open or create a project before publishing to cloud.")
             return
+        selected = self._tile_list_widget.get_selected_tile_ids()
         from .cloud_publish_dialog import CloudPublishDialog
-        dlg = CloudPublishDialog(self._pm, self)
+        dlg = CloudPublishDialog(self._pm, self, selected_tile_ids=selected)
         dlg.exec()
 
     def _on_company_nodes(self) -> None:
