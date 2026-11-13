@@ -1374,6 +1374,12 @@ class MainWindow(QMainWindow):
             self._db.update_filename(
                 conn, tile_id, f"bathy/{bathy_name}", TileStatus.BATHY
             )
+            try:
+                self._db.record_processing_time(
+                    conn, tile_id, "bathy", duration_seconds=0.0, point_count=new_count
+                )
+            except Exception:
+                pass
 
         self._tile_list_widget.update_tile_status(tile_id, TileStatus.BATHY)
         self._mark_project_dirty()
@@ -2325,6 +2331,16 @@ class MainWindow(QMainWindow):
         # Gather all tiles from local database (excluding auxiliary noise tiles)
         tiles_data = []
         try:
+            # Query recorded processing steps from processing_times
+            tile_steps = defaultdict(set)
+            try:
+                with self._db.connect() as conn:
+                    pt_rows = conn.execute("SELECT tile_id, step FROM processing_times").fetchall()
+                    for pt_tid, pt_step in pt_rows:
+                        tile_steps[pt_tid].add(pt_step)
+            except Exception:
+                pass
+
             tiles = self._db.get_all_tiles()
             for t in tiles:
                 tid = t["id"]
@@ -2334,16 +2350,20 @@ class MainWindow(QMainWindow):
                 point_count = t.get("point_count", 0)
                 qc_status = t.get("qc_status")
                 qc_comment = t.get("qc_comment")
+                fn = str(t.get("filename", ""))
 
-                # Deduce processing steps applied
+                # Accurately deduce processing steps applied
+                actual = tile_steps.get(tid, set())
                 steps = ["import"]
-                if status in ("FILTERED", "GROUND", "CLASSIFIED", "EDITED"):
+                if "filter" in actual or status in ("FILTERED", "GROUND", "CLASSIFIED", "BATHY", "EDITED"):
                     steps.append("filter")
-                if status in ("GROUND", "CLASSIFIED", "EDITED"):
+                if "ground" in actual or status == "GROUND":
                     steps.append("ground")
-                if status in ("CLASSIFIED", "EDITED"):
+                if "pointcept" in actual or status == "CLASSIFIED":
                     steps.append("pointcept")
-                if status == "EDITED":
+                if "bathy" in actual or status == "BATHY" or "bathy/" in fn:
+                    steps.append("bathy")
+                if "edited" in actual or status == "EDITED":
                     steps.append("edited")
 
                 tiles_data.append({
