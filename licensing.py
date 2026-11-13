@@ -293,6 +293,10 @@ class LicenseManager:
         tile_ids: List[str],
         target_node_ids: List[int],
         project_id: Optional[int] = None,
+        project_name: Optional[str] = None,
+        project_path: Optional[str] = None,
+        voxel_size: float = 0.5,
+        smoothing: str = "yes",
         job_type: str = "pointcept_classification",
         server_url: Optional[str] = None,
     ) -> Dict[str, Any]:
@@ -305,6 +309,10 @@ class LicenseManager:
         payload = {
             "user_email": self.user_email,
             "project_id": project_id,
+            "project_name": project_name,
+            "project_path": project_path,
+            "voxel_size": voxel_size,
+            "smoothing": smoothing,
             "tile_ids": tile_ids,
             "target_node_ids": target_node_ids,
             "job_type": job_type,

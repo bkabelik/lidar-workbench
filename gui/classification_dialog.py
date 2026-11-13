@@ -40,6 +40,7 @@ from ..config import (
     DEFAULT_CONFIG_PATH,
     DEFAULT_MODEL_PATH,
     DEFAULT_POINTCEPT_PATH,
+    TileStatus,
 )
 from ..database import Database
 from ..pointcept_worker import PointceptWorker
@@ -445,7 +446,20 @@ class ClassificationDialog(QDialog):
                 f"Dispatching {len(self._tile_ids)} tiles across {len(selected_node_ids)} company nodes…"
             )
 
-            res = self._lic.dispatch_job(self._tile_ids, selected_node_ids)
+            proj_root = getattr(self._tm, "_pm", None) and self._tm._pm.project_root
+            proj_name = ""
+            if getattr(self._tm, "_pm", None):
+                proj_name = self._tm._pm.metadata.get("name") or (proj_root.name if proj_root else "")
+            proj_path = str(proj_root) if proj_root else ""
+
+            res = self._lic.dispatch_job(
+                self._tile_ids,
+                selected_node_ids,
+                project_name=proj_name,
+                project_path=proj_path,
+                voxel_size=self._voxel_spin.value(),
+                smoothing="yes" if self._smoothing_check.isChecked() else "no",
+            )
             if not res.get("success"):
                 self._start_btn.setEnabled(True)
                 self._cancel_btn.setEnabled(False)
@@ -533,6 +547,31 @@ class ClassificationDialog(QDialog):
         self._progress_bar.setValue(100)
         processed = data.get("processed_tiles", len(self._tile_ids))
         self._status_label.setText(f"Done — {processed}/{len(self._tile_ids)} tiles classified across company nodes.")
+
+        # Update local SQLite database & refresh status
+        try:
+            with self._db.connect() as conn:
+                for tid in self._tile_ids:
+                    self._db.update_status(conn, tid, TileStatus.CLASSIFIED)
+                    tile_info = self._db.get_tile(tid)
+                    pt_count = tile_info.get("point_count") if tile_info else None
+                    self._db.record_processing_time(
+                        conn,
+                        tid,
+                        "pointcept",
+                        duration_seconds=0.0,
+                        point_count=pt_count,
+                        params={
+                            "cluster": True,
+                            "voxel_size": self._voxel_spin.value(),
+                            "smoothing": "yes" if self._smoothing_check.isChecked() else "no",
+                        },
+                    )
+            if hasattr(self._tm, "clear_cache"):
+                self._tm.clear_cache()
+        except Exception as exc:
+            logger.error("Failed updating tile statuses after cluster completion: %s", exc)
+
         QMessageBox.information(
             self,
             "Distributed Classification Complete",
