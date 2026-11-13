@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
 import traceback
 from collections import defaultdict
 from pathlib import Path
@@ -2321,37 +2322,38 @@ class MainWindow(QMainWindow):
         if not proj_name:
             proj_name = "LiDAR_Project"
 
-        # Gather all tiles from local database
+        # Gather all tiles from local database (excluding auxiliary noise tiles)
         tiles_data = []
         try:
-            with self._db.connect() as conn:
-                tiles = self._db.get_all_tiles(conn)
-                for t in tiles:
-                    tid = t["id"]
-                    status = t.get("status", "IMPORTED")
-                    point_count = t.get("point_count", 0)
-                    qc_status = t.get("qc_status")
-                    qc_comment = t.get("qc_comment")
+            tiles = self._db.get_all_tiles()
+            for t in tiles:
+                tid = t["id"]
+                status = t.get("status", "IMPORTED")
+                if tid.endswith("_noise") or status == "NOISE" or "_noise" in tid:
+                    continue
+                point_count = t.get("point_count", 0)
+                qc_status = t.get("qc_status")
+                qc_comment = t.get("qc_comment")
 
-                    # Deduce processing steps applied
-                    steps = ["import"]
-                    if status in ("FILTERED", "GROUND", "CLASSIFIED", "EDITED"):
-                        steps.append("filter")
-                    if status in ("GROUND", "CLASSIFIED", "EDITED"):
-                        steps.append("ground")
-                    if status in ("CLASSIFIED", "EDITED"):
-                        steps.append("pointcept")
-                    if status == "EDITED":
-                        steps.append("edited")
+                # Deduce processing steps applied
+                steps = ["import"]
+                if status in ("FILTERED", "GROUND", "CLASSIFIED", "EDITED"):
+                    steps.append("filter")
+                if status in ("GROUND", "CLASSIFIED", "EDITED"):
+                    steps.append("ground")
+                if status in ("CLASSIFIED", "EDITED"):
+                    steps.append("pointcept")
+                if status == "EDITED":
+                    steps.append("edited")
 
-                    tiles_data.append({
-                        "tile_id": tid,
-                        "status": status,
-                        "point_count": point_count or 0,
-                        "qc_status": qc_status,
-                        "qc_comment": qc_comment,
-                        "processing_steps": steps,
-                    })
+                tiles_data.append({
+                    "tile_id": tid,
+                    "status": status,
+                    "point_count": point_count or 0,
+                    "qc_status": qc_status,
+                    "qc_comment": qc_comment,
+                    "processing_steps": steps,
+                })
         except Exception as exc:
             logger.warning("Failed gathering tiles for sync: %s", exc)
             return

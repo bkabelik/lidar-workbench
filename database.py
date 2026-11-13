@@ -435,8 +435,11 @@ class Database:
             row = conn.execute("SELECT * FROM tiles WHERE id = ?", (tile_id,)).fetchone()
         return dict(row) if row else None
 
-    def get_all_tiles(self) -> List[Dict[str, Any]]:
+    def get_all_tiles(self, conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
         """Return all tile rows ordered by status then id."""
+        if conn is not None:
+            rows = conn.execute("SELECT * FROM tiles ORDER BY status, id").fetchall()
+            return [dict(r) for r in rows]
         with self.connect() as conn:
             rows = conn.execute("SELECT * FROM tiles ORDER BY status, id").fetchall()
         return [dict(r) for r in rows]

@@ -7,7 +7,10 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules, coll
 
 block_cipher = None
 
-repo_dir = Path(r"D:\01_build_lidar_workbench\lidar-workbench").resolve()
+try:
+    repo_dir = Path(SPECPATH).resolve()
+except NameError:
+    repo_dir = Path(__file__).resolve().parent if "__file__" in locals() else Path(".").resolve()
 
 # Root workbench modules
 root_modules = [
