@@ -45,26 +45,17 @@ from ..database import Database
 from ..pointcept_worker import PointceptWorker
 from ..tile_manager import TileManager
 from ..licensing import get_license_manager, get_local_gpu_name
+from .settings_dialog import load_pointcept_settings, save_pointcept_settings
 
 logger = logging.getLogger("lidar_workbench.gui.classification_dialog")
 
-_SETTINGS_FILE = ".pointcept_settings.json"
-
 
 def _load_settings() -> dict:
-    try:
-        with open(_SETTINGS_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    return load_pointcept_settings()
 
 
 def _save_settings(settings: dict) -> None:
-    try:
-        with open(_SETTINGS_FILE, "w") as f:
-            json.dump(settings, f, indent=2)
-    except Exception as exc:
-        logger.warning("Could not save Pointcept settings: %s", exc)
+    save_pointcept_settings(settings)
 
 
 class DistributedJobMonitor(QThread):
@@ -299,6 +290,13 @@ class ClassificationDialog(QDialog):
         if "smoothing" in s:
             self._smoothing_check.setChecked(s["smoothing"])
 
+        self._pointcept_edit.textChanged.connect(self._persist_settings)
+        self._model_edit.textChanged.connect(self._persist_settings)
+        self._config_edit.textChanged.connect(self._persist_settings)
+        self._python_edit.textChanged.connect(self._persist_settings)
+        self._voxel_spin.valueChanged.connect(self._persist_settings)
+        self._smoothing_check.toggled.connect(self._persist_settings)
+
     def _persist_settings(self) -> None:
         _save_settings({
             "pointcept_path": self._pointcept_edit.text().strip(),
@@ -308,6 +306,10 @@ class ClassificationDialog(QDialog):
             "voxel_size": self._voxel_spin.value(),
             "smoothing": self._smoothing_check.isChecked(),
         })
+
+    def closeEvent(self, event) -> None:
+        self._persist_settings()
+        super().closeEvent(event)
 
     # ── compute mode & cluster handling ────────────────────────────
 

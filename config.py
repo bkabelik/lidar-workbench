@@ -8,6 +8,7 @@ parameters, project directory layout, and logging setup helpers.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Dict, Final, Tuple
@@ -21,6 +22,14 @@ APP_DESCRIPTION: Final[str] = (
     "Interactive airborne LiDAR point cloud analysis and "
     "classification tool for bathymetric and topographic data."
 )
+
+if sys.platform == "win32":
+    APP_DATA_DIR: Final[Path] = Path(os.environ.get("APPDATA", Path.home())) / "LiDAR_Workbench"
+else:
+    APP_DATA_DIR: Final[Path] = Path.home() / ".lidar_workbench"
+
+APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+USER_SETTINGS_FILE: Final[Path] = APP_DATA_DIR / "settings.json"
 
 def _resolve_bundled_path(rel_path: str) -> str:
     """Resolve a relative asset path in both development and frozen PyInstaller environments."""
