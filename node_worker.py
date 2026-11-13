@@ -21,8 +21,8 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
-# Allow running directly (python node_worker.py) as well as via -m or frozen PyInstaller
-if __name__ == "__main__" and not __package__:
+# Allow running directly (python node_worker.py) as well as via -m, spawn, or frozen PyInstaller
+if not __package__:
     import os as _os
     import types as _types
 

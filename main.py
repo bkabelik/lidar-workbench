@@ -26,8 +26,8 @@ if "__EGL_VENDOR_LIBRARY_DIRS" not in os.environ and "EGL_VENDOR_LIBRARY_DIRS" n
 
 from PySide6.QtWidgets import QApplication
 
-# Allow running directly (python main.py) as well as via -m or frozen PyInstaller
-if __name__ == "__main__" and not __package__:
+# Allow running directly (python main.py) as well as via -m, multiprocessing spawn, or frozen PyInstaller
+if not __package__:
     import os as _os
     import types as _types
 
