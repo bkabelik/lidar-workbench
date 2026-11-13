@@ -763,21 +763,23 @@ class CloudPublishDialog(QDialog):
                             logger.warning("Failed uploading QC report %s: %s", qcf.name, e)
                         break
 
-            # 5h. Upload primary LAS / LAZ file if checked
+            # 5h. Upload primary LAS / LAZ deliverable files if checked
             if self._chk_las.isChecked() and tiles:
-                las_path = None
+                is_ent = (self._lic.plan in ("enterprise", "pro")) or getattr(self._lic, "is_admin", False)
+                max_allowed_bytes = (50 * 1024 * 1024 * 1024) if is_ent else (500 * 1024 * 1024)
+
+                las_paths = []
                 for t in tiles:
                     p = self._resolve_tile_path(t)
-                    if p and p.is_file():
-                        las_path = p
-                        break
+                    if p and p.is_file() and p not in las_paths:
+                        las_paths.append(p)
 
-                if las_path and las_path.is_file():
-                    is_ent = (self._lic.plan in ("enterprise", "pro")) or getattr(self._lic, "is_admin", False)
-                    max_allowed_bytes = (50 * 1024 * 1024 * 1024) if is_ent else (500 * 1024 * 1024)
+                total_las = len(las_paths)
+                for idx, las_path in enumerate(las_paths):
                     if las_path.stat().st_size <= max_allowed_bytes:
-                        self._prog_bar.setValue(97)
-                        self._status_lbl.setText(f"Uploading Deliverable LAS: {las_path.name}...")
+                        pct = int(95 + (idx + 1) / max(1, total_las) * 4)
+                        self._prog_bar.setValue(min(pct, 99))
+                        self._status_lbl.setText(f"Uploading Deliverable LAS ({idx + 1}/{total_las}): {las_path.name}...")
                         QApplication.processEvents()
                         try:
                             with open(las_path, "rb") as f:
