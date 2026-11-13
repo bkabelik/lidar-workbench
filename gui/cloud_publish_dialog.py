@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
 )
 
-from ..licensing import DEFAULT_SERVER_URL
+from ..licensing import DEFAULT_SERVER_URL, get_license_manager
 from ..project_manager import ProjectManager
 
 try:
@@ -74,6 +74,7 @@ class CloudPublishDialog(QDialog):
         self.setWindowTitle("Publish Deliverables to Cloud")
         self.setMinimumWidth(580)
         self._pm = pm
+        self._lic = get_license_manager()
         self._share_url: Optional[str] = None
         self._build_ui()
 
@@ -94,9 +95,10 @@ class CloudPublishDialog(QDialog):
         info_layout = QVBoxLayout(info_group)
         info_layout.addWidget(QLabel(f"<b>Project Name:</b> {proj_name}"))
 
-        tiles = self._pm.db.get_all_tiles() if self._pm.db else []
+        all_tiles = self._pm.db.get_all_tiles() if self._pm.db else []
+        tiles = [t for t in all_tiles if "_noise" not in t.get("id", "") and t.get("status") != "NOISE"]
         tiles_count = len(tiles)
-        classified_count = sum(1 for t in tiles if t.get("classified"))
+        classified_count = sum(1 for t in tiles if t.get("status") in ("CLASSIFIED", "EDITED") or t.get("classified"))
         info_layout.addWidget(QLabel(f"<b>Tiles:</b> {classified_count} / {tiles_count} classified"))
         layout.addWidget(info_group)
 
@@ -337,6 +339,7 @@ class CloudPublishDialog(QDialog):
     def _generate_web_pointcloud_preview(self) -> tuple[bytes, dict]:
         """Sample points across project tiles, convert coordinates to WGS84, and pack into binary float32."""
         tiles = self._pm.db.get_all_tiles() if self._pm.db else []
+        tiles = [t for t in tiles if "_noise" not in t.get("id", "") and t.get("status") != "NOISE"]
         if not tiles or laspy is None:
             return b"", {}
 
@@ -423,8 +426,9 @@ class CloudPublishDialog(QDialog):
         proj_meta = self._pm.metadata
         proj_name = proj_meta.get("name", "Untitled Project")
         tiles = self._pm.db.get_all_tiles() if self._pm.db else []
+        tiles = [t for t in tiles if "_noise" not in t.get("id", "") and t.get("status") != "NOISE"]
         total_tiles = len(tiles)
-        processed_tiles = sum(1 for t in tiles if t.get("classified"))
+        processed_tiles = sum(1 for t in tiles if t.get("status") in ("CLASSIFIED", "EDITED") or t.get("classified"))
 
         # 1. Generate Web Point Cloud Preview
         preview_bytes, geo_stats = b"", {}
