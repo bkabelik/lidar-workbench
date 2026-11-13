@@ -7,11 +7,12 @@ parameters, project directory layout, and logging setup helpers.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, Final, Tuple
+from typing import Any, Dict, Final, Tuple
 
 # ── Application metadata ──────────────────────────────────────────────
 APP_NAME: Final[str] = "LiDAR Workbench"
@@ -252,3 +253,106 @@ def get_class_name(classification: int) -> str:
         Class name string, or ``"Unknown (<code>)"`` for unrecognised codes.
     """
     return ASPRS_CLASS_NAMES.get(classification, f"Unknown ({classification})")
+
+
+# ── Persistent User Settings Helpers ──────────────────────────────────────────
+
+_LEGACY_SETTINGS_FILE = Path(".settings.json")
+
+
+def load_all_settings() -> Dict[str, Any]:
+    """Load all settings from permanent user storage, falling back to legacy file."""
+    target_file = USER_SETTINGS_FILE
+    if not target_file.is_file() and _LEGACY_SETTINGS_FILE.is_file():
+        try:
+            with open(_LEGACY_SETTINGS_FILE, "r") as f:
+                legacy = json.load(f)
+                if isinstance(legacy, dict):
+                    return legacy
+        except Exception:
+            pass
+
+    if target_file.is_file():
+        try:
+            with open(target_file, "r") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as exc:
+            logger.warning("Could not read user settings from %s: %s", target_file, exc)
+    return {}
+
+
+def save_all_settings(data: Dict[str, Any]) -> None:
+    """Save all settings permanently to USER_SETTINGS_FILE."""
+    try:
+        USER_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(USER_SETTINGS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as exc:
+        logger.warning("Could not save settings to %s: %s", USER_SETTINGS_FILE, exc)
+
+
+def load_general_settings() -> dict:
+    """Load general application preferences, falling back to defaults."""
+    all_settings = load_all_settings()
+    defaults = {
+        "filter_workers": DEFAULT_FILTER_WORKERS,
+        "classify_workers": DEFAULT_CLASSIFY_WORKERS,
+        "bathy_workers": DEFAULT_BATHY_WORKERS,
+        "ground_workers": DEFAULT_GROUND_WORKERS,
+        "brush_radius": DEFAULT_BRUSH_RADIUS_M,
+        "rect_width": DEFAULT_RECT_WIDTH_M,
+        "rect_height": DEFAULT_RECT_HEIGHT_M,
+        "shared_storage_root": "",
+    }
+    saved_gen = all_settings.get("general", {})
+    if not saved_gen and any(k in all_settings for k in defaults):
+        saved_gen = all_settings
+    defaults.update({k: v for k, v in saved_gen.items() if k in defaults})
+    return defaults
+
+
+def save_general_settings(settings: dict) -> None:
+    """Persist general settings section."""
+    all_settings = load_all_settings()
+    all_settings["general"] = settings
+    save_all_settings(all_settings)
+
+
+def load_pointcept_settings() -> dict:
+    """Load AI / Pointcept model paths and inference defaults."""
+    all_settings = load_all_settings()
+    defaults = {
+        "pointcept_path": DEFAULT_POINTCEPT_PATH,
+        "model_path": DEFAULT_MODEL_PATH,
+        "config_path": DEFAULT_CONFIG_PATH,
+        "python_exe": sys.executable,
+        "voxel_size": 0.5,
+        "smoothing": True,
+    }
+    saved_pc = all_settings.get("pointcept", {})
+    # Legacy fallback: .pointcept_settings.json in cwd
+    if not saved_pc and Path(".pointcept_settings.json").is_file():
+        try:
+            with open(".pointcept_settings.json", "r") as f:
+                saved_pc = json.load(f)
+        except Exception:
+            pass
+
+    for k, v in saved_pc.items():
+        if v:
+            # If path does not exist on this machine, fall back to local auto-resolved default
+            if k in ("pointcept_path", "model_path", "config_path", "python_exe"):
+                if not Path(str(v)).exists():
+                    continue
+            defaults[k] = v
+    return defaults
+
+
+def save_pointcept_settings(settings: dict) -> None:
+    """Persist AI / Pointcept model paths and inference defaults."""
+    all_settings = load_all_settings()
+    all_settings["pointcept"] = settings
+    save_all_settings(all_settings)
+

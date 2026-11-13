@@ -21,6 +21,23 @@ import time
 from pathlib import Path
 from typing import Optional, Tuple
 
+# Allow running directly (python node_worker.py) as well as via -m or frozen PyInstaller
+if __name__ == "__main__" and not __package__:
+    import os as _os
+    import types as _types
+
+    _base = getattr(sys, "_MEIPASS", _os.path.dirname(_os.path.abspath(__file__)))
+    _pkg_dir = _base
+    if _base not in sys.path:
+        sys.path.insert(0, _base)
+    if "lidar_workbench" not in sys.modules:
+        _mod = _types.ModuleType("lidar_workbench")
+        _mod.__path__ = [_pkg_dir]
+        _mod.__file__ = _os.path.join(_pkg_dir, "__init__.py")
+        _mod.__package__ = "lidar_workbench"
+        sys.modules["lidar_workbench"] = _mod
+    __package__ = "lidar_workbench"
+
 try:
     from PySide6.QtCore import QThread, Signal
 except ImportError:
@@ -34,12 +51,22 @@ except ImportError:
 
 try:
     from .licensing import get_license_manager, LicenseManager
-    from .config import DEFAULT_POINTCEPT_PATH, DEFAULT_MODEL_PATH, DEFAULT_CONFIG_PATH
-    from .gui.settings_dialog import load_pointcept_settings, load_general_settings
+    from .config import (
+        DEFAULT_POINTCEPT_PATH,
+        DEFAULT_MODEL_PATH,
+        DEFAULT_CONFIG_PATH,
+        load_pointcept_settings,
+        load_general_settings,
+    )
 except (ImportError, ValueError):
     from licensing import get_license_manager, LicenseManager
-    from config import DEFAULT_POINTCEPT_PATH, DEFAULT_MODEL_PATH, DEFAULT_CONFIG_PATH
-    from gui.settings_dialog import load_pointcept_settings, load_general_settings
+    from config import (
+        DEFAULT_POINTCEPT_PATH,
+        DEFAULT_MODEL_PATH,
+        DEFAULT_CONFIG_PATH,
+        load_pointcept_settings,
+        load_general_settings,
+    )
 
 logger = logging.getLogger("lidar_workbench.node_worker")
 
