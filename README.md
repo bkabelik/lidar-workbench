@@ -11,18 +11,22 @@
 https://github.com/user-attachments/assets/a24c937b-cadb-4a6d-a4bc-d83682c2284c
 
 Developed by **[Kabelik GmbH](https://kabelik.at)** — Remote Sensing, Geomatics &amp; IT Services  
+Cloud Portal &amp; WebGIS: **[https://lidar.kabelik.at/](https://lidar.kabelik.at/)**  
 Merbotogasse 58D, 2700 Wiener Neustadt, Austria · [office@kabelik.at](mailto:office@kabelik.at)
 
 Built with PySide6, Open3D, laspy, NumPy/SciPy, and [Pointcept](https://github.com/bkabelik/PointceptALS.git).
+
+## Cloud Portal &amp; WebGIS
+[![LiDAR Cloud Portal](https://img.shields.io/badge/Cloud_Portal-lidar.kabelik.at-1a73e8?style=for-the-badge&logo=googlecloud&logoColor=white)](https://lidar.kabelik.at/)
 
 ## Video Tutorials:  
 [![Watch on YouTube](https://img.shields.io/badge/YouTube-Course_Playlist-red?style=for-the-badge&logo=youtube)](https://www.youtube.com/playlist?list=PLG8LnhTJkPGI)
 
 ## Download (Windows Standalone)
-[![Download Windows Installer](https://img.shields.io/badge/Download-Windows_Installer_(64--bit)-0284c7?style=for-the-badge&logo=windows&logoColor=white)](https://drive.google.com/file/d/1KPt9g8LIhKXXc73eEA8hojD6x6Qfgkhr/view?usp=sharing)
+[![Download Windows Installer](https://img.shields.io/badge/Download-Windows_Installer_(64--bit)-0284c7?style=for-the-badge&logo=windows&logoColor=white)](https://lidar.kabelik.at/static/downloads/LiDAR_Workbench_Setup_v1.0_RTX30_40_50.exe)
 
 Pre-built standalone Windows setup supporting NVIDIA RTX 30, RTX 40, and RTX 50 (Blackwell) Series GPUs:
-- **Direct Download:** [LiDAR Workbench Setup (Google Drive Mirror)](https://drive.google.com/file/d/1KPt9g8LIhKXXc73eEA8hojD6x6Qfgkhr/view?usp=sharing)
+- **Direct Download:** [LiDAR_Workbench_Setup_v1.0_RTX30_40_50.exe](https://lidar.kabelik.at/static/downloads/LiDAR_Workbench_Setup_v1.0_RTX30_40_50.exe)
 - **Features included:** Self-contained executable, Pointcept deep-learning classification, 2D/3D profile editors, Water Surface Modeler (WSM), QGIS project parser, and automatic peer-to-peer compute worker. No prior Python or manual CUDA compilation required.
 
 ---
