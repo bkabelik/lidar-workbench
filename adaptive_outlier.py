@@ -742,14 +742,15 @@ def classify_outliers_adaptive(
         angle_deg = np.degrees(np.arccos(dot))
         unstable_normal = angle_deg > params.max_normal_angle_deg
 
-        # Protect multi-return forest canopy and dense building corners from PCA rejection
+        # Protect multi-return forest canopy, vertical walls/fences/nets, and linear features from normal SOR
         surv_canopy = canopy_protected[surv_idx]
+        is_vertical_or_linear = (is_planar & (np.abs(norm_l[:, 2]) < 0.55)) | is_linear
         sparse_for_pca = weighted_d > (med_wd + 2.0 * mad_wd)
         pca_reject = (~is_linear) & (~is_planar) & unstable_normal & (~surv_canopy) & sparse_for_pca & (res_s > params.max_plane_residual_m)
 
-        # Extreme SOR (> 1.35x threshold) can also catch isolated canopy outliers, normal SOR respects canopy
-        extreme_sor = weighted_d > (sor_thresh * 1.35)
-        final_reject = (sor_reject & (~surv_canopy)) | extreme_sor | pca_reject
+        # Extreme SOR catches truly isolated outliers even on canopy/vertical structures
+        extreme_sor = weighted_d > (sor_thresh * 1.65)
+        final_reject = (sor_reject & (~surv_canopy) & (~is_vertical_or_linear)) | extreme_sor | pca_reject
 
         rej_pts = surv_idx[final_reject]
         if len(rej_pts) > 0:
