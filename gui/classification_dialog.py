@@ -103,6 +103,130 @@ class DistributedJobMonitor(QThread):
             time.sleep(1.5)
 
 
+class ClusterExecutionWidget(QGroupBox):
+    """Reusable Local vs. Distributed Company Node Cluster selector & dispatcher."""
+
+    def __init__(self, tile_manager, parent=None, title: str = "Execution Mode (Local vs. Distributed Cluster)"):
+        super().__init__(title, parent)
+        self._tm = tile_manager
+        from ..licensing import get_license_manager
+        self._lic = get_license_manager()
+        self._node_rows: list = []
+
+        lay = QVBoxLayout(self)
+        lay.setSpacing(6)
+
+        mode_row = QHBoxLayout()
+        self._radio_local = QRadioButton("Local Machine (This PC)")
+        self._radio_local.setChecked(True)
+        self._radio_cluster = QRadioButton("Distributed Company Nodes")
+        mode_row.addWidget(self._radio_local)
+        mode_row.addWidget(self._radio_cluster)
+        mode_row.addStretch()
+        lay.addLayout(mode_row)
+
+        self._cluster_box = QWidget()
+        cb_lay = QVBoxLayout(self._cluster_box)
+        cb_lay.setContentsMargins(0, 2, 0, 0)
+        cb_lay.setSpacing(4)
+
+        hdr = QHBoxLayout()
+        hdr.addWidget(QLabel("Select online company nodes:"))
+        ref_btn = QPushButton("🔄 Refresh")
+        ref_btn.setFixedWidth(85)
+        ref_btn.clicked.connect(self.refresh_nodes)
+        hdr.addWidget(ref_btn)
+        cb_lay.addLayout(hdr)
+
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["Use", "Node", "GPU", "Status"])
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self._table.setMaximumHeight(110)
+        self._table.verticalHeader().setVisible(False)
+        cb_lay.addWidget(self._table)
+
+        self._cluster_box.setVisible(False)
+        lay.addWidget(self._cluster_box)
+
+        self._radio_cluster.toggled.connect(self._on_toggled)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._cluster_box.setVisible(checked)
+        if checked:
+            self.refresh_nodes()
+
+    def is_distributed(self) -> bool:
+        return self._radio_cluster.isChecked()
+
+    def selected_node_ids(self) -> list:
+        return [nid for nid, chk in self._node_rows if chk.isChecked()]
+
+    def refresh_nodes(self) -> None:
+        self._table.setRowCount(0)
+        self._node_rows.clear()
+        if not self._lic.is_logged_in:
+            self._table.insertRow(0)
+            self._table.setItem(0, 1, QTableWidgetItem("Not logged in"))
+            return
+        nodes = self._lic.get_company_nodes()
+        if not nodes:
+            self._table.insertRow(0)
+            self._table.setItem(0, 1, QTableWidgetItem("No online nodes found"))
+            return
+        for r, n in enumerate(nodes):
+            self._table.insertRow(r)
+            chk = QCheckBox()
+            chk.setChecked(bool(n.get("is_online")))
+            chk_w = QWidget()
+            cl = QHBoxLayout(chk_w)
+            cl.setContentsMargins(4, 0, 4, 0)
+            cl.setAlignment(Qt.AlignCenter)
+            cl.addWidget(chk)
+            self._table.setCellWidget(r, 0, chk_w)
+            self._table.setItem(r, 1, QTableWidgetItem(str(n.get("node_name", ""))))
+            self._table.setItem(r, 2, QTableWidgetItem(str(n.get("gpu_name", ""))))
+            self._table.setItem(r, 3, QTableWidgetItem("Online" if n.get("is_online") else "Offline"))
+            self._node_rows.append((n["id"], chk))
+
+    def start_distributed_job(
+        self,
+        tile_ids: list,
+        job_type: str,
+        job_params: dict,
+        on_progress,
+        on_completed,
+        on_error,
+        parent=None,
+    ) -> tuple:
+        node_ids = self.selected_node_ids()
+        if not node_ids:
+            return None, "Please select at least one online company node."
+
+        pm = getattr(self._tm, "_pm", None)
+        proj_root = pm.project_root if pm else None
+        proj_name = (pm.metadata.get("name") or (proj_root.name if proj_root else "")) if pm else ""
+        proj_path = str(proj_root) if proj_root else ""
+
+        res = self._lic.dispatch_job(
+            tile_ids,
+            node_ids,
+            project_name=proj_name,
+            project_path=proj_path,
+            job_type=job_type,
+            job_params=job_params,
+        )
+        if not res.get("success"):
+            return None, res.get("error") or res.get("detail") or "Failed to dispatch distributed job."
+
+        mon = DistributedJobMonitor(res["job_id"], len(tile_ids), self._lic, parent or self)
+        mon.progress.connect(on_progress)
+        mon.completed.connect(on_completed)
+        mon.error.connect(on_error)
+        mon.start()
+        return mon, None
+
+
 class ClassificationDialog(QDialog):
     """
     Dialog for configuring and launching Pointcept classification.

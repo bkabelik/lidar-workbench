@@ -298,6 +298,7 @@ class LicenseManager:
         voxel_size: float = 0.5,
         smoothing: str = "yes",
         job_type: str = "pointcept_classification",
+        job_params: Optional[Dict[str, Any]] = None,
         server_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Dispatch a batch of tiles across the selected company nodes."""
@@ -316,6 +317,7 @@ class LicenseManager:
             "tile_ids": tile_ids,
             "target_node_ids": target_node_ids,
             "job_type": job_type,
+            "job_params": job_params or {},
         }
         try:
             req = urllib.request.Request(

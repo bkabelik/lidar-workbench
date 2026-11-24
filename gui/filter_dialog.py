@@ -30,6 +30,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -428,11 +430,22 @@ class FilterDialog(QDialog):
         self._batch_check.setChecked(True)
         mid.addWidget(self._batch_check)
 
+        # --- Distributed Cluster Execution ---
+        from .classification_dialog import ClusterExecutionWidget
+        self._cluster_exec = ClusterExecutionWidget(self._tm, parent=self)
+        mid.addWidget(self._cluster_exec)
+        self._cluster_monitor = None
+        self._cluster_prog = QProgressBar()
+        self._cluster_prog.setRange(0, 100)
+        self._cluster_prog.setVisible(False)
+        mid.addWidget(self._cluster_prog)
+
         # --- Buttons ---
         btn_box = QDialogButtonBox(QDialogButtonBox.Apply | QDialogButtonBox.Cancel)
-        btn_box.button(QDialogButtonBox.Apply).setText("Apply Pipeline")
-        btn_box.button(QDialogButtonBox.Apply).clicked.connect(self._on_apply)
-        btn_box.rejected.connect(self.reject)
+        self._apply_btn = btn_box.button(QDialogButtonBox.Apply)
+        self._apply_btn.setText("Apply Pipeline")
+        self._apply_btn.clicked.connect(self._on_apply)
+        btn_box.rejected.connect(self._on_cancel_dialog)
         mid.addWidget(btn_box)
 
         layout.addLayout(mid, stretch=1)
@@ -878,13 +891,55 @@ class FilterDialog(QDialog):
 
     # ── apply ──────────────────────────────────────────────────────
 
+    def _on_cancel_dialog(self):
+        if self._cluster_monitor is not None:
+            self._cluster_monitor.cancel()
+        self.reject()
+
     def _on_apply(self):
         if not self._pipeline:
             self._preview_status.setText("Add at least one filter step to the pipeline.")
             return
+        if self._cluster_exec.is_distributed():
+            target_tiles = self._tile_ids if self._batch_check.isChecked() else [self._tile_ids[self._current_tile_idx]]
+            self._apply_btn.setEnabled(False)
+            self._cluster_prog.setVisible(True)
+            self._cluster_prog.setValue(0)
+            self._preview_status.setText(f"Dispatching filter pipeline across company nodes ({len(target_tiles)} tiles)…")
+            mon, err = self._cluster_exec.start_distributed_job(
+                target_tiles,
+                job_type="noise_filter",
+                job_params={"pipeline": self._pipeline},
+                on_progress=self._on_cluster_progress,
+                on_completed=self._on_cluster_completed,
+                on_error=self._on_cluster_error,
+                parent=self,
+            )
+            if err:
+                self._apply_btn.setEnabled(True)
+                self._cluster_prog.setVisible(False)
+                QMessageBox.warning(self, "Distributed Filter", err)
+                return
+            self._cluster_monitor = mon
+            return
         if self._batch_check.isChecked():
             self.filter_applied.emit(self._tile_ids, self._pipeline)
         self.accept()
+
+    def _on_cluster_progress(self, msg: str, pct: float) -> None:
+        self._preview_status.setText(msg)
+        self._cluster_prog.setValue(int(pct))
+
+    def _on_cluster_completed(self, _res: dict) -> None:
+        self._apply_btn.setEnabled(True)
+        self._cluster_prog.setValue(100)
+        QMessageBox.information(self, "Distributed Filter Complete", "All tiles were filtered across the selected company nodes.")
+        self.accept()
+
+    def _on_cluster_error(self, msg: str) -> None:
+        self._apply_btn.setEnabled(True)
+        self._preview_status.setText(f"Distributed error: {msg}")
+        QMessageBox.critical(self, "Distributed Filter Error", msg)
 
     # ── preset save / load ─────────────────────────────────────────
 

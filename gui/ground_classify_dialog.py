@@ -556,6 +556,9 @@ class GroundClassifyDialog(QDialog):
             except Exception:
                 pass
             self._worker.wait(5000)
+        if hasattr(self, "_cluster_monitor") and self._cluster_monitor is not None and self._cluster_monitor.isRunning():
+            self._cluster_monitor.cancel()
+            self._cluster_monitor.wait(2000)
         super().reject()
 
     def closeEvent(self, event):
@@ -1067,6 +1070,12 @@ class GroundClassifyDialog(QDialog):
         info.setWordWrap(True)
         layout.addWidget(info)
 
+        # Distributed Cluster Execution
+        from .classification_dialog import ClusterExecutionWidget
+        self._cluster_exec = ClusterExecutionWidget(getattr(self, "_tm", None), parent=self)
+        self._cluster_monitor = None
+        layout.addWidget(self._cluster_exec)
+
         # Progress
         self._status = QLabel("Ready")
         layout.addWidget(self._status)
@@ -1326,6 +1335,33 @@ class GroundClassifyDialog(QDialog):
         method = self._method_combo.currentData()
         source_class = self._source_class_combo.currentData()
         params = self._collect_params(method)
+
+        if self._cluster_exec.is_distributed():
+            tile_ids = [j["tile_id"] for j in self._jobs]
+            self._run_btn.setEnabled(False)
+            self._status.setText(f"Dispatching ground classification across company nodes ({len(tile_ids)} tiles)…")
+            self._progress.setValue(0)
+            mon, err = self._cluster_exec.start_distributed_job(
+                tile_ids,
+                job_type="ground_classification",
+                job_params={
+                    "method": method,
+                    "params": params,
+                    "source_class": source_class,
+                    "project_path": str(Path(self._jobs[0]["las_path"]).parent.parent) if self._jobs else "",
+                },
+                on_progress=self._on_progress,
+                on_completed=lambda _res: self._on_finished(len(tile_ids)),
+                on_error=self._on_error,
+                parent=self,
+            )
+            if err:
+                self._run_btn.setEnabled(True)
+                self._status.setText(f"Error: {err}")
+                QMessageBox.warning(self, "Distributed Ground Classification", err)
+                return
+            self._cluster_monitor = mon
+            return
 
         from ..gui.settings_dialog import load_general_settings
         settings = load_general_settings()

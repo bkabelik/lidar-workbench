@@ -208,8 +208,148 @@ class CompanyNodeWorker(QThread):
         if not pred_script.is_file():
             logger.error("prediction.py not found at %s", pred_script)
             return False, 0
+
+    def _run_noise_filter(
+        self,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run noise filtering pipeline on a single LAS/LAZ tile in-place."""
+        pipeline = job_params.get("pipeline") or []
+        if not pipeline:
+            logger.warning("Empty filter pipeline for %s", las_path.name)
+            return False, 0
+        try:
+            import laspy
+            import numpy as np
+            try:
+                from .noise_filter import _apply_pipeline_timed
+            except (ImportError, ValueError):
+                from noise_filter import _apply_pipeline_timed
+
+            las = laspy.read(str(las_path))
+            n_pts = len(las.x)
+            if n_pts == 0:
+                return True, 0
+            data = {
+                "x": np.asarray(las.x, dtype=np.float64),
+                "y": np.asarray(las.y, dtype=np.float64),
+                "z": np.asarray(las.z, dtype=np.float64),
+                "classification": np.asarray(las.classification, dtype=np.uint8),
+                "intensity": np.asarray(las.intensity, dtype=np.uint16) if hasattr(las, "intensity") else np.zeros(n_pts, dtype=np.uint16),
+                "return_number": np.asarray(las.return_number, dtype=np.uint8) if hasattr(las, "return_number") else np.ones(n_pts, dtype=np.uint8),
+            }
+            keep_mask, _dur = _apply_pipeline_timed(data, pipeline)
+            cls_arr = np.asarray(las.classification, dtype=np.uint8).copy()
+            cls_arr[~keep_mask] = 7  # ASPRS Low Point / Noise
+            las.classification = cls_arr
+
+            backup = las_path.with_suffix(las_path.suffix + ".bak")
+            try:
+                shutil.copy2(str(las_path), str(backup))
+            except OSError:
+                pass
+            las.write(str(las_path))
+            logger.info("Filtered %s (%d/%d noise pts marked class 7)", las_path.name, int((~keep_mask).sum()), n_pts)
+            return True, int(n_pts)
+        except Exception as e:
+            logger.error("Noise filter failed on %s: %s", las_path.name, e)
+            return False, 0
+
+    def _run_ground_classification(
+        self,
+        tile_id: str,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run ground classification on a single LAS/LAZ tile in-place."""
+        method = str(job_params.get("method", "stepdown_ptd"))
+        params = dict(job_params.get("params") or {})
+        source_class = int(job_params.get("source_class", -1))
+        try:
+            try:
+                from .gui.ground_classify_dialog import _ground_process_tile
+            except (ImportError, ValueError):
+                from gui.ground_classify_dialog import _ground_process_tile
+            res = _ground_process_tile(tile_id, str(las_path), method, params, source_class, {})
+            n_affected = int(res.get("n_affected", 0))
+            logger.info("Ground classified %s (%d ground / %d affected)", las_path.name, int(res.get("n_ground", 0)), n_affected)
+            return True, n_affected
+        except Exception as e:
+            logger.error("Ground classification failed on %s: %s", las_path.name, e)
+            return False, 0
         if not model_path.is_file():
             logger.error("Model checkpoint not found at %s", model_path)
+            return False, 0
+
+    def _run_noise_filter(
+        self,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run noise filtering pipeline on a single LAS/LAZ tile in-place."""
+        pipeline = job_params.get("pipeline") or []
+        if not pipeline:
+            logger.warning("Empty filter pipeline for %s", las_path.name)
+            return False, 0
+        try:
+            import laspy
+            import numpy as np
+            try:
+                from .noise_filter import _apply_pipeline_timed
+            except (ImportError, ValueError):
+                from noise_filter import _apply_pipeline_timed
+
+            las = laspy.read(str(las_path))
+            n_pts = len(las.x)
+            if n_pts == 0:
+                return True, 0
+            data = {
+                "x": np.asarray(las.x, dtype=np.float64),
+                "y": np.asarray(las.y, dtype=np.float64),
+                "z": np.asarray(las.z, dtype=np.float64),
+                "classification": np.asarray(las.classification, dtype=np.uint8),
+                "intensity": np.asarray(las.intensity, dtype=np.uint16) if hasattr(las, "intensity") else np.zeros(n_pts, dtype=np.uint16),
+                "return_number": np.asarray(las.return_number, dtype=np.uint8) if hasattr(las, "return_number") else np.ones(n_pts, dtype=np.uint8),
+            }
+            keep_mask, _dur = _apply_pipeline_timed(data, pipeline)
+            cls_arr = np.asarray(las.classification, dtype=np.uint8).copy()
+            cls_arr[~keep_mask] = 7  # ASPRS Low Point / Noise
+            las.classification = cls_arr
+
+            backup = las_path.with_suffix(las_path.suffix + ".bak")
+            try:
+                shutil.copy2(str(las_path), str(backup))
+            except OSError:
+                pass
+            las.write(str(las_path))
+            logger.info("Filtered %s (%d/%d noise pts marked class 7)", las_path.name, int((~keep_mask).sum()), n_pts)
+            return True, int(n_pts)
+        except Exception as e:
+            logger.error("Noise filter failed on %s: %s", las_path.name, e)
+            return False, 0
+
+    def _run_ground_classification(
+        self,
+        tile_id: str,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run ground classification on a single LAS/LAZ tile in-place."""
+        method = str(job_params.get("method", "stepdown_ptd"))
+        params = dict(job_params.get("params") or {})
+        source_class = int(job_params.get("source_class", -1))
+        try:
+            try:
+                from .gui.ground_classify_dialog import _ground_process_tile
+            except (ImportError, ValueError):
+                from gui.ground_classify_dialog import _ground_process_tile
+            res = _ground_process_tile(tile_id, str(las_path), method, params, source_class, {})
+            n_affected = int(res.get("n_affected", 0))
+            logger.info("Ground classified %s (%d ground / %d affected)", las_path.name, int(res.get("n_ground", 0)), n_affected)
+            return True, n_affected
+        except Exception as e:
+            logger.error("Ground classification failed on %s: %s", las_path.name, e)
             return False, 0
 
         with tempfile.TemporaryDirectory(prefix="cluster_pt_") as work_dir:
@@ -248,6 +388,76 @@ class CompanyNodeWorker(QThread):
                 logger.error("Pointcept execution failed on %s (exit %d): %s", las_path.name, res.returncode, res.stderr[-500:])
                 return False, 0
 
+    def _run_noise_filter(
+        self,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run noise filtering pipeline on a single LAS/LAZ tile in-place."""
+        pipeline = job_params.get("pipeline") or []
+        if not pipeline:
+            logger.warning("Empty filter pipeline for %s", las_path.name)
+            return False, 0
+        try:
+            import laspy
+            import numpy as np
+            try:
+                from .noise_filter import _apply_pipeline_timed
+            except (ImportError, ValueError):
+                from noise_filter import _apply_pipeline_timed
+
+            las = laspy.read(str(las_path))
+            n_pts = len(las.x)
+            if n_pts == 0:
+                return True, 0
+            data = {
+                "x": np.asarray(las.x, dtype=np.float64),
+                "y": np.asarray(las.y, dtype=np.float64),
+                "z": np.asarray(las.z, dtype=np.float64),
+                "classification": np.asarray(las.classification, dtype=np.uint8),
+                "intensity": np.asarray(las.intensity, dtype=np.uint16) if hasattr(las, "intensity") else np.zeros(n_pts, dtype=np.uint16),
+                "return_number": np.asarray(las.return_number, dtype=np.uint8) if hasattr(las, "return_number") else np.ones(n_pts, dtype=np.uint8),
+            }
+            keep_mask, _dur = _apply_pipeline_timed(data, pipeline)
+            cls_arr = np.asarray(las.classification, dtype=np.uint8).copy()
+            cls_arr[~keep_mask] = 7  # ASPRS Low Point / Noise
+            las.classification = cls_arr
+
+            backup = las_path.with_suffix(las_path.suffix + ".bak")
+            try:
+                shutil.copy2(str(las_path), str(backup))
+            except OSError:
+                pass
+            las.write(str(las_path))
+            logger.info("Filtered %s (%d/%d noise pts marked class 7)", las_path.name, int((~keep_mask).sum()), n_pts)
+            return True, int(n_pts)
+        except Exception as e:
+            logger.error("Noise filter failed on %s: %s", las_path.name, e)
+            return False, 0
+
+    def _run_ground_classification(
+        self,
+        tile_id: str,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run ground classification on a single LAS/LAZ tile in-place."""
+        method = str(job_params.get("method", "stepdown_ptd"))
+        params = dict(job_params.get("params") or {})
+        source_class = int(job_params.get("source_class", -1))
+        try:
+            try:
+                from .gui.ground_classify_dialog import _ground_process_tile
+            except (ImportError, ValueError):
+                from gui.ground_classify_dialog import _ground_process_tile
+            res = _ground_process_tile(tile_id, str(las_path), method, params, source_class, {})
+            n_affected = int(res.get("n_affected", 0))
+            logger.info("Ground classified %s (%d ground / %d affected)", las_path.name, int(res.get("n_ground", 0)), n_affected)
+            return True, n_affected
+        except Exception as e:
+            logger.error("Ground classification failed on %s: %s", las_path.name, e)
+            return False, 0
+
             # prediction.py outputs to <folder>/predictions/<las_name>
             predicted_file = work_path / "predictions" / las_path.name
             if predicted_file.is_file():
@@ -261,6 +471,76 @@ class CompanyNodeWorker(QThread):
                 return True, 500000
 
         return False, 0
+
+    def _run_noise_filter(
+        self,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run noise filtering pipeline on a single LAS/LAZ tile in-place."""
+        pipeline = job_params.get("pipeline") or []
+        if not pipeline:
+            logger.warning("Empty filter pipeline for %s", las_path.name)
+            return False, 0
+        try:
+            import laspy
+            import numpy as np
+            try:
+                from .noise_filter import _apply_pipeline_timed
+            except (ImportError, ValueError):
+                from noise_filter import _apply_pipeline_timed
+
+            las = laspy.read(str(las_path))
+            n_pts = len(las.x)
+            if n_pts == 0:
+                return True, 0
+            data = {
+                "x": np.asarray(las.x, dtype=np.float64),
+                "y": np.asarray(las.y, dtype=np.float64),
+                "z": np.asarray(las.z, dtype=np.float64),
+                "classification": np.asarray(las.classification, dtype=np.uint8),
+                "intensity": np.asarray(las.intensity, dtype=np.uint16) if hasattr(las, "intensity") else np.zeros(n_pts, dtype=np.uint16),
+                "return_number": np.asarray(las.return_number, dtype=np.uint8) if hasattr(las, "return_number") else np.ones(n_pts, dtype=np.uint8),
+            }
+            keep_mask, _dur = _apply_pipeline_timed(data, pipeline)
+            cls_arr = np.asarray(las.classification, dtype=np.uint8).copy()
+            cls_arr[~keep_mask] = 7  # ASPRS Low Point / Noise
+            las.classification = cls_arr
+
+            backup = las_path.with_suffix(las_path.suffix + ".bak")
+            try:
+                shutil.copy2(str(las_path), str(backup))
+            except OSError:
+                pass
+            las.write(str(las_path))
+            logger.info("Filtered %s (%d/%d noise pts marked class 7)", las_path.name, int((~keep_mask).sum()), n_pts)
+            return True, int(n_pts)
+        except Exception as e:
+            logger.error("Noise filter failed on %s: %s", las_path.name, e)
+            return False, 0
+
+    def _run_ground_classification(
+        self,
+        tile_id: str,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run ground classification on a single LAS/LAZ tile in-place."""
+        method = str(job_params.get("method", "stepdown_ptd"))
+        params = dict(job_params.get("params") or {})
+        source_class = int(job_params.get("source_class", -1))
+        try:
+            try:
+                from .gui.ground_classify_dialog import _ground_process_tile
+            except (ImportError, ValueError):
+                from gui.ground_classify_dialog import _ground_process_tile
+            res = _ground_process_tile(tile_id, str(las_path), method, params, source_class, {})
+            n_affected = int(res.get("n_affected", 0))
+            logger.info("Ground classified %s (%d ground / %d affected)", las_path.name, int(res.get("n_ground", 0)), n_affected)
+            return True, n_affected
+        except Exception as e:
+            logger.error("Ground classification failed on %s: %s", las_path.name, e)
+            return False, 0
 
     def run(self) -> None:
         self._stop_requested = False
@@ -282,15 +562,17 @@ class CompanyNodeWorker(QThread):
                 if task.get("has_task"):
                     job_id = task["job_id"]
                     tile_id = task["tile_id"]
-                    proj_name = task.get("project_name")
-                    proj_path = task.get("project_path")
-                    voxel_sz = float(task.get("voxel_size", 0.5))
-                    smoothing = str(task.get("smoothing", "yes"))
+                    job_type = task.get("job_type") or "pointcept_classification"
+                    job_params = task.get("job_params") or {}
+                    proj_name = task.get("project_name") or job_params.get("project_name")
+                    proj_path = task.get("project_path") or job_params.get("project_path")
+                    voxel_sz = float(task.get("voxel_size", job_params.get("voxel_size", 0.5)))
+                    smoothing = str(task.get("smoothing", job_params.get("smoothing", "yes")))
 
-                    print(f"[*] Node '{self._node_name}' claimed cluster task: Tile '{tile_id}' (Job #{job_id})")
-                    logger.info("Claimed cluster task: Tile '%s' (Job #%d)", tile_id, job_id)
+                    print(f"[*] Node '{self._node_name}' claimed cluster task [{job_type}]: Tile '{tile_id}' (Job #{job_id})")
+                    logger.info("Claimed cluster task [%s]: Tile '%s' (Job #%d)", job_type, tile_id, job_id)
                     self.task_started.emit(tile_id, job_id)
-                    self.worker_status_changed.emit(f"Processing tile {tile_id}…")
+                    self.worker_status_changed.emit(f"Processing [{job_type}] {tile_id}…")
 
                     # Mark node as busy
                     self._lic.send_node_heartbeat(status="busy", node_name=self._node_name)
@@ -300,11 +582,16 @@ class CompanyNodeWorker(QThread):
                     pt_count = 500000
 
                     if las_file and las_file.is_file():
-                        print(f"[*] Found tile on shared storage: {las_file}. Running local GPU inference...")
-                        logger.info("Processing shared storage tile %s on GPU...", las_file)
-                        ok, pt_count = self._run_pointcept_inference(las_file, voxel_size=voxel_sz, smoothing=smoothing)
+                        print(f"[*] Found tile on shared storage: {las_file}. Running {job_type}...")
+                        logger.info("Processing shared storage tile %s (%s)...", las_file, job_type)
+                        if job_type == "noise_filter":
+                            ok, pt_count = self._run_noise_filter(las_file, job_params)
+                        elif job_type == "ground_classification":
+                            ok, pt_count = self._run_ground_classification(tile_id, las_file, job_params)
+                        else:
+                            ok, pt_count = self._run_pointcept_inference(las_file, voxel_size=voxel_sz, smoothing=smoothing)
                         if not ok:
-                            print(f"[!] Warning: Pointcept inference encountered an issue on {las_file}.")
+                            print(f"[!] Warning: {job_type} encountered an issue on {las_file}.")
                     else:
                         print(f"[!] Tile '{tile_id}' not found on shared storage. (Simulating completion)")
                         logger.warning("Tile '%s' not found on shared storage (root: %s).", tile_id, self._get_active_storage_root())
