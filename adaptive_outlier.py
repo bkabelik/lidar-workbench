@@ -606,8 +606,9 @@ def classify_outliers_adaptive(
     _prog("Step 2/5: 3D voxel isolation pre-filter…", 28.0)
     nbr_counts = _voxel_3d_neighbor_counts(xs, ys, zs, params.voxel_size_m)
     isolated_mask = nbr_counts < max(1, int(params.min_voxel_neighbors))
-    # Only apply radiometric gate to sparse/isolated points (not dense dark asphalt/roofs)
-    isolated_mask |= (radiometric_suspect & (nbr_counts <= 2))
+    # Only flag radiometric suspects if truly isolated (1 point in 3x3x3 voxel)
+    # so sparse bathymetry / shadowed ground beside houses is never shredded.
+    isolated_mask |= (radiometric_suspect & (nbr_counts <= 1))
 
     z_med_global = float(np.median(zs))
     class_7 |= (isolated_mask & (zs < z_med_global))
@@ -701,8 +702,10 @@ def classify_outliers_adaptive(
         med_wd = float(np.median(weighted_d))
         upper_diff = weighted_d[weighted_d >= med_wd] - med_wd
         mad_wd = max(1e-4, 1.4826 * float(np.median(upper_diff)) if len(upper_diff) > 0 else 1e-4)
-        sor_thresh = max(med_wd + (params.sor_std_multiplier * 2.0) * mad_wd, 3.0 * med_wd)
-        sor_reject = weighted_d > sor_thresh
+        # Physical spacing floor protects sparse bathymetry & shadowed ground beside houses
+        min_sparse_floor = max(1.2, 6.0 * max(0.05, float(report.nps_m)))
+        sor_thresh = max(med_wd + (params.sor_std_multiplier * 2.0) * mad_wd, 3.0 * med_wd, min_sparse_floor)
+        sor_reject = (weighted_d > sor_thresh) & (mean_d_small > min_sparse_floor * 0.75)
 
         # 4b. Multi-scale PCA plane residual & linearity/normal consistency
         # Compute covariance for k_small and k_large on all survivors in vectorized batches
@@ -742,14 +745,15 @@ def classify_outliers_adaptive(
         angle_deg = np.degrees(np.arccos(dot))
         unstable_normal = angle_deg > params.max_normal_angle_deg
 
-        # Protect multi-return forest canopy, vertical walls/fences/nets, and linear features from normal SOR
+        # Protect multi-return forest canopy, vertical walls/fences/nets, linear features,
+        # and wall-ground corners (which are dense, mean_d_small <= min_sparse_floor).
         surv_canopy = canopy_protected[surv_idx]
         is_vertical_or_linear = (is_planar & (np.abs(norm_l[:, 2]) < 0.55)) | is_linear
-        sparse_for_pca = weighted_d > (med_wd + 2.0 * mad_wd)
+        sparse_for_pca = (weighted_d > (med_wd + 2.5 * mad_wd)) & (mean_d_small > min_sparse_floor * 0.85)
         pca_reject = (~is_linear) & (~is_planar) & unstable_normal & (~surv_canopy) & sparse_for_pca & (res_s > params.max_plane_residual_m)
 
         # Extreme SOR catches truly isolated outliers even on canopy/vertical structures
-        extreme_sor = weighted_d > (sor_thresh * 1.65)
+        extreme_sor = (weighted_d > (sor_thresh * 1.65)) & (mean_d_small > min_sparse_floor)
         final_reject = (sor_reject & (~surv_canopy) & (~is_vertical_or_linear)) | extreme_sor | pca_reject
 
         rej_pts = surv_idx[final_reject]
