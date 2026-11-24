@@ -108,24 +108,49 @@ class _AdaptiveOutlierWorker(QThread):
                 if self._cancelled:
                     break
 
-                # Apply Class 7 & Class 18 in-place on disk while preserving all extra bytes
+                # Extract noise points (Class 7 & 18) to tiles/noise/<stem>_noise.las
+                # and keep clean points in the tile, matching FilterDialog behavior.
+                noise_mask = res.class_7_mask | res.class_18_mask
+                keep_mask = ~noise_mask
+                c7 = res.stats.get("n_class_7", 0)
+                c18 = res.stats.get("n_class_18", 0)
+
                 tile_info = self._db.get_tile(tid)
                 if tile_info and self._tm._pm.tiles_dir:
                     las_path = self._tm._pm.tiles_dir / tile_info["filename"]
                     if las_path.is_file():
                         las = laspy.read(str(las_path))
-                        las.classification = res.updated_classification
-                        las.write(str(las_path))
+                        if np.any(noise_mask):
+                            noise_dir = self._tm._pm.tiles_dir / "noise"
+                            noise_dir.mkdir(parents=True, exist_ok=True)
+                            noise_path = noise_dir / f"{las_path.stem}_noise.las"
+                            noise_las = laspy.LasData(las.header)
+                            noise_las.points = las.points[noise_mask]
+                            noise_las.classification = res.updated_classification[noise_mask]
+                            noise_las.write(str(noise_path))
 
-                # Update in-memory cache if loaded
+                            clean_las = laspy.LasData(las.header)
+                            clean_las.points = las.points[keep_mask]
+                            clean_las.write(str(las_path))
+
+                        from ..config import TileStatus
+                        self._tm.update_tile_status(tid, TileStatus.FILTERED)
+                        with self._db.connect() as conn:
+                            self._db.update_tile_point_count(conn, tid, int(keep_mask.sum()))
+                            self._db.record_processing_time(
+                                conn, tid, "filter",
+                                duration_seconds=float(res.stats.get("total_ms", 0.0)) / 1000.0,
+                                point_count=int(keep_mask.sum()),
+                                params={"mode": "adaptive_outlier", "preset": res.params.preset_name, "class_7": c7, "class_18": c18},
+                            )
+                            conn.commit()
+
+                # Evict stale cache for this tile
                 if hasattr(self._tm, "_point_cache") and tid in self._tm._point_cache:
-                    self._tm._point_cache[tid]["classification"] = res.updated_classification
+                    del self._tm._point_cache[tid]
 
-                # Record single reversible batch command to SQLite undo/redo history
+                # Record reversible batch command to SQLite undo/redo history
                 apply_outlier_classification_with_undo(self._db, tid, old_cls, res)
-
-                c7 = res.stats.get("n_class_7", 0)
-                c18 = res.stats.get("n_class_18", 0)
                 total_c7 += c7
                 total_c18 += c18
                 processed += 1

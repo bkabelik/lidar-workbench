@@ -261,7 +261,7 @@ class OutlierParams:
             min_reflectance_db=-22.0,
             max_pulse_deviation=25.0 if platform != "drone" else 30.0,
             protect_multi_return_canopy=True,
-            voxel_size_m=round(max(0.15, voxel_mult * nps), 3),
+            voxel_size_m=round(max(0.25, voxel_mult * nps), 3),
             min_voxel_neighbors=2,
             grid_cell_size_m=round(max(0.5, cell_mult * nps), 3),
             irls_iterations=3,
@@ -410,15 +410,21 @@ def _asymmetric_irls_lower_surface(
     uniq_cells = s_cells[starts]
 
     grid_flat = np.full(nx * ny, np.nan, dtype=np.float64)
-    # Vectorized P10: pick the k-th sorted element per cell
-    cell_p10 = np.empty(len(starts), dtype=np.float64)
+    # Vectorized P5/P15: initialize on P5 so buildings/trees never pull ground up
+    cell_p5 = np.empty(len(starts), dtype=np.float64)
+    cell_p15 = np.empty(len(starts), dtype=np.float64)
     for idx_c in range(len(starts)):
         a, b = starts[idx_c], ends[idx_c]
         seg = np.sort(s_z[a:b])
-        k = max(0, min(len(seg) - 1, int(0.10 * (len(seg) - 1))))
-        cell_p10[idx_c] = seg[k]
-    grid_flat[uniq_cells] = cell_p10
+        k5 = max(0, min(len(seg) - 1, int(0.05 * (len(seg) - 1))))
+        k15 = max(0, min(len(seg) - 1, int(0.15 * (len(seg) - 1))))
+        cell_p5[idx_c] = seg[k5]
+        cell_p15[idx_c] = seg[k15]
+    grid_flat[uniq_cells] = cell_p5
     grid = grid_flat.reshape(nx, ny)
+    grid_cap = np.full(nx * ny, np.inf, dtype=np.float64)
+    grid_cap[uniq_cells] = cell_p15
+    grid_cap = grid_cap.reshape(nx, ny)
 
     # Fill empty cells via iterative 3x3 neighbor mean
     global_p10 = float(np.percentile(zs, 10.0))
@@ -471,14 +477,13 @@ def _asymmetric_irls_lower_surface(
 
         # Asymmetric weights:
         #   - Points far below surface (res < -2.5*mad): Tukey 0 weight (pit clusters ignored)
-        #   - Points slightly below/on surface (-2.5*mad <= res <= 1.5*mad): Huber/high weight
-        #   - Points high above surface (res > 2.5*mad): 0 weight (canopy/buildings ignored)
+        #   - Points on/near ground (-2.5*mad <= res <= 1.0*mad): Huber weight
+        #   - Points above surface (res > 1.0*mad): 0 weight (buildings/canopy ignored)
         w = np.zeros(n, dtype=np.float64)
-        in_band = (res >= -2.5 * mad) & (res <= 2.5 * mad)
+        in_band = (res >= -2.5 * mad) & (res <= 1.0 * mad)
         if np.any(in_band):
             r_b = res[in_band]
             w_b = np.where(np.abs(r_b) <= mad, 1.0, mad / np.maximum(np.abs(r_b), 1e-6))
-            # Down-weight negative residuals slightly more than small positive residuals
             w_b = np.where(r_b < -mad, w_b * 0.35, w_b)
             w[in_band] = w_b
 
@@ -487,7 +492,7 @@ def _asymmetric_irls_lower_surface(
         upd = w_sum > 1e-6
         new_flat = grid.ravel().copy()
         new_flat[upd] = wz_sum[upd] / w_sum[upd]
-        grid = new_flat.reshape(nx, ny)
+        grid = np.minimum(new_flat.reshape(nx, ny), grid_cap)
         z_pred = _interp(grid)
 
     return z_pred, mad
@@ -560,8 +565,8 @@ def classify_outliers_adaptive(
     _prog("Step 2/5: 3D voxel isolation pre-filter…", 28.0)
     nbr_counts = _voxel_3d_neighbor_counts(xs, ys, zs, params.voxel_size_m)
     isolated_mask = nbr_counts < max(1, int(params.min_voxel_neighbors))
-    # Also flag points that failed the radiometric gate AND are sparse (<= 3 voxel neighbors)
-    isolated_mask |= (radiometric_suspect & (nbr_counts <= 3))
+    # Only apply radiometric gate to sparse/isolated points (not dense dark asphalt/roofs)
+    isolated_mask |= (radiometric_suspect & (nbr_counts <= 2))
 
     z_med_global = float(np.median(zs))
     class_7 |= (isolated_mask & (zs < z_med_global))
@@ -582,7 +587,8 @@ def classify_outliers_adaptive(
             iterations=params.irls_iterations,
         )
         res_alive = zs[alive_idx] - z_surf
-        low_thresh = -abs(params.z_lower_mad_multiplier) * mad_lower
+        # Safe minimum floor (-1.5 m) prevents ground/curbs/ditches from being flagged as Class 7
+        low_thresh = min(-1.5, -abs(params.z_lower_mad_multiplier) * mad_lower)
         low_hits = res_alive < low_thresh
         class_7[alive_idx[low_hits]] = True
 
@@ -654,7 +660,7 @@ def classify_outliers_adaptive(
         med_wd = float(np.median(weighted_d))
         upper_diff = weighted_d[weighted_d >= med_wd] - med_wd
         mad_wd = max(1e-4, 1.4826 * float(np.median(upper_diff)) if len(upper_diff) > 0 else 1e-4)
-        sor_thresh = max(med_wd + (params.sor_std_multiplier * 1.8) * mad_wd, 2.6 * med_wd)
+        sor_thresh = max(med_wd + (params.sor_std_multiplier * 2.0) * mad_wd, 3.0 * med_wd)
         sor_reject = weighted_d > sor_thresh
 
         # 4b. Multi-scale PCA plane residual & linearity/normal consistency
@@ -695,21 +701,23 @@ def classify_outliers_adaptive(
         angle_deg = np.degrees(np.arccos(dot))
         unstable_normal = angle_deg > params.max_normal_angle_deg
 
-        # Protect multi-return forest canopy from PCA rejection (canopy is volumetric, not planar)
+        # Protect multi-return forest canopy and dense building corners from PCA rejection
         surv_canopy = canopy_protected[surv_idx]
-        pca_reject = (~is_linear) & (~is_planar) & unstable_normal & (~surv_canopy) & (res_s > params.max_plane_residual_m)
+        sparse_for_pca = weighted_d > (med_wd + 2.0 * mad_wd)
+        pca_reject = (~is_linear) & (~is_planar) & unstable_normal & (~surv_canopy) & sparse_for_pca & (res_s > params.max_plane_residual_m)
 
-        # Extreme SOR (> 1.8x threshold) can also catch isolated canopy outliers, normal SOR respects canopy
+        # Extreme SOR (> 1.35x threshold) can also catch isolated canopy outliers, normal SOR respects canopy
         extreme_sor = weighted_d > (sor_thresh * 1.35)
         final_reject = (sor_reject & (~surv_canopy)) | extreme_sor | pca_reject
 
         rej_pts = surv_idx[final_reject]
         if len(rej_pts) > 0:
-            # Assign Class 7 if below local median neighbor Z, else Class 18
+            # Only assign Class 7 if clearly below local neighbor median Z; otherwise Class 18
             local_med_z = np.median(zs[surv_idx[n_large[final_reject]]], axis=1)
-            below_local = zs[rej_pts] < local_med_z
+            below_local = zs[rej_pts] < (local_med_z - 0.5)
+            above_local = zs[rej_pts] > (local_med_z + 0.5)
             class_7[rej_pts[below_local]] = True
-            class_18[rej_pts[~below_local]] = True
+            class_18[rej_pts[above_local]] = True
 
     # ── Step 5: Conditional Bathymetry Sub-Pass ────────────────────────
     run_bathy = (params.bathy_mode == "on") or (params.bathy_mode == "auto" and report.has_bathymetry)

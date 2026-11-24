@@ -322,9 +322,21 @@ class CompanyNodeWorker(QThread):
                 shutil.copy2(str(las_path), str(backup))
             except OSError:
                 pass
-            las.classification = res.updated_classification
-            las.write(str(las_path))
-            return True, int(n_pts)
+            noise_mask = res.class_7_mask | res.class_18_mask
+            keep_mask = ~noise_mask
+            if np.any(noise_mask):
+                noise_dir = las_path.parent / "noise"
+                noise_dir.mkdir(parents=True, exist_ok=True)
+                noise_path = noise_dir / f"{las_path.stem}_noise.las"
+                noise_las = laspy.LasData(las.header)
+                noise_las.points = las.points[noise_mask]
+                noise_las.classification = res.updated_classification[noise_mask]
+                noise_las.write(str(noise_path))
+
+                clean_las = laspy.LasData(las.header)
+                clean_las.points = las.points[keep_mask]
+                clean_las.write(str(las_path))
+            return True, int(keep_mask.sum())
         except Exception as e:
             logger.error("Adaptive outlier failed on %s: %s", las_path.name, e)
             return False, 0
@@ -445,9 +457,21 @@ class CompanyNodeWorker(QThread):
                 shutil.copy2(str(las_path), str(backup))
             except OSError:
                 pass
-            las.classification = res.updated_classification
-            las.write(str(las_path))
-            return True, int(n_pts)
+            noise_mask = res.class_7_mask | res.class_18_mask
+            keep_mask = ~noise_mask
+            if np.any(noise_mask):
+                noise_dir = las_path.parent / "noise"
+                noise_dir.mkdir(parents=True, exist_ok=True)
+                noise_path = noise_dir / f"{las_path.stem}_noise.las"
+                noise_las = laspy.LasData(las.header)
+                noise_las.points = las.points[noise_mask]
+                noise_las.classification = res.updated_classification[noise_mask]
+                noise_las.write(str(noise_path))
+
+                clean_las = laspy.LasData(las.header)
+                clean_las.points = las.points[keep_mask]
+                clean_las.write(str(las_path))
+            return True, int(keep_mask.sum())
         except Exception as e:
             logger.error("Adaptive outlier failed on %s: %s", las_path.name, e)
             return False, 0
@@ -601,9 +625,21 @@ class CompanyNodeWorker(QThread):
                 shutil.copy2(str(las_path), str(backup))
             except OSError:
                 pass
-            las.classification = res.updated_classification
-            las.write(str(las_path))
-            return True, int(n_pts)
+            noise_mask = res.class_7_mask | res.class_18_mask
+            keep_mask = ~noise_mask
+            if np.any(noise_mask):
+                noise_dir = las_path.parent / "noise"
+                noise_dir.mkdir(parents=True, exist_ok=True)
+                noise_path = noise_dir / f"{las_path.stem}_noise.las"
+                noise_las = laspy.LasData(las.header)
+                noise_las.points = las.points[noise_mask]
+                noise_las.classification = res.updated_classification[noise_mask]
+                noise_las.write(str(noise_path))
+
+                clean_las = laspy.LasData(las.header)
+                clean_las.points = las.points[keep_mask]
+                clean_las.write(str(las_path))
+            return True, int(keep_mask.sum())
         except Exception as e:
             logger.error("Adaptive outlier failed on %s: %s", las_path.name, e)
             return False, 0
@@ -735,9 +771,21 @@ class CompanyNodeWorker(QThread):
                 shutil.copy2(str(las_path), str(backup))
             except OSError:
                 pass
-            las.classification = res.updated_classification
-            las.write(str(las_path))
-            return True, int(n_pts)
+            noise_mask = res.class_7_mask | res.class_18_mask
+            keep_mask = ~noise_mask
+            if np.any(noise_mask):
+                noise_dir = las_path.parent / "noise"
+                noise_dir.mkdir(parents=True, exist_ok=True)
+                noise_path = noise_dir / f"{las_path.stem}_noise.las"
+                noise_las = laspy.LasData(las.header)
+                noise_las.points = las.points[noise_mask]
+                noise_las.classification = res.updated_classification[noise_mask]
+                noise_las.write(str(noise_path))
+
+                clean_las = laspy.LasData(las.header)
+                clean_las.points = las.points[keep_mask]
+                clean_las.write(str(las_path))
+            return True, int(keep_mask.sum())
         except Exception as e:
             logger.error("Adaptive outlier failed on %s: %s", las_path.name, e)
             return False, 0

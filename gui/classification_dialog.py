@@ -167,9 +167,13 @@ class ClusterExecutionWidget(QGroupBox):
         self._node_rows.clear()
         if not self._lic.is_logged_in:
             self._table.insertRow(0)
-            self._table.setItem(0, 1, QTableWidgetItem("Not logged in"))
+            self._table.setItem(0, 1, QTableWidgetItem("Not logged in — sign in under Help → License & Plan"))
             return
-        nodes = self._lic.get_company_nodes()
+        try:
+            self._lic.send_node_heartbeat()
+        except Exception:
+            pass
+        nodes = self._lic.fetch_company_nodes()
         if not nodes:
             self._table.insertRow(0)
             self._table.setItem(0, 1, QTableWidgetItem("No online nodes found"))
