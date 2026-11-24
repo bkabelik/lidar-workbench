@@ -261,7 +261,7 @@ class OutlierParams:
             min_reflectance_db=-22.0,
             max_pulse_deviation=25.0 if platform != "drone" else 30.0,
             protect_multi_return_canopy=True,
-            voxel_size_m=round(max(0.25, voxel_mult * nps), 3),
+            voxel_size_m=round(max(0.90, 10.0 * nps), 3),
             min_voxel_neighbors=2,
             grid_cell_size_m=round(max(0.5, cell_mult * nps), 3),
             irls_iterations=3,
@@ -442,8 +442,11 @@ def _asymmetric_irls_lower_surface(
     for dx in (-1, 0, 1):
         for dy in (-1, 0, 1):
             c_stack.append(c_pad[1 + dx : 1 + dx + cnx, 1 + dy : 1 + dy + cny])
-    c_med = np.nanmedian(np.stack(c_stack, axis=0), axis=0)
-    c_med[np.isnan(c_med)] = global_p10
+    c_stack_arr = np.stack(c_stack, axis=0)
+    all_nan = np.all(np.isnan(c_stack_arr), axis=0)
+    c_med = np.full((cnx, cny), global_p10, dtype=np.float64)
+    if np.any(~all_nan):
+        c_med[~all_nan] = np.nanmedian(c_stack_arr[:, ~all_nan], axis=0)
 
     # Project coarse envelope onto fine grid centers to reject subterranean pit seeds
     fine_cx = np.clip((((np.arange(nx) + 0.5) * cs) / coarse_cs).astype(np.int64), 0, cnx - 1)
@@ -459,9 +462,9 @@ def _asymmetric_irls_lower_surface(
         seg = np.sort(s_z[a:b])
         k5 = max(0, min(len(seg) - 1, int(0.05 * (len(seg) - 1))))
         k15 = max(0, min(len(seg) - 1, int(0.15 * (len(seg) - 1))))
-        c_floor = coarse_on_fine[uniq_cells[idx_c]] - 3.0
+        c_floor = coarse_on_fine[uniq_cells[idx_c]] - 8.0
         cell_p5[idx_c] = max(seg[k5], c_floor)
-        cell_p15[idx_c] = max(seg[k15], c_floor + 0.5)
+        cell_p15[idx_c] = max(seg[k15], c_floor + 1.0)
     grid_flat[uniq_cells] = cell_p5
     grid = grid_flat.reshape(nx, ny)
     grid_cap = np.full(nx * ny, np.inf, dtype=np.float64)
@@ -629,9 +632,14 @@ def classify_outliers_adaptive(
             iterations=params.irls_iterations,
         )
         res_alive = zs[alive_idx] - z_surf
-        # Safe minimum floor (-1.5 m) prevents ground/curbs/ditches from being flagged as Class 7
+        # Safe minimum floor (-1.5 m) prevents ground/curbs/ditches from being flagged as Class 7.
+        # Points in the moderate band [-6.0m, low_thresh) are only flagged if locally sparse
+        # (protects steep slopes, road cuts, and embankments with dense ground neighbors).
         low_thresh = min(-1.5, -abs(params.z_lower_mad_multiplier) * mad_lower)
-        low_hits = res_alive < low_thresh
+        hard_low_thresh = min(-6.0, low_thresh * 2.5)
+        low_hits = (res_alive < hard_low_thresh) | (
+            (res_alive < low_thresh) & (nbr_counts[alive_idx] <= 4)
+        )
         class_7[alive_idx[low_hits]] = True
 
         # Upper envelope (Class 18) — per-strip first when enabled
