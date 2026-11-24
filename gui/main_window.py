@@ -151,6 +151,10 @@ class MainWindow(QMainWindow):
         self._node_worker.task_finished.connect(self._on_worker_task_finished)
         self._node_worker.start()
 
+        # Silent background update check on frozen Windows builds
+        if getattr(sys, "frozen", False):
+            QTimer.singleShot(4000, lambda: self._on_check_updates(manual=False))
+
         # Background Project Cloud Sync timer (every 45s)
         self._project_sync_timer = QTimer(self)
         self._project_sync_timer.timeout.connect(lambda: self._sync_project_cloud(silent=True))
@@ -411,6 +415,10 @@ class MainWindow(QMainWindow):
         license_action = QAction("&License & Plan…", self)
         license_action.triggered.connect(self._on_license)
         help_menu.addAction(license_action)
+
+        update_action = QAction("Check for &Updates…", self)
+        update_action.triggered.connect(lambda: self._on_check_updates(manual=True))
+        help_menu.addAction(update_action)
 
         about_action = QAction("&About", self)
         about_action.triggered.connect(self._on_about)
@@ -2517,6 +2525,87 @@ class MainWindow(QMainWindow):
 
     def _on_documentation(self) -> None:
         self._show_help_dialog()
+
+    def _on_check_updates(self, manual: bool = False) -> None:
+        """Check lidar.kabelik.at for a newer Windows installer by Last-Modified date."""
+        from ..updater import UpdateCheckWorker
+        self._update_manual = manual
+        if manual:
+            self.set_status("Checking for updates…", timeout=4000)
+        self._upd_chk_worker = UpdateCheckWorker(parent=self)
+        self._upd_chk_worker.finished_check.connect(self._on_update_check_done)
+        self._upd_chk_worker.start()
+
+    def _on_update_check_done(self, res: dict) -> None:
+        manual = getattr(self, "_update_manual", False)
+        if res.get("error"):
+            if manual:
+                QMessageBox.warning(self, "Update Check Failed", f"Could not check for updates:\n{res['error']}")
+            return
+        if not res.get("available"):
+            if manual:
+                QMessageBox.information(
+                    self,
+                    "Up to Date",
+                    f"You already have the latest version.\n\n"
+                    f"Installed date: {res.get('local_date', 'Unknown')}\n"
+                    f"Server date:    {res.get('remote_date', 'Unknown')}",
+                )
+            return
+
+        size_mb = res.get("size_mb", 0.0)
+        size_str = f"{size_mb / 1024.0:.2f} GB" if size_mb >= 1024 else f"{size_mb:.1f} MB"
+        ans = QMessageBox.question(
+            self,
+            "Update Available",
+            f"A newer version of {APP_NAME} is available!\n\n"
+            f"Your version:  {res.get('local_date')}\n"
+            f"Server build:  {res.get('remote_date')}\n"
+            f"Download size: {size_str}\n\n"
+            f"Download and install now?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if ans == QMessageBox.Yes:
+            self._download_and_install_update(res.get("url"), float(res.get("remote_ts") or 0.0))
+
+    def _download_and_install_update(self, url: str, remote_ts: float) -> None:
+        from PySide6.QtWidgets import QApplication, QProgressDialog
+        from ..updater import UpdateDownloadWorker, launch_installer_and_exit
+
+        prog = QProgressDialog("Downloading LiDAR Workbench update…", "Cancel", 0, 100, self)
+        prog.setWindowTitle("Downloading Update")
+        prog.setWindowModality(Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+
+        dl = UpdateDownloadWorker(url=url, parent=self)
+        self._upd_dl_worker = dl
+        prog.canceled.connect(dl.cancel)
+
+        def _on_prog(rec: int, tot: int, mbps: float) -> None:
+            rec_mb = rec / (1024 * 1024)
+            if tot > 0:
+                tot_mb = tot / (1024 * 1024)
+                prog.setValue(int(rec * 100 / tot))
+                prog.setLabelText(f"Downloading update: {rec_mb:.1f} / {tot_mb:.1f} MB ({mbps:.1f} Mbps)")
+            else:
+                prog.setLabelText(f"Downloading update: {rec_mb:.1f} MB ({mbps:.1f} Mbps)")
+
+        def _on_done(path_str: str) -> None:
+            prog.setValue(100)
+            prog.close()
+            launch_installer_and_exit(path_str, remote_ts=remote_ts)
+            QApplication.quit()
+
+        def _on_err(msg: str) -> None:
+            prog.close()
+            QMessageBox.critical(self, "Download Failed", f"Could not download update:\n{msg}")
+
+        dl.progress.connect(_on_prog)
+        dl.completed.connect(_on_done)
+        dl.error.connect(_on_err)
+        dl.start()
 
     def _show_help_dialog(self) -> None:
         dlg = QDialog(self)

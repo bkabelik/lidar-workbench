@@ -34,6 +34,8 @@ root_modules = [
     "licensing",
     "node_worker",
     "qgis_parser",
+    "adaptive_outlier",
+    "updater",
 ]
 
 hidden_imports = [
