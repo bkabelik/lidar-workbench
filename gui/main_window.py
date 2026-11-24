@@ -2584,11 +2584,11 @@ class MainWindow(QMainWindow):
         self._upd_dl_worker = dl
         prog.canceled.connect(dl.cancel)
 
-        def _on_prog(rec: int, tot: int, mbps: float) -> None:
-            rec_mb = rec / (1024 * 1024)
+        def _on_prog(rec: float, tot: float, mbps: float) -> None:
+            rec_mb = rec / (1024.0 * 1024.0)
             if tot > 0:
-                tot_mb = tot / (1024 * 1024)
-                prog.setValue(int(rec * 100 / tot))
+                tot_mb = tot / (1024.0 * 1024.0)
+                prog.setValue(min(100, int(rec * 100.0 / tot)))
                 prog.setLabelText(f"Downloading update: {rec_mb:.1f} / {tot_mb:.1f} MB ({mbps:.1f} Mbps)")
             else:
                 prog.setLabelText(f"Downloading update: {rec_mb:.1f} MB ({mbps:.1f} Mbps)")

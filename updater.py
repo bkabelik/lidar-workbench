@@ -130,10 +130,11 @@ class UpdateCheckWorker(QThread):
 
 
 class UpdateDownloadWorker(QThread):
-    """Streams the Windows installer .exe in chunks with progress & cancel support."""
+    """Downloads the Windows installer .exe using parallel HTTP Range streams (4x) for full speed."""
 
-    progress = Signal(int, int, float)  # received_bytes, total_bytes, mbps
-    completed = Signal(str)             # path to downloaded installer
+    # Use float (64-bit) instead of int (32-bit in Qt) to prevent >2.14 GB overflow
+    progress = Signal(float, float, float)  # received_bytes, total_bytes, mbps
+    completed = Signal(str)                 # path to downloaded installer
     error = Signal(str)
 
     def __init__(self, url: str = UPDATE_EXE_URL, parent=None):
@@ -145,30 +146,78 @@ class UpdateDownloadWorker(QThread):
         self._cancelled = True
 
     def run(self) -> None:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        import requests
+
         dest = Path(tempfile.gettempdir()) / "LiDAR_Workbench_Setup_Update.exe"
         try:
-            req = urllib.request.Request(
-                self._url,
-                headers={"User-Agent": "LiDAR-Workbench-Updater/1.0"},
-            )
+            headers = {"User-Agent": "LiDAR-Workbench-Updater/1.0", "Accept-Encoding": "identity"}
+            head = requests.head(self._url, headers=headers, timeout=15, allow_redirects=True)
+            head.raise_for_status()
+            total = int(head.headers.get("Content-Length") or 0)
+            accept_ranges = (head.headers.get("Accept-Ranges") or "").lower() == "bytes"
+
             t0 = time.perf_counter()
-            received = 0
-            chunk_size = 2 * 1024 * 1024  # 2 MB
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                cl = resp.headers.get("Content-Length")
-                total = int(cl) if cl and cl.isdigit() else 0
+            last_emit = [0.0]
+            received_lock = threading.Lock()
+            received_total = [0]
+
+            def _add_progress(n_bytes: int) -> None:
+                with received_lock:
+                    received_total[0] += n_bytes
+                    now = time.perf_counter()
+                    if (now - last_emit[0]) >= 0.15 or (total > 0 and received_total[0] >= total):
+                        last_emit[0] = now
+                        elapsed = max(0.1, now - t0)
+                        mbps = (received_total[0] * 8.0) / elapsed / 1_000_000.0
+                        self.progress.emit(float(received_total[0]), float(total), mbps)
+
+            if accept_ranges and total > 32 * 1024 * 1024:
+                # Pre-allocate file and download 4 parallel byte ranges
                 with open(dest, "wb") as f:
-                    while True:
-                        if self._cancelled:
-                            break
-                        chunk = resp.read(chunk_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        received += len(chunk)
-                        elapsed = max(0.1, time.perf_counter() - t0)
-                        mbps = (received * 8.0) / elapsed / 1_000_000.0
-                        self.progress.emit(received, total, mbps)
+                    f.seek(total - 1)
+                    f.write(b"\0")
+
+                n_workers = 4
+                part_size = (total + n_workers - 1) // n_workers
+                ranges = [
+                    (i * part_size, min(total - 1, (i + 1) * part_size - 1))
+                    for i in range(n_workers)
+                    if i * part_size < total
+                ]
+
+                def _fetch_range(r_start: int, r_end: int) -> None:
+                    sess = requests.Session()
+                    r_hdrs = {**headers, "Range": f"bytes={r_start}-{r_end}"}
+                    with sess.get(self._url, headers=r_hdrs, stream=True, timeout=60) as resp:
+                        resp.raise_for_status()
+                        offset = r_start
+                        with open(dest, "r+b") as fh:
+                            for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                                if self._cancelled:
+                                    return
+                                if not chunk:
+                                    continue
+                                fh.seek(offset)
+                                fh.write(chunk)
+                                offset += len(chunk)
+                                _add_progress(len(chunk))
+
+                with ThreadPoolExecutor(max_workers=len(ranges)) as pool:
+                    futs = [pool.submit(_fetch_range, s, e) for s, e in ranges]
+                    for fut in futs:
+                        fut.result()
+            else:
+                with requests.get(self._url, headers=headers, stream=True, timeout=60) as resp:
+                    resp.raise_for_status()
+                    with open(dest, "wb") as f:
+                        for chunk in resp.iter_content(chunk_size=2 * 1024 * 1024):
+                            if self._cancelled:
+                                break
+                            if chunk:
+                                f.write(chunk)
+                                _add_progress(len(chunk))
 
             if self._cancelled:
                 try:
