@@ -123,7 +123,8 @@ class _AdaptiveOutlierWorker(QThread):
                         if np.any(noise_mask):
                             noise_dir = self._tm._pm.tiles_dir / "noise"
                             noise_dir.mkdir(parents=True, exist_ok=True)
-                            noise_path = noise_dir / f"{las_path.stem}_noise.las"
+                            noise_name = f"{las_path.stem}_noise.las"
+                            noise_path = noise_dir / noise_name
                             noise_las = laspy.LasData(las.header)
                             noise_las.points = las.points[noise_mask]
                             noise_las.classification = res.updated_classification[noise_mask]
@@ -132,6 +133,33 @@ class _AdaptiveOutlierWorker(QThread):
                             clean_las = laspy.LasData(las.header)
                             clean_las.points = las.points[keep_mask]
                             clean_las.write(str(las_path))
+
+                            # Register noise tile in SQLite so it appears in the Tile List
+                            import json as _json
+                            from ..config import TileStatus as _TS
+                            noise_tile_id = f"{tid}_noise"
+                            nx_arr = np.asarray(noise_las.x)
+                            ny_arr = np.asarray(noise_las.y)
+                            with self._db.connect() as nconn:
+                                self._db.insert_tile(
+                                    nconn,
+                                    tile_id=noise_tile_id,
+                                    filename=f"noise/{noise_name}",
+                                    bbox=(float(nx_arr.min()), float(ny_arr.min()), float(nx_arr.max()), float(ny_arr.max())),
+                                    point_count=int(noise_mask.sum()),
+                                    flight_line=tile_info.get("flight_line", 0),
+                                    scanner=tile_info.get("scanner", ""),
+                                    all_scanners=_json.loads(tile_info.get("all_scanners", "[]"))
+                                        if isinstance(tile_info.get("all_scanners"), str) else tile_info.get("all_scanners", []),
+                                    sensor_type=tile_info.get("sensor_type", ""),
+                                    flightline_sensor_types=_json.loads(tile_info.get("flightline_sensor_types", "{}"))
+                                        if isinstance(tile_info.get("flightline_sensor_types"), str) else tile_info.get("flightline_sensor_types", {}),
+                                    crs_epsg=tile_info.get("crs_epsg"),
+                                    crs_wkt=tile_info.get("crs_wkt"),
+                                    status=_TS.NOISE,
+                                    filter_params={"source_tile": tid, "filter": "adaptive_outlier", "preset": res.params.preset_name},
+                                )
+                                nconn.commit()
 
                         from ..config import TileStatus
                         self._tm.update_tile_status(tid, TileStatus.FILTERED)

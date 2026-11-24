@@ -409,8 +409,49 @@ def _asymmetric_irls_lower_surface(
     ends = np.append(starts[1:], len(s_cells))
     uniq_cells = s_cells[starts]
 
+    # Coarse-to-fine level 1: coarse grid (~20m+) + 3x3 spatial median filter
+    # prevents dense subterranean pit clusters (>10m below surface) from pulling
+    # the fine lower envelope down into the pit.
+    coarse_cs = max(20.0, cs * 8.0)
+    cnx = max(2, int(math.ceil((float(xs.max()) - x0) / coarse_cs)) + 2)
+    cny = max(2, int(math.ceil((float(ys.max()) - y0) / coarse_cs)) + 2)
+    cix = np.clip(((xs - x0) / coarse_cs).astype(np.int64), 0, cnx - 1)
+    ciy = np.clip(((ys - y0) / coarse_cs).astype(np.int64), 0, cny - 1)
+    c_cell = cix * cny + ciy
+    c_ord = np.argsort(c_cell, kind="mergesort")
+    sc_cells = c_cell[c_ord]
+    sc_z = zs[c_ord]
+    cu_mask = np.empty(len(sc_cells), dtype=bool)
+    cu_mask[0] = True
+    cu_mask[1:] = sc_cells[1:] != sc_cells[:-1]
+    c_starts = np.flatnonzero(cu_mask)
+    c_ends = np.append(c_starts[1:], len(sc_cells))
+    c_uniq = sc_cells[c_starts]
+    c_p10 = np.empty(len(c_starts), dtype=np.float64)
+    for ic in range(len(c_starts)):
+        seg = np.sort(sc_z[c_starts[ic] : c_ends[ic]])
+        k10 = max(0, min(len(seg) - 1, int(0.10 * (len(seg) - 1))))
+        c_p10[ic] = seg[k10]
+    c_grid = np.full(cnx * cny, np.nan, dtype=np.float64)
+    c_grid[c_uniq] = c_p10
+    c_grid = c_grid.reshape(cnx, cny)
+    global_p10 = float(np.percentile(zs, 10.0))
+    # Fill & 3x3 spatial median across coarse cells
+    c_pad = np.pad(c_grid, 1, mode="edge")
+    c_stack = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            c_stack.append(c_pad[1 + dx : 1 + dx + cnx, 1 + dy : 1 + dy + cny])
+    c_med = np.nanmedian(np.stack(c_stack, axis=0), axis=0)
+    c_med[np.isnan(c_med)] = global_p10
+
+    # Project coarse envelope onto fine grid centers to reject subterranean pit seeds
+    fine_cx = np.clip((((np.arange(nx) + 0.5) * cs) / coarse_cs).astype(np.int64), 0, cnx - 1)
+    fine_cy = np.clip((((np.arange(ny) + 0.5) * cs) / coarse_cs).astype(np.int64), 0, cny - 1)
+    coarse_on_fine = c_med[np.ix_(fine_cx, fine_cy)].ravel()
+
     grid_flat = np.full(nx * ny, np.nan, dtype=np.float64)
-    # Vectorized P5/P15: initialize on P5 so buildings/trees never pull ground up
+    # Vectorized P5/P15: initialize on P5, but reject seeds > 3.0m below coarse envelope
     cell_p5 = np.empty(len(starts), dtype=np.float64)
     cell_p15 = np.empty(len(starts), dtype=np.float64)
     for idx_c in range(len(starts)):
@@ -418,8 +459,9 @@ def _asymmetric_irls_lower_surface(
         seg = np.sort(s_z[a:b])
         k5 = max(0, min(len(seg) - 1, int(0.05 * (len(seg) - 1))))
         k15 = max(0, min(len(seg) - 1, int(0.15 * (len(seg) - 1))))
-        cell_p5[idx_c] = seg[k5]
-        cell_p15[idx_c] = seg[k15]
+        c_floor = coarse_on_fine[uniq_cells[idx_c]] - 3.0
+        cell_p5[idx_c] = max(seg[k5], c_floor)
+        cell_p15[idx_c] = max(seg[k15], c_floor + 0.5)
     grid_flat[uniq_cells] = cell_p5
     grid = grid_flat.reshape(nx, ny)
     grid_cap = np.full(nx * ny, np.inf, dtype=np.float64)
@@ -427,7 +469,6 @@ def _asymmetric_irls_lower_surface(
     grid_cap = grid_cap.reshape(nx, ny)
 
     # Fill empty cells via iterative 3x3 neighbor mean
-    global_p10 = float(np.percentile(zs, 10.0))
     for _ in range(4):
         nan_mask = np.isnan(grid)
         if not np.any(nan_mask):
