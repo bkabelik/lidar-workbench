@@ -278,6 +278,56 @@ class CompanyNodeWorker(QThread):
         except Exception as e:
             logger.error("Ground classification failed on %s: %s", las_path.name, e)
             return False, 0
+
+    def _run_adaptive_outlier(
+        self,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run automatic adaptive outlier classification (Class 7 & 18) on a tile in-place."""
+        try:
+            import laspy
+            import numpy as np
+            try:
+                from .adaptive_outlier import OutlierParams, classify_outliers_adaptive, evaluate_point_cloud
+            except (ImportError, ValueError):
+                from adaptive_outlier import OutlierParams, classify_outliers_adaptive, evaluate_point_cloud
+
+            las = laspy.read(str(las_path))
+            n_pts = len(las.x)
+            if n_pts == 0:
+                return True, 0
+            extra_dims = {}
+            for ed in las.point_format.extra_dimensions:
+                if hasattr(las, ed.name):
+                    extra_dims[ed.name] = np.asarray(getattr(las, ed.name))
+            data = {
+                "x": np.asarray(las.x, dtype=np.float64),
+                "y": np.asarray(las.y, dtype=np.float64),
+                "z": np.asarray(las.z, dtype=np.float64),
+                "classification": np.asarray(las.classification, dtype=np.uint8),
+                "intensity": np.asarray(las.intensity, dtype=np.uint16) if hasattr(las, "intensity") else np.zeros(n_pts, dtype=np.uint16),
+                "return_number": np.asarray(las.return_number, dtype=np.uint8) if hasattr(las, "return_number") else np.ones(n_pts, dtype=np.uint8),
+                "num_returns": np.asarray(las.number_of_returns, dtype=np.uint8) if hasattr(las, "number_of_returns") else np.ones(n_pts, dtype=np.uint8),
+                "point_source_id": np.asarray(las.point_source_id, dtype=np.uint16) if hasattr(las, "point_source_id") else np.zeros(n_pts, dtype=np.uint16),
+                "scan_angle": np.asarray(las.scan_angle, dtype=np.float64) if hasattr(las, "scan_angle") else np.asarray(las.scan_angle_rank, dtype=np.float64),
+                "extra_dims": extra_dims,
+            }
+            rep = evaluate_point_cloud(data)
+            op_dict = job_params.get("outlier_params") or {}
+            params = OutlierParams.custom(rep, **op_dict) if op_dict else OutlierParams.auto(rep)
+            res = classify_outliers_adaptive(data, params=params, report=rep)
+            backup = las_path.with_suffix(las_path.suffix + ".bak")
+            try:
+                shutil.copy2(str(las_path), str(backup))
+            except OSError:
+                pass
+            las.classification = res.updated_classification
+            las.write(str(las_path))
+            return True, int(n_pts)
+        except Exception as e:
+            logger.error("Adaptive outlier failed on %s: %s", las_path.name, e)
+            return False, 0
         if not model_path.is_file():
             logger.error("Model checkpoint not found at %s", model_path)
             return False, 0
@@ -350,6 +400,56 @@ class CompanyNodeWorker(QThread):
             return True, n_affected
         except Exception as e:
             logger.error("Ground classification failed on %s: %s", las_path.name, e)
+            return False, 0
+
+    def _run_adaptive_outlier(
+        self,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run automatic adaptive outlier classification (Class 7 & 18) on a tile in-place."""
+        try:
+            import laspy
+            import numpy as np
+            try:
+                from .adaptive_outlier import OutlierParams, classify_outliers_adaptive, evaluate_point_cloud
+            except (ImportError, ValueError):
+                from adaptive_outlier import OutlierParams, classify_outliers_adaptive, evaluate_point_cloud
+
+            las = laspy.read(str(las_path))
+            n_pts = len(las.x)
+            if n_pts == 0:
+                return True, 0
+            extra_dims = {}
+            for ed in las.point_format.extra_dimensions:
+                if hasattr(las, ed.name):
+                    extra_dims[ed.name] = np.asarray(getattr(las, ed.name))
+            data = {
+                "x": np.asarray(las.x, dtype=np.float64),
+                "y": np.asarray(las.y, dtype=np.float64),
+                "z": np.asarray(las.z, dtype=np.float64),
+                "classification": np.asarray(las.classification, dtype=np.uint8),
+                "intensity": np.asarray(las.intensity, dtype=np.uint16) if hasattr(las, "intensity") else np.zeros(n_pts, dtype=np.uint16),
+                "return_number": np.asarray(las.return_number, dtype=np.uint8) if hasattr(las, "return_number") else np.ones(n_pts, dtype=np.uint8),
+                "num_returns": np.asarray(las.number_of_returns, dtype=np.uint8) if hasattr(las, "number_of_returns") else np.ones(n_pts, dtype=np.uint8),
+                "point_source_id": np.asarray(las.point_source_id, dtype=np.uint16) if hasattr(las, "point_source_id") else np.zeros(n_pts, dtype=np.uint16),
+                "scan_angle": np.asarray(las.scan_angle, dtype=np.float64) if hasattr(las, "scan_angle") else np.asarray(las.scan_angle_rank, dtype=np.float64),
+                "extra_dims": extra_dims,
+            }
+            rep = evaluate_point_cloud(data)
+            op_dict = job_params.get("outlier_params") or {}
+            params = OutlierParams.custom(rep, **op_dict) if op_dict else OutlierParams.auto(rep)
+            res = classify_outliers_adaptive(data, params=params, report=rep)
+            backup = las_path.with_suffix(las_path.suffix + ".bak")
+            try:
+                shutil.copy2(str(las_path), str(backup))
+            except OSError:
+                pass
+            las.classification = res.updated_classification
+            las.write(str(las_path))
+            return True, int(n_pts)
+        except Exception as e:
+            logger.error("Adaptive outlier failed on %s: %s", las_path.name, e)
             return False, 0
 
         with tempfile.TemporaryDirectory(prefix="cluster_pt_") as work_dir:
@@ -458,6 +558,56 @@ class CompanyNodeWorker(QThread):
             logger.error("Ground classification failed on %s: %s", las_path.name, e)
             return False, 0
 
+    def _run_adaptive_outlier(
+        self,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run automatic adaptive outlier classification (Class 7 & 18) on a tile in-place."""
+        try:
+            import laspy
+            import numpy as np
+            try:
+                from .adaptive_outlier import OutlierParams, classify_outliers_adaptive, evaluate_point_cloud
+            except (ImportError, ValueError):
+                from adaptive_outlier import OutlierParams, classify_outliers_adaptive, evaluate_point_cloud
+
+            las = laspy.read(str(las_path))
+            n_pts = len(las.x)
+            if n_pts == 0:
+                return True, 0
+            extra_dims = {}
+            for ed in las.point_format.extra_dimensions:
+                if hasattr(las, ed.name):
+                    extra_dims[ed.name] = np.asarray(getattr(las, ed.name))
+            data = {
+                "x": np.asarray(las.x, dtype=np.float64),
+                "y": np.asarray(las.y, dtype=np.float64),
+                "z": np.asarray(las.z, dtype=np.float64),
+                "classification": np.asarray(las.classification, dtype=np.uint8),
+                "intensity": np.asarray(las.intensity, dtype=np.uint16) if hasattr(las, "intensity") else np.zeros(n_pts, dtype=np.uint16),
+                "return_number": np.asarray(las.return_number, dtype=np.uint8) if hasattr(las, "return_number") else np.ones(n_pts, dtype=np.uint8),
+                "num_returns": np.asarray(las.number_of_returns, dtype=np.uint8) if hasattr(las, "number_of_returns") else np.ones(n_pts, dtype=np.uint8),
+                "point_source_id": np.asarray(las.point_source_id, dtype=np.uint16) if hasattr(las, "point_source_id") else np.zeros(n_pts, dtype=np.uint16),
+                "scan_angle": np.asarray(las.scan_angle, dtype=np.float64) if hasattr(las, "scan_angle") else np.asarray(las.scan_angle_rank, dtype=np.float64),
+                "extra_dims": extra_dims,
+            }
+            rep = evaluate_point_cloud(data)
+            op_dict = job_params.get("outlier_params") or {}
+            params = OutlierParams.custom(rep, **op_dict) if op_dict else OutlierParams.auto(rep)
+            res = classify_outliers_adaptive(data, params=params, report=rep)
+            backup = las_path.with_suffix(las_path.suffix + ".bak")
+            try:
+                shutil.copy2(str(las_path), str(backup))
+            except OSError:
+                pass
+            las.classification = res.updated_classification
+            las.write(str(las_path))
+            return True, int(n_pts)
+        except Exception as e:
+            logger.error("Adaptive outlier failed on %s: %s", las_path.name, e)
+            return False, 0
+
             # prediction.py outputs to <folder>/predictions/<las_name>
             predicted_file = work_path / "predictions" / las_path.name
             if predicted_file.is_file():
@@ -542,6 +692,56 @@ class CompanyNodeWorker(QThread):
             logger.error("Ground classification failed on %s: %s", las_path.name, e)
             return False, 0
 
+    def _run_adaptive_outlier(
+        self,
+        las_path: Path,
+        job_params: dict,
+    ) -> Tuple[bool, int]:
+        """Run automatic adaptive outlier classification (Class 7 & 18) on a tile in-place."""
+        try:
+            import laspy
+            import numpy as np
+            try:
+                from .adaptive_outlier import OutlierParams, classify_outliers_adaptive, evaluate_point_cloud
+            except (ImportError, ValueError):
+                from adaptive_outlier import OutlierParams, classify_outliers_adaptive, evaluate_point_cloud
+
+            las = laspy.read(str(las_path))
+            n_pts = len(las.x)
+            if n_pts == 0:
+                return True, 0
+            extra_dims = {}
+            for ed in las.point_format.extra_dimensions:
+                if hasattr(las, ed.name):
+                    extra_dims[ed.name] = np.asarray(getattr(las, ed.name))
+            data = {
+                "x": np.asarray(las.x, dtype=np.float64),
+                "y": np.asarray(las.y, dtype=np.float64),
+                "z": np.asarray(las.z, dtype=np.float64),
+                "classification": np.asarray(las.classification, dtype=np.uint8),
+                "intensity": np.asarray(las.intensity, dtype=np.uint16) if hasattr(las, "intensity") else np.zeros(n_pts, dtype=np.uint16),
+                "return_number": np.asarray(las.return_number, dtype=np.uint8) if hasattr(las, "return_number") else np.ones(n_pts, dtype=np.uint8),
+                "num_returns": np.asarray(las.number_of_returns, dtype=np.uint8) if hasattr(las, "number_of_returns") else np.ones(n_pts, dtype=np.uint8),
+                "point_source_id": np.asarray(las.point_source_id, dtype=np.uint16) if hasattr(las, "point_source_id") else np.zeros(n_pts, dtype=np.uint16),
+                "scan_angle": np.asarray(las.scan_angle, dtype=np.float64) if hasattr(las, "scan_angle") else np.asarray(las.scan_angle_rank, dtype=np.float64),
+                "extra_dims": extra_dims,
+            }
+            rep = evaluate_point_cloud(data)
+            op_dict = job_params.get("outlier_params") or {}
+            params = OutlierParams.custom(rep, **op_dict) if op_dict else OutlierParams.auto(rep)
+            res = classify_outliers_adaptive(data, params=params, report=rep)
+            backup = las_path.with_suffix(las_path.suffix + ".bak")
+            try:
+                shutil.copy2(str(las_path), str(backup))
+            except OSError:
+                pass
+            las.classification = res.updated_classification
+            las.write(str(las_path))
+            return True, int(n_pts)
+        except Exception as e:
+            logger.error("Adaptive outlier failed on %s: %s", las_path.name, e)
+            return False, 0
+
     def run(self) -> None:
         self._stop_requested = False
         logger.info("Company Node Worker started for node '%s'", self._node_name)
@@ -588,6 +788,8 @@ class CompanyNodeWorker(QThread):
                             ok, pt_count = self._run_noise_filter(las_file, job_params)
                         elif job_type == "ground_classification":
                             ok, pt_count = self._run_ground_classification(tile_id, las_file, job_params)
+                        elif job_type == "adaptive_outlier":
+                            ok, pt_count = self._run_adaptive_outlier(las_file, job_params)
                         else:
                             ok, pt_count = self._run_pointcept_inference(las_file, voxel_size=voxel_sz, smoothing=smoothing)
                         if not ok:

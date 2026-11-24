@@ -737,6 +737,10 @@ class TileManager:
                 result["scan_direction_flag"] = _safe("scan_direction_flag", np.uint8, 0)
                 result["edge_of_flight_line"] = _safe("edge_of_flight_line", np.uint8, 0)
                 result["scan_angle_rank"] = _safe("scan_angle_rank", np.int8, 0)
+                if hasattr(las_data, "scan_angle"):
+                    result["scan_angle"] = np.array(las_data.scan_angle, dtype=np.float64)
+                else:
+                    result["scan_angle"] = result["scan_angle_rank"].astype(np.float64)
                 result["user_data"] = _safe("user_data", np.uint8, 0)
                 result["gps_time"] = _safe("gps_time", np.float64, 0.0)
                 result["red"] = _safe("red", np.uint16, 0)

@@ -302,6 +302,11 @@ class MainWindow(QMainWindow):
         filter_action.triggered.connect(self._on_filter)
         tools_menu.addAction(filter_action)
 
+        auto_outlier_action = QAction("&Auto Adaptive Outlier Filter…", self)
+        auto_outlier_action.setObjectName("auto_outlier")
+        auto_outlier_action.triggered.connect(self._on_auto_outlier)
+        tools_menu.addAction(auto_outlier_action)
+
         strip_adj_action = QAction("&Strip Adjustment…", self)
         strip_adj_action.setObjectName("strip_adj")
         strip_adj_action.triggered.connect(self._on_strip_adjustment)
@@ -431,6 +436,10 @@ class MainWindow(QMainWindow):
         filter_btn = toolbar.addAction("Filter")
         filter_btn.setToolTip("Apply noise filter to selected tiles")
         filter_btn.triggered.connect(self._on_filter)
+
+        auto_outlier_btn = toolbar.addAction("AutoFilter")
+        auto_outlier_btn.setToolTip("Automatic multi-platform adaptive outlier classification (Class 7 & 18)")
+        auto_outlier_btn.triggered.connect(self._on_auto_outlier)
 
         strip_adj_btn = toolbar.addAction("StripAdj")
         strip_adj_btn.setToolTip("LiDAR Strip Adjustment (align overlapping flightlines via XYZ, boresight, drift)")
@@ -801,6 +810,24 @@ class MainWindow(QMainWindow):
                     f"Imported {len(wizard.imported_tile_ids)} tile(s) from "
                     f"{Path(directory).name}", timeout=5000
                 )
+
+    def _on_auto_outlier(self) -> None:
+        """Open the Automatic Adaptive Outlier Classification dialog for selected tiles."""
+        selected = self._tile_list_widget.get_selected_tile_ids()
+        if not selected:
+            QMessageBox.information(
+                self, "No Tiles Selected",
+                "Select one or more tiles in the tile list first."
+            )
+            return
+        self._multi_view.clear()
+        from .adaptive_outlier_dialog import AdaptiveOutlierDialog
+        dialog = AdaptiveOutlierDialog(self._tm, self._db, selected, parent=self)
+        dialog.classification_applied.connect(self._refresh_tile_list)
+        try:
+            dialog.exec()
+        finally:
+            dialog.deleteLater()
 
     def _on_filter(self) -> None:
         """Open the noise filter dialog for selected tiles."""
