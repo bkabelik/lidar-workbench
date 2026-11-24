@@ -136,7 +136,7 @@ class _AdaptiveOutlierWorker(QThread):
                         from ..config import TileStatus
                         self._tm.update_tile_status(tid, TileStatus.FILTERED)
                         with self._db.connect() as conn:
-                            self._db.update_tile_point_count(conn, tid, int(keep_mask.sum()))
+                            self._db.update_point_count(conn, tid, int(keep_mask.sum()))
                             self._db.record_processing_time(
                                 conn, tid, "filter",
                                 duration_seconds=float(res.stats.get("total_ms", 0.0)) / 1000.0,
