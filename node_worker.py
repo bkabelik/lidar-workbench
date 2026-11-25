@@ -398,7 +398,57 @@ class CompanyNodeWorker(QThread):
             logger.error("Adaptive outlier failed on %s: %s", las_path.name, e)
             return False, 0
 
+    def _execute_task(self, task: dict) -> None:
+        """Execute a single claimed cluster task and report completion."""
+        job_id = task["job_id"]
+        tile_id = task["tile_id"]
+        job_type = task.get("job_type") or "pointcept_classification"
+        job_params = task.get("job_params") or {}
+        proj_name = task.get("project_name") or job_params.get("project_name")
+        proj_path = task.get("project_path") or job_params.get("project_path")
+        voxel_sz = float(task.get("voxel_size", job_params.get("voxel_size", 0.5)))
+        smoothing = str(task.get("smoothing", job_params.get("smoothing", "yes")))
+
+        print(f"[*] Node '{self._node_name}' claimed cluster task [{job_type}]: Tile '{tile_id}' (Job #{job_id})")
+        logger.info("Claimed cluster task [%s]: Tile '%s' (Job #%d)", job_type, tile_id, job_id)
+        self.task_started.emit(tile_id, job_id)
+        self.worker_status_changed.emit(f"Processing [{job_type}] {tile_id}…")
+
+        las_file = self._find_tile_file(tile_id, project_name=proj_name, project_path=proj_path)
+        pt_count = 500000
+
+        if las_file and las_file.is_file():
+            print(f"[*] Found tile on shared storage: {las_file}. Running {job_type}...")
+            logger.info("Processing shared storage tile %s (%s)...", las_file, job_type)
+            if job_type == "noise_filter":
+                ok, pt_count = self._run_noise_filter(las_file, job_params)
+            elif job_type == "ground_classification":
+                ok, pt_count = self._run_ground_classification(tile_id, las_file, job_params)
+            elif job_type == "adaptive_outlier":
+                ok, pt_count = self._run_adaptive_outlier(las_file, job_params)
+            else:
+                ok, pt_count = self._run_pointcept_inference(las_file, voxel_size=voxel_sz, smoothing=smoothing)
+            if not ok:
+                print(f"[!] Warning: {job_type} encountered an issue on {las_file}.")
+        else:
+            print(f"[!] Tile '{tile_id}' not found on shared storage. (Simulating completion)")
+            logger.warning("Tile '%s' not found on shared storage (root: %s).", tile_id, self._get_active_storage_root())
+            time.sleep(2.0)
+
+        self._lic.complete_node_tile(
+            job_id=job_id,
+            tile_id=tile_id,
+            node_name=self._node_name,
+            point_count=pt_count,
+        )
+        self._processed_count += 1
+        print(f"[+] Node '{self._node_name}' finished cluster task: Tile '{tile_id}' (Job #{job_id})")
+        logger.info("Finished cluster task: Tile '%s' (Job #%d)", tile_id, job_id)
+        self.task_finished.emit(tile_id, job_id)
+
     def run(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
         self._stop_requested = False
         logger.info("Company Node Worker started for node '%s'", self._node_name)
         if not self._is_paused and self._lic.is_logged_in:
@@ -407,78 +457,74 @@ class CompanyNodeWorker(QThread):
         else:
             self.worker_status_changed.emit("Paused" if self._is_paused else "Awaiting Login")
 
+        try:
+            gen = load_general_settings()
+            cpu_workers = max(1, int(max(gen.get("filter_workers", 4), gen.get("ground_workers", 4))))
+        except Exception:
+            cpu_workers = 4
+
         heartbeat_counter = 0
-        while not self._stop_requested:
-            if not self._lic.is_logged_in or self._is_paused:
-                time.sleep(self.poll_interval_sec * 2)
-                continue
+        active_cpu: set = set()
+        gpu_future = None
+        was_busy = False
 
-            try:
-                task = self._lic.claim_node_task(node_name=self._node_name)
-                if task.get("has_task"):
-                    job_id = task["job_id"]
-                    tile_id = task["tile_id"]
-                    job_type = task.get("job_type") or "pointcept_classification"
-                    job_params = task.get("job_params") or {}
-                    proj_name = task.get("project_name") or job_params.get("project_name")
-                    proj_path = task.get("project_path") or job_params.get("project_path")
-                    voxel_sz = float(task.get("voxel_size", job_params.get("voxel_size", 0.5)))
-                    smoothing = str(task.get("smoothing", job_params.get("smoothing", "yes")))
+        with ThreadPoolExecutor(max_workers=cpu_workers) as cpu_pool, ThreadPoolExecutor(max_workers=1) as gpu_pool:
+            while not self._stop_requested:
+                # Reap completed futures
+                done_cpu = {f for f in active_cpu if f.done()}
+                for f in done_cpu:
+                    active_cpu.discard(f)
+                    try:
+                        f.result()
+                    except Exception as exc:
+                        logger.error("CPU cluster task failed: %s", exc)
 
-                    print(f"[*] Node '{self._node_name}' claimed cluster task [{job_type}]: Tile '{tile_id}' (Job #{job_id})")
-                    logger.info("Claimed cluster task [%s]: Tile '%s' (Job #%d)", job_type, tile_id, job_id)
-                    self.task_started.emit(tile_id, job_id)
-                    self.worker_status_changed.emit(f"Processing [{job_type}] {tile_id}…")
+                if gpu_future is not None and gpu_future.done():
+                    try:
+                        gpu_future.result()
+                    except Exception as exc:
+                        logger.error("GPU cluster task failed: %s", exc)
+                    gpu_future = None
 
-                    # Mark node as busy
-                    self._lic.send_node_heartbeat(status="busy", node_name=self._node_name)
-
-                    # Locate tile on shared storage or local paths
-                    las_file = self._find_tile_file(tile_id, project_name=proj_name, project_path=proj_path)
-                    pt_count = 500000
-
-                    if las_file and las_file.is_file():
-                        print(f"[*] Found tile on shared storage: {las_file}. Running {job_type}...")
-                        logger.info("Processing shared storage tile %s (%s)...", las_file, job_type)
-                        if job_type == "noise_filter":
-                            ok, pt_count = self._run_noise_filter(las_file, job_params)
-                        elif job_type == "ground_classification":
-                            ok, pt_count = self._run_ground_classification(tile_id, las_file, job_params)
-                        elif job_type == "adaptive_outlier":
-                            ok, pt_count = self._run_adaptive_outlier(las_file, job_params)
-                        else:
-                            ok, pt_count = self._run_pointcept_inference(las_file, voxel_size=voxel_sz, smoothing=smoothing)
-                        if not ok:
-                            print(f"[!] Warning: {job_type} encountered an issue on {las_file}.")
-                    else:
-                        print(f"[!] Tile '{tile_id}' not found on shared storage. (Simulating completion)")
-                        logger.warning("Tile '%s' not found on shared storage (root: %s).", tile_id, self._get_active_storage_root())
-                        time.sleep(2.0)
-
-                    # Mark completed on cluster server
-                    self._lic.complete_node_tile(
-                        job_id=job_id,
-                        tile_id=tile_id,
-                        node_name=self._node_name,
-                        point_count=pt_count,
-                    )
-                    self._processed_count += 1
-                    print(f"[+] Node '{self._node_name}' finished cluster task: Tile '{tile_id}' (Job #{job_id})")
-                    logger.info("Finished cluster task: Tile '%s' (Job #%d)", tile_id, job_id)
-                    self.task_finished.emit(tile_id, job_id)
-
-                    # Reset to idle
+                is_busy = bool(active_cpu) or (gpu_future is not None)
+                if was_busy and not is_busy:
                     self._lic.send_node_heartbeat(status="idle", node_name=self._node_name)
                     self.worker_status_changed.emit("Idle — Listening for company tasks")
-                else:
-                    heartbeat_counter += 1
-                    if heartbeat_counter >= 5:  # Every ~15s
-                        self._lic.send_node_heartbeat(status="idle", node_name=self._node_name)
-                        heartbeat_counter = 0
-                    time.sleep(self.poll_interval_sec)
-            except Exception as e:
-                logger.debug("Cluster poll error: %s", e)
-                time.sleep(self.poll_interval_sec * 2)
+                was_busy = is_busy
+
+                if not self._lic.is_logged_in or self._is_paused:
+                    time.sleep(self.poll_interval_sec * 2)
+                    continue
+
+                try:
+                    # Claim up to cpu_workers CPU tasks in parallel; keep GPU (Pointcept) strictly 1 at a time
+                    claimed_any = False
+                    while not self._stop_requested and gpu_future is None and len(active_cpu) < cpu_workers:
+                        task = self._lic.claim_node_task(node_name=self._node_name)
+                        if not task.get("has_task"):
+                            break
+                        claimed_any = True
+                        if not was_busy:
+                            self._lic.send_node_heartbeat(status="busy", node_name=self._node_name)
+                            was_busy = True
+                        jtype = task.get("job_type") or "pointcept_classification"
+                        if jtype in ("noise_filter", "ground_classification", "adaptive_outlier"):
+                            active_cpu.add(cpu_pool.submit(self._execute_task, task))
+                        else:
+                            # Pointcept stays single-GPU sequential
+                            gpu_future = gpu_pool.submit(self._execute_task, task)
+                            break
+
+                    if not claimed_any:
+                        if not is_busy:
+                            heartbeat_counter += 1
+                            if heartbeat_counter >= 5:  # Every ~15s
+                                self._lic.send_node_heartbeat(status="idle", node_name=self._node_name)
+                                heartbeat_counter = 0
+                        time.sleep(min(1.0, self.poll_interval_sec) if is_busy else self.poll_interval_sec)
+                except Exception as e:
+                    logger.debug("Cluster poll error: %s", e)
+                    time.sleep(self.poll_interval_sec * 2)
 
         # Mark offline when stopping
         try:

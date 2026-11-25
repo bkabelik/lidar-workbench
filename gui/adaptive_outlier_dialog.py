@@ -52,8 +52,80 @@ from .classification_dialog import ClusterExecutionWidget
 logger = logging.getLogger("lidar_workbench.gui.adaptive_outlier_dialog")
 
 
+def _adaptive_outlier_process_tile(tid: str, las_path_str: str, params_dict: dict) -> dict:
+    """Run Auto Adaptive Outlier Classification on a single tile (picklable for ProcessPoolExecutor)."""
+    import laspy
+
+    las_path = Path(las_path_str)
+    las = laspy.read(str(las_path))
+    n_pts = len(las.x)
+    if n_pts == 0:
+        return {"tile_id": tid, "empty": True}
+
+    extra_dims = {}
+    for ed in las.point_format.extra_dimensions:
+        if hasattr(las, ed.name):
+            extra_dims[ed.name] = np.asarray(getattr(las, ed.name))
+
+    data = {
+        "x": np.asarray(las.x, dtype=np.float64),
+        "y": np.asarray(las.y, dtype=np.float64),
+        "z": np.asarray(las.z, dtype=np.float64),
+        "classification": np.asarray(las.classification, dtype=np.uint8),
+        "intensity": np.asarray(las.intensity, dtype=np.uint16) if hasattr(las, "intensity") else np.zeros(n_pts, dtype=np.uint16),
+        "return_number": np.asarray(las.return_number, dtype=np.uint8) if hasattr(las, "return_number") else np.ones(n_pts, dtype=np.uint8),
+        "num_returns": np.asarray(las.number_of_returns, dtype=np.uint8) if hasattr(las, "number_of_returns") else np.ones(n_pts, dtype=np.uint8),
+        "point_source_id": np.asarray(las.point_source_id, dtype=np.uint16) if hasattr(las, "point_source_id") else np.zeros(n_pts, dtype=np.uint16),
+        "scan_angle": np.asarray(las.scan_angle, dtype=np.float64) if hasattr(las, "scan_angle") else np.asarray(las.scan_angle_rank, dtype=np.float64),
+        "extra_dims": extra_dims,
+    }
+
+    rep = evaluate_point_cloud(data)
+    params = OutlierParams.custom(rep, **params_dict) if params_dict else OutlierParams.auto(rep)
+    res = classify_outliers_adaptive(data, params=params, report=rep)
+
+    noise_mask = res.class_7_mask | res.class_18_mask
+    keep_mask = ~noise_mask
+    c7 = int(res.stats.get("n_class_7", 0))
+    c18 = int(res.stats.get("n_class_18", 0))
+    noise_name = None
+    noise_bbox = None
+    noise_count = int(noise_mask.sum())
+
+    if noise_count > 0:
+        noise_dir = las_path.parent / "noise"
+        noise_dir.mkdir(parents=True, exist_ok=True)
+        noise_name = f"{las_path.stem}_noise.las"
+        noise_path = noise_dir / noise_name
+        noise_las = laspy.LasData(las.header)
+        noise_las.points = las.points[noise_mask]
+        noise_las.classification = res.updated_classification[noise_mask]
+        noise_las.write(str(noise_path))
+
+        clean_las = laspy.LasData(las.header)
+        clean_las.points = las.points[keep_mask]
+        clean_las.write(str(las_path))
+
+        nx_arr = np.asarray(noise_las.x)
+        ny_arr = np.asarray(noise_las.y)
+        noise_bbox = (float(nx_arr.min()), float(ny_arr.min()), float(nx_arr.max()), float(ny_arr.max()))
+
+    return {
+        "tile_id": tid,
+        "empty": False,
+        "c7": c7,
+        "c18": c18,
+        "keep_count": int(keep_mask.sum()),
+        "noise_count": noise_count,
+        "noise_name": noise_name,
+        "noise_bbox": noise_bbox,
+        "total_ms": float(res.stats.get("total_ms", 0.0)),
+        "preset_name": res.params.preset_name,
+    }
+
+
 class _AdaptiveOutlierWorker(QThread):
-    """Background worker running `classify_outliers_adaptive` across selected tiles."""
+    """Background worker running `classify_outliers_adaptive` across selected tiles (parallel via filter_workers)."""
 
     progress = Signal(str, float)
     tile_done = Signal(str, int, int)  # tile_id, n_class_7, n_class_18
@@ -74,12 +146,73 @@ class _AdaptiveOutlierWorker(QThread):
         self._tile_ids = list(tile_ids)
         self._params = params
         self._cancelled = False
+        self._pool = None
 
     def cancel(self) -> None:
         self._cancelled = True
+        if self._pool is not None:
+            try:
+                self._pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            try:
+                for p in list(self._pool._processes.values()):
+                    if p.is_alive():
+                        p.terminate()
+            except Exception:
+                pass
+
+    def _record_tile_result(self, tid: str, tile_info: dict, out: dict) -> None:
+        import json as _json
+        from ..config import TileStatus
+
+        if out.get("empty"):
+            return
+        c7 = int(out["c7"])
+        c18 = int(out["c18"])
+        keep_count = int(out["keep_count"])
+        noise_count = int(out["noise_count"])
+
+        if noise_count > 0 and out.get("noise_name") and out.get("noise_bbox"):
+            with self._db.connect() as nconn:
+                self._db.insert_tile(
+                    nconn,
+                    tile_id=f"{tid}_noise",
+                    filename=f"noise/{out['noise_name']}",
+                    bbox=out["noise_bbox"],
+                    point_count=noise_count,
+                    flight_line=tile_info.get("flight_line", 0),
+                    scanner=tile_info.get("scanner", ""),
+                    all_scanners=_json.loads(tile_info.get("all_scanners", "[]"))
+                    if isinstance(tile_info.get("all_scanners"), str) else tile_info.get("all_scanners", []),
+                    sensor_type=tile_info.get("sensor_type", ""),
+                    flightline_sensor_types=_json.loads(tile_info.get("flightline_sensor_types", "{}"))
+                    if isinstance(tile_info.get("flightline_sensor_types"), str) else tile_info.get("flightline_sensor_types", {}),
+                    crs_epsg=tile_info.get("crs_epsg"),
+                    crs_wkt=tile_info.get("crs_wkt"),
+                    status=TileStatus.NOISE,
+                    filter_params={"source_tile": tid, "filter": "adaptive_outlier", "preset": out["preset_name"]},
+                )
+                nconn.commit()
+
+        self._tm.update_tile_status(tid, TileStatus.FILTERED)
+        with self._db.connect() as conn:
+            self._db.update_point_count(conn, tid, keep_count)
+            self._db.record_processing_time(
+                conn, tid, "filter",
+                duration_seconds=float(out["total_ms"]) / 1000.0,
+                point_count=keep_count,
+                params={"mode": "adaptive_outlier", "preset": out["preset_name"], "class_7": c7, "class_18": c18},
+            )
+            conn.commit()
+
+        if hasattr(self._tm, "_point_cache") and tid in self._tm._point_cache:
+            del self._tm._point_cache[tid]
 
     def run(self) -> None:
-        import laspy
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from dataclasses import asdict
+        from .settings_dialog import load_general_settings
 
         n_total = len(self._tile_ids)
         total_c7 = 0
@@ -87,109 +220,78 @@ class _AdaptiveOutlierWorker(QThread):
         processed = 0
 
         try:
-            for idx, tid in enumerate(self._tile_ids):
-                if self._cancelled:
-                    break
-                base_pct = (idx / max(1, n_total)) * 100.0
-                self.progress.emit(f"Evaluating & classifying {tid} ({idx + 1}/{n_total})…", base_pct)
+            workers = max(1, int(load_general_settings().get("filter_workers", 4)))
+            params_dict = asdict(self._params)
 
-                data = self._tm.load_tile_points_full(tid)
-                if data is None or len(data.get("x", [])) == 0:
-                    continue
+            # Single-tile or 1-worker path: preserve full in-process undo/redo recording
+            if n_total <= 1 or workers == 1:
+                for idx, tid in enumerate(self._tile_ids):
+                    if self._cancelled:
+                        break
+                    self.progress.emit(f"Evaluating & classifying {tid} ({idx + 1}/{n_total})…", (idx / max(1, n_total)) * 100.0)
+                    data = self._tm.load_tile_points_full(tid)
+                    if data is None or len(data.get("x", [])) == 0:
+                        continue
+                    old_cls = np.asarray(data["classification"], dtype=np.uint8).copy()
+                    tile_info = self._db.get_tile(tid)
+                    if tile_info and self._tm._pm.tiles_dir:
+                        las_path = self._tm._pm.tiles_dir / tile_info["filename"]
+                        if las_path.is_file():
+                            out = _adaptive_outlier_process_tile(tid, str(las_path), params_dict)
+                            self._record_tile_result(tid, tile_info, out)
+                            c7, c18 = int(out.get("c7", 0)), int(out.get("c18", 0))
+                            rep = evaluate_point_cloud(data)
+                            res = classify_outliers_adaptive(data, params=self._params, report=rep, cancel_check=lambda: self._cancelled)
+                            apply_outlier_classification_with_undo(self._db, tid, old_cls, res)
+                            total_c7 += c7
+                            total_c18 += c18
+                            processed += 1
+                            self.tile_done.emit(tid, c7, c18)
+                            self.progress.emit(f"{tid}: Class 7={c7:,}, Class 18={c18:,} ({processed}/{n_total})", ((idx + 1) / max(1, n_total)) * 100.0)
+                self.finished_all.emit(processed, total_c7, total_c18)
+                return
 
-                old_cls = np.asarray(data["classification"], dtype=np.uint8).copy()
-                rep = evaluate_point_cloud(data)
-                res = classify_outliers_adaptive(
-                    data,
-                    params=self._params,
-                    report=rep,
-                    cancel_check=lambda: self._cancelled,
-                )
-                if self._cancelled:
-                    break
-
-                # Extract noise points (Class 7 & 18) to tiles/noise/<stem>_noise.las
-                # and keep clean points in the tile, matching FilterDialog behavior.
-                noise_mask = res.class_7_mask | res.class_18_mask
-                keep_mask = ~noise_mask
-                c7 = res.stats.get("n_class_7", 0)
-                c18 = res.stats.get("n_class_18", 0)
-
+            # Multi-tile parallel execution using filter_workers from Settings
+            jobs = []
+            for tid in self._tile_ids:
                 tile_info = self._db.get_tile(tid)
                 if tile_info and self._tm._pm.tiles_dir:
                     las_path = self._tm._pm.tiles_dir / tile_info["filename"]
                     if las_path.is_file():
-                        las = laspy.read(str(las_path))
-                        if np.any(noise_mask):
-                            noise_dir = self._tm._pm.tiles_dir / "noise"
-                            noise_dir.mkdir(parents=True, exist_ok=True)
-                            noise_name = f"{las_path.stem}_noise.las"
-                            noise_path = noise_dir / noise_name
-                            noise_las = laspy.LasData(las.header)
-                            noise_las.points = las.points[noise_mask]
-                            noise_las.classification = res.updated_classification[noise_mask]
-                            noise_las.write(str(noise_path))
+                        jobs.append((tid, str(las_path), tile_info))
 
-                            clean_las = laspy.LasData(las.header)
-                            clean_las.points = las.points[keep_mask]
-                            clean_las.write(str(las_path))
+            if not jobs:
+                self.finished_all.emit(0, 0, 0)
+                return
 
-                            # Register noise tile in SQLite so it appears in the Tile List
-                            import json as _json
-                            from ..config import TileStatus as _TS
-                            noise_tile_id = f"{tid}_noise"
-                            nx_arr = np.asarray(noise_las.x)
-                            ny_arr = np.asarray(noise_las.y)
-                            with self._db.connect() as nconn:
-                                self._db.insert_tile(
-                                    nconn,
-                                    tile_id=noise_tile_id,
-                                    filename=f"noise/{noise_name}",
-                                    bbox=(float(nx_arr.min()), float(ny_arr.min()), float(nx_arr.max()), float(ny_arr.max())),
-                                    point_count=int(noise_mask.sum()),
-                                    flight_line=tile_info.get("flight_line", 0),
-                                    scanner=tile_info.get("scanner", ""),
-                                    all_scanners=_json.loads(tile_info.get("all_scanners", "[]"))
-                                        if isinstance(tile_info.get("all_scanners"), str) else tile_info.get("all_scanners", []),
-                                    sensor_type=tile_info.get("sensor_type", ""),
-                                    flightline_sensor_types=_json.loads(tile_info.get("flightline_sensor_types", "{}"))
-                                        if isinstance(tile_info.get("flightline_sensor_types"), str) else tile_info.get("flightline_sensor_types", {}),
-                                    crs_epsg=tile_info.get("crs_epsg"),
-                                    crs_wkt=tile_info.get("crs_wkt"),
-                                    status=_TS.NOISE,
-                                    filter_params={"source_tile": tid, "filter": "adaptive_outlier", "preset": res.params.preset_name},
-                                )
-                                nconn.commit()
-
-                        from ..config import TileStatus
-                        self._tm.update_tile_status(tid, TileStatus.FILTERED)
-                        with self._db.connect() as conn:
-                            self._db.update_point_count(conn, tid, int(keep_mask.sum()))
-                            self._db.record_processing_time(
-                                conn, tid, "filter",
-                                duration_seconds=float(res.stats.get("total_ms", 0.0)) / 1000.0,
-                                point_count=int(keep_mask.sum()),
-                                params={"mode": "adaptive_outlier", "preset": res.params.preset_name, "class_7": c7, "class_18": c18},
-                            )
-                            conn.commit()
-
-                # Evict stale cache for this tile
-                if hasattr(self._tm, "_point_cache") and tid in self._tm._point_cache:
-                    del self._tm._point_cache[tid]
-
-                # Record reversible batch command to SQLite undo/redo history
-                apply_outlier_classification_with_undo(self._db, tid, old_cls, res)
-                total_c7 += c7
-                total_c18 += c18
-                processed += 1
-                self.tile_done.emit(tid, c7, c18)
-                self.progress.emit(
-                    f"{tid}: Class 7={c7:,}, Class 18={c18:,} ({processed}/{n_total})",
-                    ((idx + 1) / max(1, n_total)) * 100.0,
-                )
-
+            max_w = min(workers, len(jobs))
+            self.progress.emit(f"Auto Noise filtering {len(jobs)} tiles with {max_w} worker processes…", 0.0)
+            with ProcessPoolExecutor(max_workers=max_w) as pool:
+                self._pool = pool
+                fut_map = {
+                    pool.submit(_adaptive_outlier_process_tile, tid, lp, params_dict): (tid, tinfo)
+                    for tid, lp, tinfo in jobs
+                }
+                for fut in as_completed(fut_map):
+                    if self._cancelled:
+                        break
+                    tid, tinfo = fut_map[fut]
+                    out = fut.result()
+                    self._record_tile_result(tid, tinfo, out)
+                    c7 = int(out.get("c7", 0))
+                    c18 = int(out.get("c18", 0))
+                    total_c7 += c7
+                    total_c18 += c18
+                    processed += 1
+                    self.tile_done.emit(tid, c7, c18)
+                    self.progress.emit(
+                        f"{tid}: Class 7={c7:,}, Class 18={c18:,} ({processed}/{len(jobs)})",
+                        (processed / max(1, len(jobs))) * 100.0,
+                    )
+            self._pool = None
             self.finished_all.emit(processed, total_c7, total_c18)
         except Exception as exc:
+            self._pool = None
             logger.exception("Adaptive outlier worker error")
             self.error.emit(str(exc))
 
