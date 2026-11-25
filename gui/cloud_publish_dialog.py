@@ -626,7 +626,16 @@ class CloudPublishDialog(QDialog):
             headers["Authorization"] = f"Bearer {self._lic.access_token}"
 
         try:
-            resp = requests.post(publish_url, data=form_data, headers=headers, timeout=20)
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            from requests.adapters import HTTPAdapter
+            import time
+
+            sess = requests.Session()
+            adapter = HTTPAdapter(pool_connections=8, pool_maxsize=8)
+            sess.mount("https://", adapter)
+            sess.mount("http://", adapter)
+
+            resp = sess.post(publish_url, data=form_data, headers=headers, timeout=20)
             resp.raise_for_status()
             res_body = resp.json()
 
@@ -640,157 +649,94 @@ class CloudPublishDialog(QDialog):
             if not upload_url.startswith("http"):
                 upload_url = f"{server_url}{upload_url}"
 
-            # 5a. Upload Web Point Cloud
+            # Build list of (label, asset_type, filename, payload_or_path, mime_type, timeout_s, critical)
+            upload_tasks = []
             if preview_bytes:
-                self._prog_bar.setValue(40)
-                self._status_lbl.setText("Uploading 3D GIS Globe point cloud...")
-                QApplication.processEvents()
-                requests.post(
-                    upload_url,
-                    data={"asset_type": "pointcloud"},
-                    files={"file": ("web_preview.bin", preview_bytes, "application/octet-stream")},
-                    timeout=30,
-                )
-
-            # 5b. Upload Orthophoto (Web-Optimized Image or Raw GeoTIFF)
+                upload_tasks.append(("3D GIS Globe point cloud", "pointcloud", "web_preview.bin", preview_bytes, "application/octet-stream", 120, True))
             if ortho_webp_bytes:
-                self._prog_bar.setValue(55)
-                self._status_lbl.setText("Uploading web-optimized orthophoto...")
-                QApplication.processEvents()
-                requests.post(
-                    upload_url,
-                    data={"asset_type": "orthophoto"},
-                    files={"file": ("orthophoto.webp", ortho_webp_bytes, "image/webp")},
-                    timeout=60,
-                )
+                upload_tasks.append(("web-optimized orthophoto", "orthophoto", "orthophoto.webp", ortho_webp_bytes, "image/webp", 120, True))
             elif ortho_file and ortho_file.exists():
-                self._prog_bar.setValue(55)
-                self._status_lbl.setText(f"Uploading orthophoto: {ortho_file.name}...")
-                QApplication.processEvents()
-                with open(ortho_file, "rb") as f:
-                    requests.post(
-                        upload_url,
-                        data={"asset_type": "orthophoto"},
-                        files={"file": (ortho_file.name, f, "image/tiff")},
-                        timeout=120,
-                    )
-
-            # 5c. Upload Vector Layers (with QGIS styling embedded)
+                upload_tasks.append((f"orthophoto {ortho_file.name}", "orthophoto", ortho_file.name, ortho_file, "image/tiff", 300, True))
             if vectors_geojson_bytes:
-                self._prog_bar.setValue(65)
-                self._status_lbl.setText("Uploading styled vector layers...")
-                QApplication.processEvents()
-                requests.post(
-                    upload_url,
-                    data={"asset_type": "vector"},
-                    files={"file": ("vectors.geojson", vectors_geojson_bytes, "application/geo+json")},
-                    timeout=60,
-                )
-
-            # 5d. Upload QGIS Project if present
+                upload_tasks.append(("styled vector layers", "vector", "vectors.geojson", vectors_geojson_bytes, "application/geo+json", 120, True))
             if qgis_path_str and os.path.isfile(qgis_path_str):
                 qp = Path(qgis_path_str)
-                self._prog_bar.setValue(72)
-                self._status_lbl.setText(f"Uploading QGIS project file: {qp.name}...")
-                QApplication.processEvents()
-                with open(qp, "rb") as f:
-                    requests.post(
-                        upload_url,
-                        data={"asset_type": "qgis_project"},
-                        files={"file": (qp.name, f, "application/octet-stream")},
-                        timeout=60,
-                    )
+                upload_tasks.append((f"QGIS project {qp.name}", "qgis_project", qp.name, qp, "application/octet-stream", 120, True))
 
-            # 5e. Upload DTM Rasters if available
             if self._chk_dtm.isChecked() and self._pm.project_dir:
                 dtm_dir = self._pm.project_dir / "dtm"
                 if dtm_dir.is_dir():
                     target_tids = {t.get("id") for t in tiles if t.get("id")}
                     dtm_files = [f for f in dtm_dir.glob("*.tif") if any(tid in f.name for tid in target_tids)] or list(dtm_dir.glob("*.tif"))
                     for dtmf in dtm_files[:5]:
-                        self._prog_bar.setValue(80)
-                        self._status_lbl.setText(f"Uploading DTM: {dtmf.name}...")
-                        QApplication.processEvents()
-                        try:
-                            with open(dtmf, "rb") as f:
-                                requests.post(
-                                    upload_url,
-                                    data={"asset_type": "dtm"},
-                                    files={"file": (dtmf.name, f, "image/tiff")},
-                                    timeout=60,
-                                )
-                        except Exception as e:
-                            logger.warning("Failed uploading DTM raster %s: %s", dtmf.name, e)
+                        upload_tasks.append((f"DTM {dtmf.name}", "dtm", dtmf.name, dtmf, "image/tiff", 300, False))
 
-            # 5f. Upload DSM Rasters if available
             if self._chk_dsm.isChecked() and self._pm.project_dir:
                 dsm_dir = self._pm.project_dir / "dsm"
                 if dsm_dir.is_dir():
                     target_tids = {t.get("id") for t in tiles if t.get("id")}
                     dsm_files = [f for f in dsm_dir.glob("*.tif") if any(tid in f.name for tid in target_tids)] or list(dsm_dir.glob("*.tif"))
                     for dsmf in dsm_files[:5]:
-                        self._prog_bar.setValue(88)
-                        self._status_lbl.setText(f"Uploading DSM: {dsmf.name}...")
-                        QApplication.processEvents()
-                        try:
-                            with open(dsmf, "rb") as f:
-                                requests.post(
-                                    upload_url,
-                                    data={"asset_type": "dsm"},
-                                    files={"file": (dsmf.name, f, "image/tiff")},
-                                    timeout=60,
-                                )
-                        except Exception as e:
-                            logger.warning("Failed uploading DSM raster %s: %s", dsmf.name, e)
+                        upload_tasks.append((f"DSM {dsmf.name}", "dsm", dsmf.name, dsmf, "image/tiff", 300, False))
 
-            # 5g. Upload QC Report if available
             if self._chk_qc.isChecked() and self._pm.project_dir:
                 qc_dir = self._pm.project_dir / "qc"
                 if qc_dir.is_dir():
                     for qcf in qc_dir.glob("*.json"):
-                        self._prog_bar.setValue(93)
-                        self._status_lbl.setText(f"Uploading QC Report: {qcf.name}...")
-                        QApplication.processEvents()
-                        try:
-                            with open(qcf, "rb") as f:
-                                requests.post(
-                                    upload_url,
-                                    data={"asset_type": "qc_report"},
-                                    files={"file": (qcf.name, f, "application/json")},
-                                    timeout=20,
-                                )
-                        except Exception as e:
-                            logger.warning("Failed uploading QC report %s: %s", qcf.name, e)
+                        upload_tasks.append((f"QC Report {qcf.name}", "qc_report", qcf.name, qcf, "application/json", 60, False))
                         break
 
-            # 5h. Upload primary LAS / LAZ deliverable files if checked
             if self._chk_las.isChecked() and tiles:
                 is_ent = (self._lic.plan in ("enterprise", "pro")) or getattr(self._lic, "is_admin", False)
                 max_allowed_bytes = (50 * 1024 * 1024 * 1024) if is_ent else (500 * 1024 * 1024)
-
                 las_paths = []
                 for t in tiles:
                     p = self._resolve_tile_path(t)
                     if p and p.is_file() and p not in las_paths:
                         las_paths.append(p)
-
-                total_las = len(las_paths)
-                for idx, las_path in enumerate(las_paths):
+                for las_path in las_paths:
                     if las_path.stat().st_size <= max_allowed_bytes:
-                        pct = int(95 + (idx + 1) / max(1, total_las) * 4)
-                        self._prog_bar.setValue(min(pct, 99))
-                        self._status_lbl.setText(f"Uploading Deliverable LAS ({idx + 1}/{total_las}): {las_path.name}...")
-                        QApplication.processEvents()
-                        try:
-                            with open(las_path, "rb") as f:
-                                requests.post(
-                                    upload_url,
-                                    data={"asset_type": "pointcloud"},
-                                    files={"file": (las_path.name, f, "application/octet-stream")},
-                                    timeout=600,
-                                )
-                        except Exception as e:
-                            logger.warning("Failed uploading deliverable LAS %s: %s", las_path.name, e)
+                        upload_tasks.append((f"LAS {las_path.name}", "pointcloud", las_path.name, las_path, "application/octet-stream", 600, False))
+
+            def _do_upload(task):
+                label, atype, fname, src, mime, tout, _crit = task
+                if isinstance(src, (bytes, bytearray)):
+                    r = sess.post(upload_url, data={"asset_type": atype}, files={"file": (fname, src, mime)}, timeout=tout)
+                else:
+                    with open(src, "rb") as fh:
+                        r = sess.post(upload_url, data={"asset_type": atype}, files={"file": (fname, fh, mime)}, timeout=tout)
+                r.raise_for_status()
+                return label
+
+            if upload_tasks:
+                total_tasks = len(upload_tasks)
+                self._prog_bar.setValue(35)
+                self._status_lbl.setText(f"Uploading {total_tasks} deliverables in parallel...")
+                QApplication.processEvents()
+                with ThreadPoolExecutor(max_workers=min(4, total_tasks)) as pool:
+                    fut_map = {pool.submit(_do_upload, t): t for t in upload_tasks}
+                    done_count = 0
+                    pending = set(fut_map.keys())
+                    while pending:
+                        finished = [f for f in pending if f.done()]
+                        if not finished:
+                            QApplication.processEvents()
+                            time.sleep(0.05)
+                            continue
+                        for fut in finished:
+                            pending.remove(fut)
+                            done_count += 1
+                            t = fut_map[fut]
+                            try:
+                                fut.result()
+                            except Exception as e:
+                                logger.warning("Failed uploading %s: %s", t[0], e)
+                            pct = 35 + int((done_count / total_tasks) * 64)
+                            self._prog_bar.setValue(min(pct, 99))
+                            self._status_lbl.setText(f"Uploaded {done_count}/{total_tasks}: {t[0]}")
+                            QApplication.processEvents()
+
+            sess.close()
 
             self._prog_bar.setValue(100)
             self._status_lbl.setText("Successfully published to Cloud!")
