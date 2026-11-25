@@ -60,8 +60,9 @@ def get_local_build_timestamp() -> float:
 
     state = _load_state()
     rec_ts = float(state.get("installed_remote_mtime") or 0.0)
-    # Only trust recorded remote_ts if local exe hasn't changed since
-    if rec_ts > local_ts and float(state.get("local_exe_mtime") or 0.0) == local_ts:
+    pre_ts = float(state.get("pre_install_exe_mtime") or state.get("local_exe_mtime") or 0.0)
+    # Trust recorded remote_ts as long as the local exe wasn't downgraded below pre_ts
+    if rec_ts > local_ts and (local_ts >= pre_ts or pre_ts == 0.0):
         return rec_ts
     return local_ts
 
@@ -98,8 +99,8 @@ def check_for_update(url: str = UPDATE_EXE_URL, timeout: float = 8.0) -> Dict[st
     remote_ts = dt.timestamp()
     size_bytes = int(cl_hdr) if cl_hdr and cl_hdr.isdigit() else 0
 
-    # 5-minute tolerance to avoid false positives from clock/copy skew
-    available = remote_ts > (local_ts + 300.0)
+    # 30-minute tolerance avoids false positives from Inno Setup packaging time + upload skew
+    available = remote_ts > (local_ts + 1800.0)
     return {
         "available": available,
         "remote_ts": remote_ts,
@@ -243,7 +244,7 @@ def launch_installer_and_exit(installer_path: str, remote_ts: float = 0.0) -> No
     if remote_ts:
         _save_state({
             "installed_remote_mtime": remote_ts,
-            "local_exe_mtime": local_exe_mtime,
+            "pre_install_exe_mtime": local_exe_mtime,
         })
 
     args = [installer_path, "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"]
