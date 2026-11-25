@@ -833,6 +833,7 @@ class MainWindow(QMainWindow):
         from .adaptive_outlier_dialog import AdaptiveOutlierDialog
         dialog = AdaptiveOutlierDialog(self._tm, self._db, selected, parent=self)
         dialog.classification_applied.connect(self._refresh_tile_list)
+        dialog.classification_applied.connect(lambda: self._sync_project_cloud(silent=True))
         try:
             dialog.exec()
         finally:
