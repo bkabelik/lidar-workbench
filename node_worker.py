@@ -157,10 +157,17 @@ class CompanyNodeWorker(QThread):
         s_root = self._get_active_storage_root()
         if s_root:
             sp = Path(s_root)
+            folder_names = []
             if project_name:
-                candidates.append(sp / project_name / "tiles" / f"{tile_id}.las")
-                candidates.append(sp / project_name / "tiles" / f"{tile_id}.laz")
-                candidates.append(sp / project_name / f"{tile_id}.las")
+                folder_names.append(project_name)
+            if project_path:
+                pp_name = Path(project_path).name
+                if pp_name and pp_name not in folder_names:
+                    folder_names.append(pp_name)
+            for fname in folder_names:
+                candidates.append(sp / fname / "tiles" / f"{tile_id}.las")
+                candidates.append(sp / fname / "tiles" / f"{tile_id}.laz")
+                candidates.append(sp / fname / f"{tile_id}.las")
             candidates.append(sp / "tiles" / f"{tile_id}.las")
             candidates.append(sp / f"{tile_id}.las")
 
