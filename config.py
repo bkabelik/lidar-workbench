@@ -328,7 +328,7 @@ def load_pointcept_settings() -> dict:
         "model_path": DEFAULT_MODEL_PATH,
         "config_path": DEFAULT_CONFIG_PATH,
         "python_exe": sys.executable,
-        "voxel_size": 0.5,
+        "voxel_size": 0.15,
         "smoothing": True,
     }
     saved_pc = all_settings.get("pointcept", {})

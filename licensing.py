@@ -295,7 +295,7 @@ class LicenseManager:
         project_id: Optional[int] = None,
         project_name: Optional[str] = None,
         project_path: Optional[str] = None,
-        voxel_size: float = 0.5,
+        voxel_size: float = 0.15,
         smoothing: str = "yes",
         job_type: str = "pointcept_classification",
         job_params: Optional[Dict[str, Any]] = None,

@@ -197,7 +197,7 @@ class CompanyNodeWorker(QThread):
     def _run_pointcept_inference(
         self,
         las_path: Path,
-        voxel_size: float = 0.5,
+        voxel_size: float = 0.15,
         smoothing: str = "yes",
     ) -> Tuple[bool, int]:
         """Run Pointcept AI inference on the specified tile using local GPU."""
@@ -406,7 +406,7 @@ class CompanyNodeWorker(QThread):
         job_params = task.get("job_params") or {}
         proj_name = task.get("project_name") or job_params.get("project_name")
         proj_path = task.get("project_path") or job_params.get("project_path")
-        voxel_sz = float(task.get("voxel_size", job_params.get("voxel_size", 0.5)))
+        voxel_sz = float(task.get("voxel_size", job_params.get("voxel_size", 0.15)))
         smoothing = str(task.get("smoothing", job_params.get("smoothing", "yes")))
 
         print(f"[*] Node '{self._node_name}' claimed cluster task [{job_type}]: Tile '{tile_id}' (Job #{job_id})")

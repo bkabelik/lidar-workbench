@@ -281,7 +281,7 @@ class SettingsDialog(QDialog):
         self._voxel_spin.setRange(0.05, 5.0)
         self._voxel_spin.setSingleStep(0.05)
         self._voxel_spin.setDecimals(2)
-        self._voxel_spin.setValue(self._pointcept.get("voxel_size", 0.5))
+        self._voxel_spin.setValue(self._pointcept.get("voxel_size", 0.15))
         infer_form.addRow("Default Voxel Size (m):", self._voxel_spin)
 
         self._smoothing_chk = QCheckBox("Enable majority voting spatial smoothing")
