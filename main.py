@@ -99,6 +99,11 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_ORG)
+    try:
+        from .gui.ui_state import install_global_ui_state_persistence
+        install_global_ui_state_persistence(app)
+    except Exception as exc:
+        logger.debug("Could not install UI state persistence: %s", exc)
     icon_path = _resolve_bundled_path("gui/assets/app_icon.png")
     if os.path.isfile(icon_path):
         from PySide6.QtGui import QIcon
