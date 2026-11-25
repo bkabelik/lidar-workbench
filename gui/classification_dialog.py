@@ -142,7 +142,8 @@ class ClusterExecutionWidget(QGroupBox):
         self._table.setHorizontalHeaderLabels(["Use", "Node", "GPU", "Status"])
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        self._table.setMaximumHeight(110)
+        self._table.setMinimumHeight(90)
+        self._table.setMaximumHeight(130)
         self._table.verticalHeader().setVisible(False)
         cb_lay.addWidget(self._table)
 
@@ -178,19 +179,28 @@ class ClusterExecutionWidget(QGroupBox):
             self._table.insertRow(0)
             self._table.setItem(0, 1, QTableWidgetItem("No online nodes found"))
             return
+        import platform
+        this_pc = platform.node()
         for r, n in enumerate(nodes):
             self._table.insertRow(r)
+            is_online = bool(n.get("is_online"))
+            name = str(n.get("node_name", ""))
             chk = QCheckBox()
-            chk.setChecked(bool(n.get("is_online")))
+            chk.setChecked(is_online)
+            chk.setEnabled(is_online)
             chk_w = QWidget()
             cl = QHBoxLayout(chk_w)
             cl.setContentsMargins(4, 0, 4, 0)
             cl.setAlignment(Qt.AlignCenter)
             cl.addWidget(chk)
             self._table.setCellWidget(r, 0, chk_w)
-            self._table.setItem(r, 1, QTableWidgetItem(str(n.get("node_name", ""))))
+            disp_name = f"{name} (This PC)" if name == this_pc else name
+            self._table.setItem(r, 1, QTableWidgetItem(disp_name))
             self._table.setItem(r, 2, QTableWidgetItem(str(n.get("gpu_name", ""))))
-            self._table.setItem(r, 3, QTableWidgetItem("Online" if n.get("is_online") else "Offline"))
+            stat = "🟢 Online" if is_online else "⚪ Offline"
+            if is_online and n.get("status") == "busy":
+                stat = "🟡 Busy"
+            self._table.setItem(r, 3, QTableWidgetItem(stat))
             self._node_rows.append((n["id"], chk))
 
     def start_distributed_job(
@@ -209,8 +219,8 @@ class ClusterExecutionWidget(QGroupBox):
 
         pm = getattr(self._tm, "_pm", None)
         proj_root = pm.project_root if pm else None
-        proj_name = (pm.metadata.get("name") or (proj_root.name if proj_root else "")) if pm else ""
-        proj_path = str(proj_root) if proj_root else ""
+        proj_path = str(proj_root) if proj_root else str((job_params or {}).get("project_path") or "")
+        proj_name = (pm.metadata.get("name") or (proj_root.name if proj_root else "")) if pm else (Path(proj_path).name if proj_path else "")
 
         res = self._lic.dispatch_job(
             tile_ids,
