@@ -769,9 +769,8 @@ def classify_outliers_adaptive(
             # Only assign Class 7 if clearly below local neighbor median Z; otherwise Class 18
             local_med_z = np.median(zs[surv_idx[n_large[final_reject]]], axis=1)
             below_local = zs[rej_pts] < (local_med_z - 0.5)
-            above_local = zs[rej_pts] > (local_med_z + 0.5)
             class_7[rej_pts[below_local]] = True
-            class_18[rej_pts[above_local]] = True
+            class_18[rej_pts[~below_local]] = True
 
     # ── Step 5: Conditional Bathymetry Sub-Pass ────────────────────────
     run_bathy = (params.bathy_mode == "on") or (params.bathy_mode == "auto" and report.has_bathymetry)
