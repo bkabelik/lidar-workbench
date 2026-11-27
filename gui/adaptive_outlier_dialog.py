@@ -378,6 +378,12 @@ class AdaptiveOutlierDialog(QDialog):
         self._preset_combo.addItem("Helicopter (~100 pts/m², Multi-Strip)", "helicopter")
         self._preset_combo.addItem("Fixed-Wing (~20 pts/m², Wide Scan)", "fixed_wing")
         self._preset_combo.addItem("Custom (Manual Overrides)", "custom")
+        self._preset_combo.setToolTip(
+            "Select a platform baseline.\n"
+            "• Auto: derives voxel size, grid cell, and tolerances from the sample tile's NPS, relief, and flightlines.\n"
+            "• Drone / Helicopter / Fixed-Wing: force a specific platform profile.\n"
+            "• Custom: automatically selected when you edit any parameter below."
+        )
         self._preset_combo.currentIndexChanged.connect(self._on_preset_changed)
         preset_row.addWidget(self._preset_combo, stretch=1)
         root.addLayout(preset_row)
@@ -392,58 +398,142 @@ class AdaptiveOutlierDialog(QDialog):
         g1 = QGroupBox("1. Return-Aware RIEGL Radiometric & Pulse-Shape Gate")
         f1 = QFormLayout(g1)
         self._chk_refl_gate = QCheckBox("Enable Low-Reflectance Gate")
-        self._chk_refl_gate.setToolTip("Apply reflectance threshold to single/first returns when RIEGL reflectance is available.")
+        self._chk_refl_gate.setToolTip(
+            "Use RIEGL Reflectance (dB) to flag weak single/first returns in Step 1 & weight SOR distances in Step 4.\n"
+            "• Uncheck if dark asphalt, wet surfaces, or shadows are being over-filtered."
+        )
         f1.addRow(self._chk_refl_gate)
-        self._spn_min_refl = self._dspin(-60.0, 20.0, 1.0, " dB", "Minimum RIEGL reflectance (dB) for single/first returns.")
+        self._spn_min_refl = self._dspin(
+            -60.0, 20.0, 1.0, " dB",
+            "Minimum RIEGL Reflectance (dB) for single/first returns.\n"
+            "• Lower (e.g. -28 dB): more permissive (keeps darker targets/wet ground).\n"
+            "• Higher (e.g. -18 dB): stricter (flags more weak/atmospheric returns)."
+        )
         f1.addRow("Min Reflectance (dB):", self._spn_min_refl)
-        self._spn_max_dev = self._dspin(0.0, 200.0, 1.0, "", "Maximum RIEGL pulse shape deviation before flagging isolated returns.")
+        self._spn_max_dev = self._dspin(
+            0.0, 200.0, 1.0, "",
+            "Maximum RIEGL pulse-shape Deviation before marking a single/first return as suspect.\n"
+            "• Higher (e.g. 40–60): keeps more rough edges, leaves, and oblique walls.\n"
+            "• Lower (e.g. 15–20): stricter against distorted/multipath returns (0 disables)."
+        )
         f1.addRow("Max Pulse Deviation:", self._spn_max_dev)
         self._chk_protect_canopy = QCheckBox("Protect Multi-Return Forest Canopy (return_number > 1)")
-        self._chk_protect_canopy.setToolTip("Never apply strict low-reflectance or PCA planar rejection to intermediate/last vegetation returns.")
+        self._chk_protect_canopy.setToolTip(
+            "Exempts intermediate and last vegetation returns (return_number > 1) from radiometric gating, normal SOR, and PCA rejection.\n"
+            "• Keep ON for forested tiles so dense interior canopy & understory aren't stripped.\n"
+            "• Note: tree-top spire tips are usually return_number == 1 and are governed by Step 4 SOR/PCA."
+        )
         f1.addRow(self._chk_protect_canopy)
         p_lay.addWidget(g1)
 
         # Group 2: 3D Voxel Isolation
         g2 = QGroupBox("2. 3D Voxel Isolation Pre-Filter (O(N))")
         f2 = QFormLayout(g2)
-        self._spn_voxel = self._dspin(0.05, 10.0, 0.05, " m", "3D voxel edge length (auto: 3.0 × NPS).")
+        self._spn_voxel = self._dspin(
+            0.05, 10.0, 0.05, " m",
+            "3D voxel edge length for isolation check (auto: max(0.90 m, 10 × NPS)).\n"
+            "A point is checked against its 3×3×3 voxel cube.\n"
+            "• Larger (e.g. 1.2–2.0 m): preserves sparser ground under canopy & sparse walls.\n"
+            "• Smaller (e.g. 0.4–0.6 m): catches tighter stray points near surfaces (risks sparse ground)."
+        )
         f2.addRow("Voxel Size:", self._spn_voxel)
-        self._spn_voxel_nbr = self._ispin(1, 20, " pts", "Minimum points in 3×3×3 voxel neighborhood to survive.")
+        self._spn_voxel_nbr = self._ispin(
+            1, 20, " pts",
+            "Minimum total points inside the 3×3×3 voxel neighborhood (including the point itself) to survive Step 2.\n"
+            "• 2 pts (default): only removes completely isolated points with 0 neighbors.\n"
+            "• Higher (3–5 pts): removes small isolated 2–4 pt noise clumps in Step 2."
+        )
         f2.addRow("Min Voxel Neighbors:", self._spn_voxel_nbr)
         p_lay.addWidget(g2)
 
         # Group 3: Asymmetric IRLS & Strip Envelope
         g3 = QGroupBox("3. Flightline-Aware Asymmetric IRLS Lower & Upper Envelope")
         f3 = QFormLayout(g3)
-        self._spn_cell = self._dspin(0.25, 25.0, 0.25, " m", "IRLS 2D terrain envelope cell size (auto: 8.0 × NPS).")
+        self._spn_cell = self._dspin(
+            0.25, 25.0, 0.25, " m",
+            "2D grid cell size for the coarse-to-fine lower terrain envelope (auto: 8–10 × NPS).\n"
+            "• Smaller (0.5–1.0 m): tracks sharp ditches, walls, and steep terrain breaks closely.\n"
+            "• Larger (2.0–4.0 m): bridges wider subterranean pit clusters."
+        )
         f3.addRow("Grid Cell Size:", self._spn_cell)
-        self._spn_irls_iter = self._ispin(1, 10, "", "Number of asymmetric Huber/Tukey IRLS refinement iterations.")
+        self._spn_irls_iter = self._ispin(
+            1, 10, "",
+            "Number of asymmetric Huber/Tukey IRLS terrain-fitting iterations.\n"
+            "• 3 (default): fast and robust.\n"
+            "• Higher (4–6): tighter convergence on complex terrain."
+        )
         f3.addRow("IRLS Iterations:", self._spn_irls_iter)
-        self._spn_lower_mad = self._dspin(1.0, 20.0, 0.5, " × MAD", "Class 7 threshold below IRLS lower terrain envelope.")
+        self._spn_lower_mad = self._dspin(
+            1.0, 20.0, 0.5, " × MAD",
+            "Low-noise (Class 7) threshold below the IRLS lower surface (minimum floor -1.5 m; hard floor -6.0 m).\n"
+            "• Higher (e.g. 7–10): more permissive on steep cliffs/embankments.\n"
+            "• Lower (e.g. 3–4): catches shallower low outliers closer to the surface."
+        )
         f3.addRow("Lower MAD Multiplier:", self._spn_lower_mad)
-        self._spn_upper_mad = self._dspin(1.0, 25.0, 0.5, " × MAD", "Class 18 high-flyer threshold above upper envelope.")
+        self._spn_upper_mad = self._dspin(
+            1.0, 25.0, 0.5, " × MAD",
+            "High-flyer (Class 18) threshold above P95 + multiplier × MAD.\n"
+            "• Higher (e.g. 9–12): safer for tall towers, cranes, or steep mountain ridges.\n"
+            "• Lower (e.g. 4–5): catches lower aerial noise/birds above canopy."
+        )
         f3.addRow("Upper MAD Multiplier:", self._spn_upper_mad)
         self._chk_per_strip = QCheckBox("Evaluate Per-Strip First (preserves helicopter ripples)")
-        self._chk_per_strip.setToolTip("Evaluate each point_source_id strip independently before flagging high flyers.")
+        self._chk_per_strip.setToolTip(
+            "Fits the upper envelope per flightline (point_source_id) before flagging Class 18.\n"
+            "• Keep ON for multi-strip helicopter/fixed-wing surveys with slight Z/roll offsets between strips."
+        )
         f3.addRow(self._chk_per_strip)
-        self._spn_strip_disc = self._dspin(0.1, 20.0, 0.1, " m", "Maximum allowed cross-strip elevation discrepancy.")
+        self._spn_strip_disc = self._dspin(
+            0.1, 20.0, 0.1, " m",
+            "Allowed cross-strip elevation discrepancy when Per-Strip First is enabled.\n"
+            "• Higher: tolerates larger unadjusted strip-to-strip Z offsets."
+        )
         f3.addRow("Max Strip Discrepancy:", self._spn_strip_disc)
         p_lay.addWidget(g3)
 
         # Group 4: Multi-Scale PCA + Radiometric SOR
         g4 = QGroupBox("4. Multi-Scale PCA Consistency & Radiometric SOR")
         f4 = QFormLayout(g4)
-        self._spn_k_small = self._ispin(4, 32, "", "Small neighborhood k for local plane/linearity PCA.")
+        self._spn_k_small = self._ispin(
+            4, 32, "",
+            "Small k-NN neighborhood for local plane residual and linearity (wires/poles).\n"
+            "• Lower (6–8): preserves fine poles/edges; higher (10–14): smoother normal estimates."
+        )
         f4.addRow("SOR k (Small):", self._spn_k_small)
-        self._spn_k_large = self._ispin(8, 64, "", "Large neighborhood k for single cKDTree query & multi-scale check.")
+        self._spn_k_large = self._ispin(
+            8, 64, "",
+            "Large k-NN neighborhood for radiometric SOR distance and multi-scale normal comparison.\n"
+            "• Higher (24–36): catches larger stray noise clumps; lower (12–18): faster & more local."
+        )
         f4.addRow("SOR k (Large):", self._spn_k_large)
-        self._spn_sor_std = self._dspin(0.5, 10.0, 0.1, " σ", "Radiometric-weighted k-NN distance MAD/std multiplier.")
+        self._spn_sor_std = self._dspin(
+            0.5, 10.0, 0.1, " σ",
+            "Statistical Outlier Removal multiplier on radiometric-weighted k-NN distance.\n"
+            "• Higher (e.g. 3.5–4.5): keeps more conifer tree-top needles, sparse walls, and edges.\n"
+            "• Lower (e.g. 1.8–2.2): removes tighter near-surface stray noise."
+        )
         f4.addRow("SOR Std Multiplier:", self._spn_sor_std)
-        self._spn_plane_res = self._dspin(0.02, 5.0, 0.02, " m", "Max PCA smallest-eigenvalue plane residual (auto: 1.5 × NPS).")
+        self._spn_plane_res = self._dspin(
+            0.02, 5.0, 0.02, " m",
+            "Maximum PCA plane residual (sqrt(λ3)) for a neighborhood to count as planar (auto: max(0.08 m, 1.5 × NPS)).\n"
+            "Planar vertical walls & roofs are protected from normal SOR.\n"
+            "• Higher (e.g. 0.20–0.35 m): protects rougher facades, fences, and spiky treetops.\n"
+            "• Lower (e.g. 0.08–0.10 m): stricter on non-planar clutter."
+        )
         f4.addRow("Max Plane Residual:", self._spn_plane_res)
-        self._spn_norm_ang = self._dspin(5.0, 85.0, 1.0, "°", "Max surface normal angular jump between k_small and k_large.")
+        self._spn_norm_ang = self._dspin(
+            5.0, 85.0, 1.0, "°",
+            "Maximum surface-normal angle jump between k_small and k_large before PCA flags a sparse non-planar point.\n"
+            "• Higher (e.g. 35–45°): protects sharp roof ridges, corners, and tree tips.\n"
+            "• Lower (e.g. 15–20°): flags more noisy/chaotic sparse points."
+        )
         f4.addRow("Max Normal Angle:", self._spn_norm_ang)
-        self._spn_rad_wt = self._dspin(0.0, 3.0, 0.1, "", "Weight of reflectance/intensity penalty in k-NN distance SOR.")
+        self._spn_rad_wt = self._dspin(
+            0.0, 3.0, 0.1, "",
+            "Extra distance penalty applied to low-reflectance / low-intensity points in Step 4 SOR.\n"
+            "• 0.0: pure geometric SOR (ignores reflectance/intensity).\n"
+            "• 0.5 (default): balanced; higher (1.0–1.5): aggressively penalizes weak returns."
+        )
         f4.addRow("Radiometric Weight:", self._spn_rad_wt)
         p_lay.addWidget(g4)
 
@@ -454,6 +544,12 @@ class AdaptiveOutlierDialog(QDialog):
         self._cmb_bathy.addItem("Auto (Run if bathymetry detected)", "auto")
         self._cmb_bathy.addItem("On (Force water-column & spray filter)", "on")
         self._cmb_bathy.addItem("Off", "off")
+        self._cmb_bathy.setToolTip(
+            "Controls Step 5 water-column & surface-spray filtering.\n"
+            "• Auto: runs only if water/bathymetry classes or weak multi-return water pulses are detected.\n"
+            "• On: forces water-column filtering.\n"
+            "• Off: disables Step 5 (use if sparse bathymetric bottom points are being removed)."
+        )
         f5.addRow("Bathymetry Mode:", self._cmb_bathy)
         p_lay.addWidget(g5)
 
