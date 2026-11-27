@@ -363,6 +363,74 @@ def _voxel_3d_neighbor_counts(
     return nbr_counts
 
 
+def _voxel_3d_connected_components_outliers(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    voxel_size: float,
+    min_component_pts: int = 50,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    O(N log N) 3D 26-connected voxel component filter.
+    Returns (tiny_mask [< 12 pts, unconditional], small_mask [< min_component_pts]).
+    """
+    n = len(xs)
+    if n == 0 or min_component_pts <= 1:
+        z = np.zeros(n, dtype=bool)
+        return z, z
+
+    from scipy.sparse import csr_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    vs = max(0.5, float(voxel_size))
+    x0, y0, z0 = float(xs.min()), float(ys.min()), float(zs.min())
+    kx = np.floor((xs - x0) / vs).astype(np.int64)
+    ky = np.floor((ys - y0) / vs).astype(np.int64)
+    kz = np.floor((zs - z0) / vs).astype(np.int64)
+
+    max_coord = (1 << 20) - 1
+    kx = np.clip(kx, 0, max_coord)
+    ky = np.clip(ky, 0, max_coord)
+    kz = np.clip(kz, 0, max_coord)
+    keys = (kx << 42) | (ky << 21) | kz
+
+    uniq_keys, inv, counts = np.unique(keys, return_inverse=True, return_counts=True)
+    nv = len(uniq_keys)
+    ukx = uniq_keys >> 42
+    uky = (uniq_keys >> 21) & ((1 << 21) - 1)
+    ukz = uniq_keys & ((1 << 21) - 1)
+
+    rows = []
+    cols = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dz in (-1, 0, 1):
+                if (dx, dy, dz) <= (0, 0, 0):
+                    continue
+                nx, ny, nz = ukx + dx, uky + dy, ukz + dz
+                valid = (nx >= 0) & (ny >= 0) & (nz >= 0)
+                q = np.where(valid, (nx << 42) | (ny << 21) | nz, -1)
+                pos = np.searchsorted(uniq_keys, q)
+                pos_c = np.minimum(pos, nv - 1)
+                hit = valid & (uniq_keys[pos_c] == q)
+                if np.any(hit):
+                    rows.append(np.flatnonzero(hit))
+                    cols.append(pos_c[hit])
+
+    if rows:
+        r_all = np.concatenate(rows)
+        c_all = np.concatenate(cols)
+        adj = csr_matrix((np.ones(len(r_all), dtype=np.int8), (r_all, c_all)), shape=(nv, nv))
+        _, labels = connected_components(adj, directed=False)
+    else:
+        labels = np.arange(nv, dtype=np.int64)
+
+    comp_pts = np.bincount(labels, weights=counts)
+    tiny_vox = comp_pts[labels] < min(12, int(min_component_pts))
+    small_vox = comp_pts[labels] < int(min_component_pts)
+    return tiny_vox[inv], small_vox[inv]
+
+
 def _asymmetric_irls_lower_surface(
     xs: np.ndarray,
     ys: np.ndarray,
@@ -679,18 +747,28 @@ def classify_outliers_adaptive(
     if _cancelled():
         return OutlierResult(class_7, class_18, cls_out, report, params, {"cancelled": True})
 
-    # ── Step 2: 3D Voxel Isolation Pre-Filter (O(N)) ───────────────────
-    _prog("Step 2/5: 3D voxel isolation pre-filter…", 28.0)
+    # ── Step 2: 3D Voxel Isolation + Connected-Component Pre-Filter (O(N)) ─
+    _prog("Step 2/5: 3D voxel isolation & connected components…", 28.0)
     nbr_counts = _voxel_3d_neighbor_counts(xs, ys, zs, params.voxel_size_m)
     isolated_mask = nbr_counts < max(1, int(params.min_voxel_neighbors))
     # Only flag radiometric suspects if truly isolated (1 point in 3x3x3 voxel)
     # so sparse bathymetry / shadowed ground beside houses is never shredded.
     isolated_mask |= (radiometric_suspect & (nbr_counts <= 1))
 
+    # 3D Voxel Connected Components catches disconnected over/under blobs (1–50 pts)
+    # at any height (-30m, -3m, +6m, +80m) without touching connected forest or ground.
+    cc_voxel = max(1.1, min(1.8, params.voxel_size_m * 1.25))
+    cc_tiny_mask, cc_small_mask = _voxel_3d_connected_components_outliers(
+        xs, ys, zs, voxel_size=cc_voxel, min_component_pts=50
+    )
+    isolated_mask |= cc_small_mask
+
     z_med_global = float(np.median(zs))
     class_7 |= (isolated_mask & (zs < z_med_global))
-    # Defer isolated high points to Step 4 so linear powerlines (is_linear) are preserved
-    step2_iso_high = isolated_mask & (zs >= z_med_global)
+    # Tiny disconnected blobs (<12 pts) above z_med are always noise; larger ones (12..49 pts)
+    # are deferred to Step 4 so linear powerline corner spans (is_linear) are preserved.
+    class_18 |= (cc_tiny_mask & (zs >= z_med_global))
+    step2_iso_high = isolated_mask & (~cc_tiny_mask) & (zs >= z_med_global)
 
     if _cancelled():
         return OutlierResult(class_7, class_18, cls_out, report, params, {"cancelled": True})
