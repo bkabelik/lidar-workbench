@@ -29,6 +29,9 @@ WizardStyle=modern
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 DiskSpanning=no
+; Azure Artifact Signing (pass /Sazsign="..." via build.ps1 / build.bat, or configure azsign in Inno Setup IDE)
+SignTool=azsign
+SignedUninstaller=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -37,7 +40,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
-Source: "{#MyAppDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#MyAppDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion signonce
+Source: "{#MyAppDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion signonce skipifsourcedoesntexist
+Source: "{#MyAppDir}\*"; DestDir: "{app}"; Excludes: "{#MyAppExeName},\*.dll"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
