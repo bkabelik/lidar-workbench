@@ -855,7 +855,8 @@ class MainWindow(QMainWindow):
 
         dialog = FilterDialog(self._tm, selected, parent=self)
         dialog.filter_applied.connect(self._on_filter_applied)
-        dialog.exec()
+        dialog.distributed_completed.connect(self._refresh_tile_list)
+        dialog.distributed_completed.connect(lambda: self._sync_project_cloud(silent=True))
         try:
             dialog.exec()
         finally:
@@ -1129,6 +1130,7 @@ class MainWindow(QMainWindow):
 
         dialog = ClassificationDialog(self._tm, self._db, selected, parent=self)
         dialog.finished.connect(lambda: self._refresh_tile_list())
+        dialog.finished.connect(lambda: self._sync_project_cloud(silent=True))
         dialog.exec()
 
     def _on_ground_classify(self) -> None:

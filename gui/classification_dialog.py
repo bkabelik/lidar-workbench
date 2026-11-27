@@ -241,6 +241,74 @@ class ClusterExecutionWidget(QGroupBox):
         return mon, None
 
 
+def sync_distributed_filter_results(tile_manager, db, tile_ids: list, filter_name: str = "noise_filter") -> int:
+    """Update local SQLite status (FILTERED), point counts, and tiles/noise/*_noise.las entries after a cluster job."""
+    import json as _json
+    import laspy
+    from ..config import TileStatus
+
+    total_noise = 0
+    pm = getattr(tile_manager, "_pm", None)
+    tiles_dir = getattr(pm, "tiles_dir", None) if pm else None
+    if not tiles_dir or db is None:
+        return 0
+
+    for tid in tile_ids:
+        tile_info = db.get_tile(tid)
+        if not tile_info:
+            continue
+        las_path = tiles_dir / tile_info["filename"]
+        if not las_path.is_file():
+            continue
+        with laspy.open(str(las_path)) as reader:
+            keep_count = int(reader.header.point_count)
+
+        noise_name = f"{las_path.stem}_noise.las"
+        noise_path = tiles_dir / "noise" / noise_name
+        if noise_path.is_file():
+            with laspy.open(str(noise_path)) as nreader:
+                nh = nreader.header
+                n_pts = int(nh.point_count)
+                n_bbox = (float(nh.mins[0]), float(nh.mins[1]), float(nh.maxs[0]), float(nh.maxs[1]))
+            total_noise += n_pts
+            with db.connect() as nconn:
+                db.insert_tile(
+                    nconn,
+                    tile_id=f"{tid}_noise",
+                    filename=f"noise/{noise_name}",
+                    bbox=n_bbox,
+                    point_count=n_pts,
+                    flight_line=tile_info.get("flight_line", 0),
+                    scanner=tile_info.get("scanner", ""),
+                    all_scanners=_json.loads(tile_info.get("all_scanners", "[]"))
+                    if isinstance(tile_info.get("all_scanners"), str) else tile_info.get("all_scanners", []),
+                    sensor_type=tile_info.get("sensor_type", ""),
+                    flightline_sensor_types=_json.loads(tile_info.get("flightline_sensor_types", "{}"))
+                    if isinstance(tile_info.get("flightline_sensor_types"), str) else tile_info.get("flightline_sensor_types", {}),
+                    crs_epsg=tile_info.get("crs_epsg"),
+                    crs_wkt=tile_info.get("crs_wkt"),
+                    status=TileStatus.NOISE,
+                    filter_params={"source_tile": tid, "filter": filter_name, "cluster": True},
+                )
+                nconn.commit()
+
+        tile_manager.update_tile_status(tid, TileStatus.FILTERED)
+        with db.connect() as conn:
+            db.update_point_count(conn, tid, keep_count)
+            db.record_processing_time(
+                conn, tid, "filter",
+                duration_seconds=0.0,
+                point_count=keep_count,
+                params={"mode": filter_name, "cluster": True},
+            )
+            conn.commit()
+
+        if hasattr(tile_manager, "_point_cache") and tid in tile_manager._point_cache:
+            del tile_manager._point_cache[tid]
+
+    return total_noise
+
+
 class ClassificationDialog(QDialog):
     """
     Dialog for configuring and launching Pointcept classification.

@@ -99,17 +99,28 @@ def _node_run_noise_filter(las_path_str: str, job_params: dict) -> Tuple[bool, i
             "return_number": np.asarray(las.return_number, dtype=np.uint8) if hasattr(las, "return_number") else np.ones(n_pts, dtype=np.uint8),
         }
         keep_mask, _dur = _apply_pipeline_timed(data, pipeline)
-        cls_arr = np.asarray(las.classification, dtype=np.uint8).copy()
-        cls_arr[~keep_mask] = 7
-        las.classification = cls_arr
         backup = las_path.with_suffix(las_path.suffix + ".bak")
         try:
             shutil.copy2(str(las_path), str(backup))
         except OSError:
             pass
-        las.write(str(las_path))
-        logger.info("Filtered %s (%d/%d noise pts marked class 7)", las_path.name, int((~keep_mask).sum()), n_pts)
-        return True, int(n_pts)
+        noise_mask = ~keep_mask
+        if np.any(noise_mask):
+            noise_dir = las_path.parent / "noise"
+            noise_dir.mkdir(parents=True, exist_ok=True)
+            noise_path = noise_dir / f"{las_path.stem}_noise.las"
+            noise_las = laspy.LasData(las.header)
+            noise_las.points = las.points[noise_mask]
+            noise_cls = np.asarray(noise_las.classification, dtype=np.uint8).copy()
+            noise_cls[:] = 7
+            noise_las.classification = noise_cls
+            noise_las.write(str(noise_path))
+
+            clean_las = laspy.LasData(las.header)
+            clean_las.points = las.points[keep_mask]
+            clean_las.write(str(las_path))
+        logger.info("Filtered %s (%d/%d noise pts extracted)", las_path.name, int(noise_mask.sum()), n_pts)
+        return True, int(keep_mask.sum())
     except Exception as e:
         logger.error("Noise filter failed on %s: %s", las_path.name, e)
         return False, 0
@@ -434,7 +445,11 @@ class CompanyNodeWorker(QThread):
             logger.info("Processing shared storage tile %s (%s)...", las_file, job_type)
             if job_type in ("noise_filter", "ground_classification", "adaptive_outlier"):
                 if proc_pool is not None:
-                    ok, pt_count = proc_pool.submit(_run_cpu_task_subprocess, job_type, tile_id, str(las_file), job_params).result()
+                    try:
+                        ok, pt_count = proc_pool.submit(_run_cpu_task_subprocess, job_type, tile_id, str(las_file), job_params).result()
+                    except Exception as p_exc:
+                        logger.exception("ProcessPoolExecutor failed for %s (%s), falling back to direct execution", tile_id, p_exc)
+                        ok, pt_count = _run_cpu_task_subprocess(job_type, tile_id, str(las_file), job_params)
                 else:
                     ok, pt_count = _run_cpu_task_subprocess(job_type, tile_id, str(las_file), job_params)
             else:
@@ -473,6 +488,7 @@ class CompanyNodeWorker(QThread):
             cpu_workers = max(1, int(max(gen.get("filter_workers", 4), gen.get("ground_workers", 4))))
         except Exception:
             cpu_workers = 4
+        logger.info("Company Node Worker '%s' CPU ProcessPool size: %d", self._node_name, cpu_workers)
 
         heartbeat_counter = 0
         active_cpu: set = set()

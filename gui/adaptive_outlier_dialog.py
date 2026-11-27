@@ -625,66 +625,10 @@ class AdaptiveOutlierDialog(QDialog):
 
     def _on_cluster_completed(self, _res: dict) -> None:
         """Update local SQLite status, point counts, and noise tiles after distributed Auto Noise."""
-        import json as _json
-        import laspy
-        from ..config import TileStatus
-
         total_noise = 0
         try:
-            tiles_dir = self._tm._pm.tiles_dir
-            for tid in self._tile_ids:
-                tile_info = self._db.get_tile(tid)
-                if not tile_info or not tiles_dir:
-                    continue
-                las_path = tiles_dir / tile_info["filename"]
-                if not las_path.is_file():
-                    continue
-                with laspy.open(str(las_path)) as reader:
-                    keep_count = int(reader.header.point_count)
-
-                noise_dir = tiles_dir / "noise"
-                noise_name = f"{las_path.stem}_noise.las"
-                noise_path = noise_dir / noise_name
-                if noise_path.is_file():
-                    with laspy.open(str(noise_path)) as nreader:
-                        nh = nreader.header
-                        n_pts = int(nh.point_count)
-                        n_bbox = (float(nh.mins[0]), float(nh.mins[1]), float(nh.maxs[0]), float(nh.maxs[1]))
-                    total_noise += n_pts
-                    with self._db.connect() as nconn:
-                        self._db.insert_tile(
-                            nconn,
-                            tile_id=f"{tid}_noise",
-                            filename=f"noise/{noise_name}",
-                            bbox=n_bbox,
-                            point_count=n_pts,
-                            flight_line=tile_info.get("flight_line", 0),
-                            scanner=tile_info.get("scanner", ""),
-                            all_scanners=_json.loads(tile_info.get("all_scanners", "[]"))
-                            if isinstance(tile_info.get("all_scanners"), str) else tile_info.get("all_scanners", []),
-                            sensor_type=tile_info.get("sensor_type", ""),
-                            flightline_sensor_types=_json.loads(tile_info.get("flightline_sensor_types", "{}"))
-                            if isinstance(tile_info.get("flightline_sensor_types"), str) else tile_info.get("flightline_sensor_types", {}),
-                            crs_epsg=tile_info.get("crs_epsg"),
-                            crs_wkt=tile_info.get("crs_wkt"),
-                            status=TileStatus.NOISE,
-                            filter_params={"source_tile": tid, "filter": "adaptive_outlier", "cluster": True},
-                        )
-                        nconn.commit()
-
-                self._tm.update_tile_status(tid, TileStatus.FILTERED)
-                with self._db.connect() as conn:
-                    self._db.update_point_count(conn, tid, keep_count)
-                    self._db.record_processing_time(
-                        conn, tid, "filter",
-                        duration_seconds=0.0,
-                        point_count=keep_count,
-                        params={"mode": "adaptive_outlier", "cluster": True},
-                    )
-                    conn.commit()
-
-                if hasattr(self._tm, "_point_cache") and tid in self._tm._point_cache:
-                    del self._tm._point_cache[tid]
+            from .classification_dialog import sync_distributed_filter_results
+            total_noise = sync_distributed_filter_results(self._tm, self._db, self._tile_ids, filter_name="adaptive_outlier")
         except Exception as exc:
             logger.warning("Failed updating SQLite after distributed Auto Noise: %s", exc)
 

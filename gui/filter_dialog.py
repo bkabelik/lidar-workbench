@@ -95,6 +95,7 @@ class FilterDialog(QDialog):
     """
 
     filter_applied = Signal(list, list)  # tile_ids, pipeline
+    distributed_completed = Signal()
 
     def __init__(self, tile_manager, tile_ids, parent=None):
         super().__init__(parent)
@@ -902,6 +903,7 @@ class FilterDialog(QDialog):
             return
         if self._cluster_exec.is_distributed():
             target_tiles = self._tile_ids if self._batch_check.isChecked() else [self._tile_ids[self._current_tile_idx]]
+            self._cluster_target_tiles = list(target_tiles)
             self._apply_btn.setEnabled(False)
             self._cluster_prog.setVisible(True)
             self._cluster_prog.setValue(0)
@@ -933,6 +935,14 @@ class FilterDialog(QDialog):
     def _on_cluster_completed(self, _res: dict) -> None:
         self._apply_btn.setEnabled(True)
         self._cluster_prog.setValue(100)
+        try:
+            from .classification_dialog import sync_distributed_filter_results
+            target_tiles = getattr(self, "_cluster_target_tiles", self._tile_ids)
+            db = getattr(self._tm, "_db", None)
+            sync_distributed_filter_results(self._tm, db, target_tiles, filter_name="noise_filter")
+        except Exception as exc:
+            logger.warning("Failed updating SQLite after distributed filter: %s", exc)
+        self.distributed_completed.emit()
         QMessageBox.information(self, "Distributed Filter Complete", "All tiles were filtered across the selected company nodes.")
         self.accept()
 

@@ -1351,7 +1351,7 @@ class GroundClassifyDialog(QDialog):
                     "project_path": str(Path(self._jobs[0]["las_path"]).parent.parent) if self._jobs else "",
                 },
                 on_progress=self._on_progress,
-                on_completed=lambda _res: self._on_finished(len(tile_ids)),
+                on_completed=lambda _res: self._on_cluster_completed(tile_ids),
                 on_error=self._on_error,
                 parent=self,
             )
@@ -1404,6 +1404,11 @@ class GroundClassifyDialog(QDialog):
             f"({n_ground/max(n_affected,1)*100:.1f}%)"
         )
         self.tile_processed.emit(tile_id, result)
+
+    def _on_cluster_completed(self, tile_ids: list):
+        for tid in tile_ids:
+            self.tile_processed.emit(tid, {"n_ground": 0, "n_affected": 0, "cluster": True})
+        self._on_finished(len(tile_ids))
 
     def _on_finished(self, n_processed: int):
         self._status.setText(f"Done: {n_processed}/{len(self._jobs)} tiles")
