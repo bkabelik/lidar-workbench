@@ -542,6 +542,80 @@ def _asymmetric_irls_lower_surface(
     return z_pred, mad
 
 
+def _detect_detached_high_mask(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    z_surf: np.ndarray,
+    cell_size: float = 4.0,
+    min_gap_m: float = 8.0,
+    min_height_m: float = 12.0,
+    hard_max_height_m: float = 65.0,
+) -> np.ndarray:
+    """
+    Detect points floating detached in mid-air above an empty vertical gap
+    (e.g., atmospheric/cloud noise layers) without slicing continuous tall forest.
+    """
+    n = len(xs)
+    detached = np.zeros(n, dtype=bool)
+    if n == 0:
+        return detached
+
+    h = zs - z_surf
+    # Unconditionally flag extreme heights far above any terrestrial structure
+    detached |= (h > hard_max_height_m)
+
+    cand_idx = np.flatnonzero((h > min_height_m) & (~detached))
+    if len(cand_idx) == 0:
+        return detached
+
+    # Group all points by 2D column (cell_size x cell_size) to check vertical continuity
+    cs = max(2.0, float(cell_size))
+    x0 = float(xs.min())
+    y0 = float(ys.min())
+    ny = max(2, int(math.ceil((float(ys.max()) - y0) / cs)) + 2)
+    cx = ((xs - x0) / cs).astype(np.int64)
+    cy = ((ys - y0) / cs).astype(np.int64)
+    col_id = cx * ny + cy
+
+    cand_cols = np.unique(col_id[cand_idx])
+    in_cand_col = np.isin(col_id, cand_cols)
+    sub_idx = np.flatnonzero(in_cand_col)
+    sub_col = col_id[sub_idx]
+    sub_h = h[sub_idx]
+
+    # Sort by (col_id, h) so each column's heights are contiguous & ascending
+    order = np.lexsort((sub_h, sub_col))
+    s_idx = sub_idx[order]
+    s_col = sub_col[order]
+    s_h = sub_h[order]
+
+    uniq = np.empty(len(s_col), dtype=bool)
+    uniq[0] = True
+    uniq[1:] = s_col[1:] != s_col[:-1]
+    starts = np.flatnonzero(uniq)
+    ends = np.append(starts[1:], len(s_col))
+
+    for ic in range(len(starts)):
+        a, b = starts[ic], ends[ic]
+        col_h = s_h[a:b]
+        if col_h[-1] <= min_height_m:
+            continue
+        # Check gap from terrain (0.0) to first point, and between consecutive points
+        if col_h[0] >= min_gap_m:
+            detached[s_idx[a:b]] = True
+            continue
+        diffs = np.diff(col_h)
+        gap_pos = np.flatnonzero(diffs >= min_gap_m)
+        if len(gap_pos) > 0:
+            # First gap >= min_gap_m above terrain detaches everything above it
+            cut = int(gap_pos[0]) + 1
+            if col_h[cut] > min_height_m:
+                detached[s_idx[a + cut : b]] = True
+
+    return detached
+
+
 def classify_outliers_adaptive(
     data: Dict[str, Any],
     params: Optional[OutlierParams] = None,
@@ -615,14 +689,16 @@ def classify_outliers_adaptive(
 
     z_med_global = float(np.median(zs))
     class_7 |= (isolated_mask & (zs < z_med_global))
-    class_18 |= (isolated_mask & (zs >= z_med_global))
+    # Defer isolated high points to Step 4 so linear powerlines (is_linear) are preserved
+    step2_iso_high = isolated_mask & (zs >= z_med_global)
 
     if _cancelled():
         return OutlierResult(class_7, class_18, cls_out, report, params, {"cancelled": True})
 
-    # ── Step 3: Flightline-Aware Asymmetric IRLS Lower & Upper Envelope ─
+    # ── Step 3: Flightline-Aware Asymmetric IRLS Lower & Detached-High Envelope ─
     _prog("Step 3/5: Asymmetric IRLS terrain & strip envelope…", 48.0)
     alive_idx = np.flatnonzero(~(class_7 | class_18))
+    step3_detached_high = np.zeros(n, dtype=bool)
     if len(alive_idx) > 20:
         z_surf, mad_lower = _asymmetric_irls_lower_surface(
             xs[alive_idx],
@@ -642,33 +718,28 @@ def classify_outliers_adaptive(
         )
         class_7[alive_idx[low_hits]] = True
 
-        # Upper envelope (Class 18) — per-strip first when enabled
+        # Detached high-noise detection (replaces blind p95_r slicing that clipped tall
+        # forest/powerlines on flat tiles and missed >5% high-noise clouds).
+        # Deferred to Step 4 so linear powerlines (is_linear) are protected.
         still_alive = alive_idx[~low_hits]
         if len(still_alive) > 20:
-            if params.per_strip_first and report.flightline_count > 1:
-                strips = np.unique(psid[still_alive])
-                for s_id in strips:
-                    s_mask = psid[still_alive] == s_id
-                    s_idx = still_alive[s_mask]
-                    if len(s_idx) < 20:
-                        continue
-                    s_surf, s_mad = _asymmetric_irls_lower_surface(
-                        xs[s_idx], ys[s_idx], zs[s_idx],
-                        cell_size=max(params.grid_cell_size_m * 1.5, 3.0),
-                        iterations=2,
-                    )
-                    s_res = zs[s_idx] - s_surf
-                    p95_r = float(np.percentile(s_res, 95.0))
-                    # Extreme high flyers far above canopy/building envelope of this strip
-                    hi_thresh = max(p95_r + params.z_upper_mad_multiplier * max(s_mad, 0.5),
-                                    params.z_upper_mad_multiplier * 3.0)
-                    class_18[s_idx[s_res > hi_thresh]] = True
-            else:
-                z_s2 = zs[still_alive] - z_surf[~low_hits]
-                p95_r = float(np.percentile(z_s2, 95.0))
-                hi_thresh = max(p95_r + params.z_upper_mad_multiplier * max(mad_lower, 0.5),
-                                params.z_upper_mad_multiplier * 3.0)
-                class_18[still_alive[z_s2 > hi_thresh]] = True
+            hard_max_h = max(75.0, params.z_upper_mad_multiplier * 12.0)
+            res_still = zs[still_alive] - z_surf[~low_hits]
+            # Unconditionally flag extreme sky flyers > 75m above terrain (even linear scan-line streaks)
+            extreme_sky = res_still > hard_max_h
+            class_18[still_alive[extreme_sky]] = True
+
+            det_mask = _detect_detached_high_mask(
+                xs[still_alive],
+                ys[still_alive],
+                zs[still_alive],
+                z_surf[~low_hits],
+                cell_size=max(params.grid_cell_size_m * 3.0, 4.0),
+                min_gap_m=max(6.0, params.z_upper_mad_multiplier * 1.25),
+                min_height_m=max(10.0, params.z_upper_mad_multiplier * 1.6),
+                hard_max_height_m=hard_max_h,
+            )
+            step3_detached_high[still_alive[det_mask & (~extreme_sky)]] = True
 
     if _cancelled():
         return OutlierResult(class_7, class_18, cls_out, report, params, {"cancelled": True})
@@ -761,8 +832,10 @@ def classify_outliers_adaptive(
         pca_reject = (~is_linear) & (~is_planar) & unstable_normal & (~surv_canopy) & sparse_for_pca & (res_s > params.max_plane_residual_m)
 
         # Extreme SOR catches truly isolated outliers even on canopy/vertical structures
-        extreme_sor = (weighted_d > (sor_thresh * 1.65)) & (mean_d_small > min_sparse_floor)
-        final_reject = (sor_reject & (~surv_canopy) & (~is_vertical_or_linear)) | extreme_sor | pca_reject
+        # (powerlines/wires remain protected via ~is_linear)
+        extreme_sor = (weighted_d > (sor_thresh * 1.65)) & (mean_d_small > min_sparse_floor) & (~is_linear)
+        deferred_high = (step2_iso_high[surv_idx] | step3_detached_high[surv_idx]) & (~is_linear)
+        final_reject = (sor_reject & (~surv_canopy) & (~is_vertical_or_linear)) | extreme_sor | pca_reject | deferred_high
 
         rej_pts = surv_idx[final_reject]
         if len(rej_pts) > 0:
