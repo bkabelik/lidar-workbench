@@ -737,11 +737,6 @@ class AdaptiveOutlierDialog(QDialog):
             f"Done: {n_tiles} tile(s) — Class 7: {total_c7:,}, Class 18: {total_c18:,} (undoable in SQLite)"
         )
         self.classification_applied.emit()
-        QMessageBox.information(
-            self,
-            "Adaptive Outlier Classification Complete",
-            f"Processed {n_tiles} tile(s).\nClass 7 (Low Noise): {total_c7:,}\nClass 18 (High Noise): {total_c18:,}",
-        )
 
     def _on_error(self, msg: str) -> None:
         self._run_btn.setEnabled(True)
