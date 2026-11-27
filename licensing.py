@@ -63,6 +63,18 @@ def get_machine_hwid() -> str:
     return hashlib.sha256(f"lw-hwid-salt-{raw_id}".encode("utf-8")).hexdigest()[:32]
 
 
+def _get_os_display_name() -> str:
+    """Return human-readable OS name, distinguishing Windows 11 (build >= 22000) from Windows 10."""
+    sys_name = platform.system()
+    if sys_name == "Windows":
+        try:
+            if sys.getwindowsversion().build >= 22000:
+                return "Windows 11"
+        except Exception:
+            pass
+    return f"{sys_name} {platform.release()}"
+
+
 def get_local_gpu_name() -> str:
     """Detect available NVIDIA RTX GPU or return fallback."""
     try:
@@ -196,7 +208,7 @@ class LicenseManager:
             "password": password,
             "hwid": self._hwid,
             "machine_name": platform.node(),
-            "os_name": f"{platform.system()} {platform.release()}",
+            "os_name": _get_os_display_name(),
         }
 
         try:
@@ -248,7 +260,7 @@ class LicenseManager:
             "hwid": self._hwid,
             "node_name": node_name or platform.node(),
             "gpu_name": get_local_gpu_name(),
-            "os_name": f"{platform.system()} {platform.release()}",
+            "os_name": _get_os_display_name(),
             "status": status,
         }
         try:
@@ -569,7 +581,7 @@ class LicenseManager:
             "license_key": clean_key,
             "hwid": self._hwid,
             "machine_name": platform.node(),
-            "os_name": f"{platform.system()} {platform.release()}",
+            "os_name": _get_os_display_name(),
         }
 
         try:
